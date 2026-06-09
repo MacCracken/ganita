@@ -1,0 +1,16 @@
+[package]
+name = "ganita"
+version = "0.1.0"
+description = "ganita — TODO"
+license = "GPL-3.0-only"
+language = "cyrius"
+cyrius = "6.1.17"
+
+[build]
+entry = "src/main.cyr"
+test = "src/test.cyr"
+output = "ganita"
+
+[deps]
+stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench"]
+---
