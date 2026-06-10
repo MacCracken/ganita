@@ -1,0 +1,57 @@
+# ganita back-compat aliases (v6.1.26 carve). Legacy mat_* / f64_advanced /
+# fibonacci / binomial names → canonical ganita_* API. Deprecated (migration
+# window only). See CHANGELOG [ganita 1.0.0] / cyrius [6.1.26].
+
+fn mat_new(rows, cols): i64 { return ganita_mat_new(rows, cols); }
+fn mat_rows(m): i64 { return ganita_mat_rows(m); }
+fn mat_cols(m): i64 { return ganita_mat_cols(m); }
+fn mat_get(m, r, c): i64 { return ganita_mat_get(m, r, c); }
+fn mat_set(m, r, c, val): i64 { return ganita_mat_set(m, r, c, val); }
+fn mat_identity(n): i64 { return ganita_mat_identity(n); }
+fn mat_from(rows, cols, data): i64 { return ganita_mat_from(rows, cols, data); }
+fn mat_add(a, b): i64 { return ganita_mat_add(a, b); }
+fn mat_sub(a, b): i64 { return ganita_mat_sub(a, b); }
+fn mat_scale(a, scalar): i64 { return ganita_mat_scale(a, scalar); }
+fn mat_mul(a, b): i64 { return ganita_mat_mul(a, b); }
+fn mat_transpose(a): i64 { return ganita_mat_transpose(a); }
+fn mat_dot(a, b, n): i64 { return ganita_mat_dot(a, b, n); }
+fn mat_print(m): i64 { return ganita_mat_print(m); }
+fn mat_copy(m): i64 { return ganita_mat_copy(m); }
+fn mat_neg(m): i64 { return ganita_mat_neg(m); }
+fn mat_row(m, r): i64 { return ganita_mat_row(m, r); }
+fn mat_col(m, c): i64 { return ganita_mat_col(m, c); }
+fn mat_set_row(m, r, data): i64 { return ganita_mat_set_row(m, r, data); }
+fn mat_set_col(m, c, data): i64 { return ganita_mat_set_col(m, c, data); }
+fn mat_submatrix(m, r0, c0, r1, c1): i64 { return ganita_mat_submatrix(m, r0, c0, r1, c1); }
+fn mat_frobenius(m): i64 { return ganita_mat_frobenius(m); }
+fn mat_max_norm(m): i64 { return ganita_mat_max_norm(m); }
+fn mat_is_symmetric(m, tol): i64 { return ganita_mat_is_symmetric(m, tol); }
+fn mat_eq(a, b, tol): i64 { return ganita_mat_eq(a, b, tol); }
+fn mat_trace(m): i64 { return ganita_mat_trace(m); }
+fn mat_lu(m, out_lu, out_piv): i64 { return ganita_mat_lu(m, out_lu, out_piv); }
+fn mat_lu_solve(lu, piv, b, out_x): i64 { return ganita_mat_lu_solve(lu, piv, b, out_x); }
+fn mat_det(m): i64 { return ganita_mat_det(m); }
+fn mat_inv(m): i64 { return ganita_mat_inv(m); }
+fn mat_cholesky(m, out_l): i64 { return ganita_mat_cholesky(m, out_l); }
+fn mat_cholesky_solve(l, b, out_x): i64 { return ganita_mat_cholesky_solve(l, b, out_x); }
+fn mat_qr(m, out_q, out_r): i64 { return ganita_mat_qr(m, out_q, out_r); }
+fn mat_gaussian_elim(aug): i64 { return ganita_mat_gaussian_elim(aug); }
+fn mat_least_squares(a, b, out_x): i64 { return ganita_mat_least_squares(a, b, out_x); }
+fn mat_eigen_sym(m, out_vals, out_vecs): i64 { return ganita_mat_eigen_sym(m, out_vals, out_vecs); }
+fn mat_svd(m, out_u, out_sigma, out_vt): i64 { return ganita_mat_svd(m, out_u, out_sigma, out_vt); }
+fn mat_pseudo_inv(m): i64 { return ganita_mat_pseudo_inv(m); }
+fn mat_rank(m, tol): i64 { return ganita_mat_rank(m, tol); }
+fn mat_condition(m): i64 { return ganita_mat_condition(m); }
+fn f64_sinh(x): i64 { return ganita_f64_sinh(x); }
+fn f64_cosh(x): i64 { return ganita_f64_cosh(x); }
+fn f64_tanh(x): i64 { return ganita_f64_tanh(x); }
+fn f64_pow(base, exp): i64 { return ganita_f64_pow(base, exp); }
+fn f64_asin(x): i64 { return ganita_f64_asin(x); }
+fn f64_acos(x): i64 { return ganita_f64_acos(x); }
+fn f64_atan2(y, x): i64 { return ganita_f64_atan2(y, x); }
+fn f64_asinh(x): i64 { return ganita_f64_asinh(x); }
+fn f64_acosh(x): i64 { return ganita_f64_acosh(x); }
+fn f64_atanh(x): i64 { return ganita_f64_atanh(x); }
+fn f64_hypot(x, y): i64 { return ganita_f64_hypot(x, y); }
+fn fibonacci(n): i64 { return ganita_fibonacci(n); }
+fn binomial(n, k): i64 { return ganita_binomial(n, k); }

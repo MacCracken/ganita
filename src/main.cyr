@@ -1,10 +1,35 @@
-# ganita — main entry point
-# Stdlib auto-included via cyrius.cyml
+# ganita — smoke entry. Includes the stdlib prereqs + the full bundle (matrix +
+# linalg + math_advanced + back-compat aliases) so `cyrius build` proves they
+# parse, link, and assemble together as a consumer would use `lib/ganita.cyr`,
+# then exercises a matrix op + an advanced-math op + an alias.
+# Deep correctness lives in cyrius's matrix/linalg/math .tcyr suite (post-fold).
 
-fn main() {
+include "lib/syscalls.cyr"
+include "lib/string.cyr"
+include "lib/alloc.cyr"
+include "lib/fmt.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/math.cyr"
+
+include "src/matrix.cyr"
+include "src/linalg.cyr"
+include "src/math_advanced.cyr"
+include "src/_compat.cyr"
+
+fn main(): i64 {
     alloc_init();
-    println("hello from ganita");
-    return 0;
+
+    # matrix dimensions (integer, exact)
+    var m = ganita_mat_new(3, 2);
+    if (ganita_mat_rows(m) != 3) { return 1; }
+    if (ganita_mat_cols(m) != 2) { return 2; }
+
+    # advanced math: binomial(5,2) = 10 (canonical + alias parity)
+    if (ganita_binomial(5, 2) != 10) { return 3; }
+    if (binomial(5, 2) != 10) { return 4; }    # back-compat alias
+
+    return 42;
 }
 
 var r = main();

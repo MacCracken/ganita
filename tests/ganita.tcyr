@@ -1,13 +1,42 @@
-# ganita test suite
-# Stdlib auto-included via cyrius.cyml
+# ganita test suite — canonical ganita_* API + back-compat alias parity.
+# Carries its own includes (auto-prepend skipped when includes present),
+# mirroring how a consumer pulls lib/ganita.cyr + stdlib (+ stdlib math for
+# the f64 builtin polyfills the transcendental fns need).
 
-fn main() {
-    alloc_init();
-    test_group("smoke");
-    assert(1, "true is true");
-    assert_eq(1 + 1, 2, "math works");
-    return assert_summary();
-}
+include "lib/syscalls.cyr"
+include "lib/string.cyr"
+include "lib/alloc.cyr"
+include "lib/fmt.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/assert.cyr"
+include "lib/math.cyr"
 
-var exit_code = main();
-syscall(60, exit_code);
+include "src/matrix.cyr"
+include "src/linalg.cyr"
+include "src/math_advanced.cyr"
+include "src/_compat.cyr"
+
+alloc_init();
+
+test_group("matrix (canonical)");
+var a = ganita_mat_new(3, 2);
+assert_eq(ganita_mat_rows(a), 3, "rows");
+assert_eq(ganita_mat_cols(a), 2, "cols");
+var id = ganita_mat_identity(2);
+assert_eq(ganita_mat_rows(id), 2, "identity rows");
+assert_eq(ganita_mat_cols(id), 2, "identity cols");
+assert_eq(ganita_mat_get(id, 0, 1), 0, "identity off-diagonal == 0.0 bits");
+
+test_group("advanced math (canonical)");
+assert_eq(ganita_binomial(5, 2), 10, "C(5,2)=10");
+assert_eq(ganita_binomial(6, 3), 20, "C(6,3)=20");
+assert_eq(ganita_fibonacci(10), ganita_fibonacci(9) + ganita_fibonacci(8), "fib recurrence");
+
+test_group("back-compat aliases");
+var a2 = mat_new(4, 5);
+assert_eq(mat_rows(a2), 4, "alias mat_rows");
+assert_eq(mat_cols(a2), 5, "alias mat_cols");
+assert_eq(binomial(5, 2), 10, "alias binomial == canonical");
+
+var r = assert_summary();

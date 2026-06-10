@@ -1,16 +1,34 @@
 [package]
 name = "ganita"
-version = "0.1.0"
-description = "ganita — TODO"
+version = "${file:VERSION}"
+description = "ganita — linear algebra (matrix, linalg) + advanced math (transcendental + number theory) for the AGNOS-lineage Cyrius ecosystem; foldable into stdlib per the sandhi pattern"
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.1.17"
+cyrius = "6.1.25"
 
 [build]
 entry = "src/main.cyr"
 test = "src/test.cyr"
 output = "ganita"
 
+# `math` provides the f64-builtin polyfills (_f64_exp_polyfill etc.) that the
+# transcendental functions in math_advanced rely on for targets without native
+# f64 — and the F64_* constants. Native-f64 targets (x86_64) don't need it at
+# build time, but consumers should keep stdlib `math` in scope alongside ganita.
 [deps]
-stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench"]
----
+stdlib = [
+    "string", "fmt", "alloc", "io", "vec", "str", "syscalls",
+    "assert", "bench", "math",
+]
+
+# `[lib]` drives `cyrius distlib`. Single-pass compiler — order matters:
+# matrix defines the mat_* base API; linalg extends it (calls ganita_mat_*);
+# math_advanced is independent (f64 builtins only); _compat (back-compat
+# aliases → canonical ganita_*) MUST be last.
+[lib]
+modules = [
+    "src/matrix.cyr",
+    "src/linalg.cyr",
+    "src/math_advanced.cyr",
+    "src/_compat.cyr",
+]
