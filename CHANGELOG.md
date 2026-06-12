@@ -4,6 +4,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.1] — 2026-06-12
+
+### Changed
+
+- `cyrius` pin bumped 6.1.25 → 6.2.1 (ecosystem-wide stdlib pin sweep onto the
+  current toolchain). No source changes — ganita's `[deps]` carries no carved-out
+  modules. Verified green on 6.2.1: `cyrius deps` resolves cleanly, `.tcyr` suite
+  11/11, bench 1/1, `dist/ganita.cyr` regenerated via `cyrius distlib`.
+
 ## [1.0.0] — 2026-06-10
 
 **Initial carve out of the Cyrius stdlib** (cyrius v6.1.26, second half of
