@@ -33,6 +33,14 @@ assert_eq(ganita_binomial(5, 2), 10, "C(5,2)=10");
 assert_eq(ganita_binomial(6, 3), 20, "C(6,3)=20");
 assert_eq(ganita_fibonacci(10), ganita_fibonacci(9) + ganita_fibonacci(8), "fib recurrence");
 
+test_group("f64_tanh saturation (regression: was inf/inf=NaN for large |x|)");
+assert_eq(ganita_f64_tanh(f64_from(0)), f64_from(0), "tanh(0) = 0");
+assert_eq(ganita_f64_tanh(f64_from(1000)), f64_from(1), "tanh(1000) saturates to 1 (was NaN)");
+assert_eq(ganita_f64_tanh(f64_from(0 - 1000)), f64_from(0 - 1), "tanh(-1000) saturates to -1");
+assert_eq(ganita_f64_tanh(f64_from(25)), f64_from(1), "tanh(25) (saturated) = 1");
+assert_eq(ganita_f64_tanh(f64_from(20)), ganita_f64_tanh(f64_from(21)),
+"tanh bit-exact across the saturation boundary (formula 20 == saturated 21)");
+
 test_group("back-compat aliases");
 var a2 = mat_new(4, 5);
 assert_eq(mat_rows(a2), 4, "alias mat_rows");

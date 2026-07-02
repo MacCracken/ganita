@@ -4,6 +4,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.2] — 2026-07-02
+
+### Fixed
+
+- **`ganita_f64_tanh` no longer returns NaN for large |x|.** The
+  `(e^x − e^-x)/(e^x + e^-x)` form overflowed to `inf/inf = NaN` once
+  `f64_exp(x)` hit +inf (|x| > ~709). Now saturates to ±1 for |x| > 20 — which is
+  **bit-exact** (for |x| ≥ ~19, `tanh(x)` already rounds to exactly ±1.0 in f64,
+  so no correctly-computed value changes) and NaN-safe. Surfaced by importing a
+  real GPT-2-small checkpoint: its GELU `tanh(c·(x + a·x³))` overflows on the
+  model's massive-activation outliers, NaN-poisoning the forward. Fixes GELU for
+  every downstream consumer (rupantara `ru_gelu_fwd`, attn11 `gelu_fwd`, …).
+  Regression tests added (`tests/ganita.tcyr`: `tanh(±1000)` → ±1, boundary
+  bit-exactness). No API change.
+
 ## [1.0.1] — 2026-06-12
 
 ### Changed
