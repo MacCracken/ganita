@@ -4,6 +4,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.3] — 2026-07-08
+
+### Fixed
+
+- **Inverse trig (`ganita_f64_asin`/`acos`/`atan2`) un-guarded on aarch64.** They were
+  `#ifdef CYRIUS_ARCH_X86` in `src/math_advanced.cyr` because they build on `f64_atan`,
+  which was x86-only — while the `_compat.cyr` `f64_asin`/`acos`/`atan2` wrappers sat
+  OUTSIDE the guard (a latent undefined-fn on aarch64). Cyrius v6.4.25 added
+  `_f64_atan_polyfill`, so the guard is removed; the family now works on x86 (native x87
+  `fpatan`) and aarch64 (an aarch64 consumer must `include "lib/math.cyr"` for the
+  polyfill). Verified: `ganita_f64_atan2(1,1)` = π/4 on both arches (aarch64 via qemu).
+
 ## [1.0.2] — 2026-07-02
 
 ### Fixed
