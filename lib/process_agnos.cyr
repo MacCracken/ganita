@@ -124,8 +124,12 @@ fn exec_capture_str(args, buf, buflen): i64 {
 # Str-argv env variant — agnos can't pass envp, so identical to exec_vec_str.
 fn exec_env_str(args, env): i64 { return exec_vec_str(args); }
 
-# Run a single cmdline string. agnos can't pass args, so spawn just the first
-# token (the program path), up to the first space.
+# Run a single cmdline string. agnos has no shell and sys_spawn takes no
+# argv/pipe, so shell pipelines (`a | b`, `$(...)`, `VAR=val cmd`) are NOT
+# representable here — unlike the POSIX /bin/sh -c and Windows cmd /s /c
+# paths. Best effort: spawn just the first token (the program path), up to
+# the first space; returns -1 if that isn't a spawnable ELF. cyriusly's
+# heavy verbs (install/update/setup) therefore aren't available on agnos.
 fn exec_cmd(cmdline): i64 {
     var pathlen = 0;
     var done = 0;

@@ -56,7 +56,7 @@ fn run(cmd, arg1, arg2): Result {
     var pid = sys_fork();
     if (pid < 0) { return Err(0 - pid); }
     if (pid == 0) { _exec3(cmd, arg1, arg2); }
-    var status_buf[1];
+    var status_buf[4];
     sys_waitpid(pid, &status_buf, 0);
     var status = load32(&status_buf);
     if (WIFEXITED(status) == 1) { return Ok(WEXITSTATUS(status)); }
@@ -99,7 +99,7 @@ fn run_capture(cmd, arg1, arg2, buf, buflen): Result {
         }
     }
     sys_close(read_fd);
-    var status_buf[1];
+    var status_buf[4];
     sys_waitpid(pid, &status_buf, 0);
     return Ok(total);
 }
@@ -115,7 +115,7 @@ fn spawn(cmd, arg1, arg2): Result {
 
 # Wait for a specific pid. Returns Result(exit_code).
 fn wait_pid(pid): Result {
-    var status_buf[1];
+    var status_buf[4];
     var r = sys_waitpid(pid, &status_buf, 0);
     if (r < 0) { return Err(0 - r); }
     var status = load32(&status_buf);
@@ -188,7 +188,7 @@ fn exec_vec(args): i64 {
         sys_execve(cmd, argv, envp);
         sys_exit(127);
     }
-    var stbuf[1];
+    var stbuf[4];
     sys_waitpid(pid, &stbuf, 0);
     var st = load32(&stbuf);
     if (WIFEXITED(st) == 1) { return WEXITSTATUS(st); }
@@ -235,7 +235,7 @@ fn exec_capture(args, buf, buflen): i64 {
         else { total = total + n; if (total >= buflen) { rgo = 0; } }
     }
     sys_close(rfd);
-    var stbuf[1];
+    var stbuf[4];
     sys_waitpid(pid, &stbuf, 0);
     return total;
 }
@@ -271,7 +271,7 @@ fn exec_env(args, env): i64 {
         sys_execve(cmd, argv, envp);
         sys_exit(127);
     }
-    var stbuf[1];
+    var stbuf[4];
     sys_waitpid(pid, &stbuf, 0);
     var st = load32(&stbuf);
     if (WIFEXITED(st) == 1) { return WEXITSTATUS(st); }
@@ -318,7 +318,7 @@ fn exec_vec_str(args): i64 {
         sys_execve(cmd, argv, envp);
         sys_exit(127);
     }
-    var stbuf[1];
+    var stbuf[4];
     sys_waitpid(pid, &stbuf, 0);
     var st = load32(&stbuf);
     if (WIFEXITED(st) == 1) { return WEXITSTATUS(st); }
@@ -364,7 +364,7 @@ fn exec_capture_str(args, buf, buflen): i64 {
         else { total = total + n; if (total >= buflen) { rgo = 0; } }
     }
     sys_close(rfd);
-    var stbuf[1];
+    var stbuf[4];
     sys_waitpid(pid, &stbuf, 0);
     return total;
 }
@@ -398,7 +398,7 @@ fn exec_env_str(args, env): i64 {
         sys_execve(cmd, argv, envp);
         sys_exit(127);
     }
-    var stbuf[1];
+    var stbuf[4];
     sys_waitpid(pid, &stbuf, 0);
     var st = load32(&stbuf);
     if (WIFEXITED(st) == 1) { return WEXITSTATUS(st); }
@@ -411,16 +411,70 @@ fn exec_env_str(args, env): i64 {
 # the pre-v5.10.43 byte-or-pointer impl, would crash under the
 # new STR-path dispatch) to 32 (byte literal for space). Hits the
 # byte path of str_split's v5.10.43 runtime dispatch.
-fn exec_cmd(cmdline): i64 {
-    var args = vec_new();
-    var parts = str_split(str_from(cmdline), 32);
-    var pi = 0;
-    while (pi < vec_len(parts)) {
-        var part = vec_get(parts, pi);
-        vec_push(args, str_data(part));
-        pi = pi + 1;
+# Read /proc/self/environ and build a NULL-terminated envp array suitable
+# for execve. Each entry points into a heap copy of the environ blob, so the
+# array outlives this call and survives across fork into the child. Returns
+# the envp array pointer, or 0 if environ can't be read (caller substitutes
+# an empty env). Mirrors getenv's /proc/self/environ source (lib/io.cyr).
+fn _read_environ_envp(): i64 {
+    var fd = sys_open("/proc/self/environ", 0, 0);   # 0 = O_RDONLY
+    if (fd < 0) { return 0; }
+    var blob = alloc(65536);
+    var n = sys_read(fd, blob, 65535);
+    sys_close(fd);
+    if (n <= 0) { return 0; }
+    store8(blob + n, 0);
+    # environ entries are NUL-separated; one terminator per entry.
+    var count = 0;
+    var i = 0;
+    while (i < n) {
+        if (load8(blob + i) == 0) { count = count + 1; }
+        i = i + 1;
     }
-    return exec_vec(args);
+    var envp = alloc((count + 1) * 8);
+    var ei = 0;
+    var start = 0;
+    i = 0;
+    while (i < n) {
+        if (load8(blob + i) == 0) {
+            store64(envp + ei * 8, blob + start);
+            ei = ei + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    store64(envp + ei * 8, 0);
+    return envp;
+}
+
+# Run a shell command line through `/bin/sh -c` so pipes, redirects, inline
+# VAR=val assignments, and $PATH lookup all work — and forward the parent's
+# environment (PATH/HOME/...) to the child so install.sh-style consumers see
+# HOME and sh can resolve curl. Pre-v6.2.34 this space-split the cmdline and
+# execve'd the bare first token directly: shell metacharacters (`|`, `$(...)`,
+# `&&`, `VAR=`) became literal argv, and the bare command name was never
+# $PATH-resolved → ENOENT → silent rc=127. That broke every cyriusly heavy
+# verb (install/update/uninstall/setup/cmdtools): `cyriusly install <ver>`
+# printed "Installing..." then did nothing. See CHANGELOG.
+fn exec_cmd(cmdline): i64 {
+    var argv[40];
+    store64(&argv + 0, "/bin/sh");
+    store64(&argv + 8, "-c");
+    store64(&argv + 16, cmdline);
+    store64(&argv + 24, 0);
+    var envp = _read_environ_envp();
+    if (envp == 0) { envp = alloc(8); store64(envp, 0); }
+    var pid = sys_fork();
+    if (pid < 0) { return 0 - 1; }
+    if (pid == 0) {
+        sys_execve("/bin/sh", &argv, envp);
+        sys_exit(127);
+    }
+    var stbuf[4];
+    sys_waitpid(pid, &stbuf, 0);
+    var st = load32(&stbuf);
+    if (WIFEXITED(st) == 1) { return WEXITSTATUS(st); }
+    return 0 - 1;
 }
 
 #endif

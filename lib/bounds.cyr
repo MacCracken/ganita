@@ -15,7 +15,16 @@ fn _bounds_fail(msg, mlen, idx, len): i64 {
     var _lb[24]; var _ll = fmt_int_buf(len, &_lb);
     syscall(1, 2, &_lb, _ll);
     syscall(1, 2, "\n", 1);
+    # Portable abort: agnos exit=#0; else #60. v6.2.39 — was a bare
+    # syscall(60,1) that no-op'd on agnos (#60 undefined → -1), so a bounds
+    # violation FAILED-OPEN and continued past the bad index. Same guard as
+    # vec/str/hashmap/tagged _die.
+    #ifdef CYRIUS_TARGET_AGNOS
+    syscall(0, 1);
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
     syscall(60, 1);
+    #endif
     return 0;
 }
 
@@ -24,7 +33,16 @@ fn _bounds_neg(msg, mlen): i64 {
     syscall(1, 2, "bounds: ", 8);
     syscall(1, 2, msg, mlen);
     syscall(1, 2, "\n", 1);
+    # Portable abort: agnos exit=#0; else #60. v6.2.39 — was a bare
+    # syscall(60,1) that no-op'd on agnos (#60 undefined → -1), so a bounds
+    # violation FAILED-OPEN and continued past the bad index. Same guard as
+    # vec/str/hashmap/tagged _die.
+    #ifdef CYRIUS_TARGET_AGNOS
+    syscall(0, 1);
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
     syscall(60, 1);
+    #endif
     return 0;
 }
 

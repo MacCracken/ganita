@@ -76,3 +76,28 @@ fn mutex_unlock(m): i64 {
     return 0;
 }
 #endif
+
+#ifdef CYRIUS_TARGET_AGNOS
+# AGNOS ring-3: single-core "cooperative-iron" — its frozen syscall surface has
+# no futex/__ulock, and threads run SERIALLY (lib/thread_agnos.cyr). With no
+# second thread there is never a contender, so the lock is a no-op — the same
+# contract thread_agnos.cyr's mutex uses. The 8-byte cell is still allocated so
+# callers that null-check the returned pointer behave (e.g. patra's _patra_mtx /
+# _pc_mtx / _pt_alloc_mtx). A real blocking lock awaits agnos gaining preemptive
+# multithreading; until then no-op is correct, not a stub. Without this branch
+# mutex_* are undefined on agnos (cycc lowers an undefined call to a ud2/SIGILL),
+# so patra_init()'s unconditional mutex_new() would trap at runtime.
+fn mutex_new(): i64 {
+    alloc_init();
+    var m = alloc(MUTEX_SIZE);
+    if (m == 0) { return 0; }
+    store64(m, 0);
+    return m;
+}
+
+# Acquire — no-op on the single-threaded agnos path (no contender exists).
+fn mutex_lock(m): i64 { return 0; }
+
+# Release — pairs with mutex_lock; no-op (single-threaded).
+fn mutex_unlock(m): i64 { return 0; }
+#endif

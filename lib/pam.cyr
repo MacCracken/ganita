@@ -71,7 +71,7 @@ fn pam_unix_authenticate(user, password): i64 {
     var helper = _pam_find_chkpwd();
     if (helper == 0) { return PAM_AUTH_HELPER_MISSING; }
 
-    var fds[2];
+    var fds[8];
     var pr = sys_pipe(&fds);
     if (pr < 0) { return PAM_AUTH_PIPE_FAILED; }
     var rfd = load32(&fds);
@@ -111,7 +111,7 @@ fn pam_unix_authenticate(user, password): i64 {
     }
     sys_close(wfd);
 
-    var status_buf[1];
+    var status_buf[4];
     sys_waitpid(pid, &status_buf, 0);
     var status = load32(&status_buf);
 

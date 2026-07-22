@@ -17,6 +17,7 @@
 #   0xF003 (61443) SetHandleInformation(handle, mask, flags)
 #   0xF004 (61444) CreatePipe(&rd, &wr, &sa, size)
 #   0xF005 (61445) CreateProcessW(&args10)
+#   0xF01D (61469) TerminateProcess(handle, exitCode)  — v6.4.26, the SIGKILL analogue
 #
 # A spawned "pid" (from spawn()) is the process HANDLE, not a Unix PID —
 # treat it opaquely and pass it to wait_pid(). getpid()/getppid() are stubs
@@ -179,6 +180,42 @@ fn _win_wait_close(pi): i64 {
     return ec;
 }
 
+# v6.4.26 — force-terminate a spawned process. `hProcess` is the process HANDLE
+# (pi+0 from _win_create_process / the opaque "pid" from spawn()); `exitCode` is
+# the exit code the killed child reports. Returns the TerminateProcess BOOL
+# (nonzero=success). The Windows analogue of kill(pid, SIGKILL) — Win32 has no
+# signals, so a runaway child can only be stopped this way.
+# See 2026-07-08-windows-pe-surface-no-terminateprocess.md.
+fn _win_terminate(hProcess, exitCode): i64 {
+    return syscall(61469, hProcess, exitCode);    # TerminateProcess(hProcess, exitCode)
+}
+
+# v6.4.26 — wait for the process in `pi` up to `ms` milliseconds; if it does not
+# exit in time, TerminateProcess it and reap. Returns the child exit code (the
+# forced code 137 = 128+SIGKILL when we had to kill, mirroring the POSIX
+# SIGKILL-exit convention so a downstream can treat both lanes uniformly), and
+# sets *killed_out = 1 iff the deadline was enforced (0 iff it exited on its own).
+# Closes both handles either way. This is the timeout-kill primitive thoth's
+# exec_shell_capture needs on Windows (the analogue of the POSIX deadline+SIGKILL).
+fn _win_wait_timeout(pi, ms, killed_out): i64 {
+    var hProcess = load64(pi + 0);
+    var hThread = load64(pi + 8);
+    store64(killed_out, 0);
+    var wr = syscall(61441, hProcess, ms);        # WaitForSingleObject(hProcess, ms)
+    if (wr == 258) {                              # WAIT_TIMEOUT (0x102) → enforce deadline
+        _win_terminate(hProcess, 137);            # TerminateProcess(hProcess, 137)
+        syscall(61441, hProcess, 4294967295);     # WaitForSingleObject(INFINITE) — reap
+        store64(killed_out, 1);
+    }
+    var code[8];
+    store64(&code, 0);
+    syscall(61442, hProcess, &code);              # GetExitCodeProcess
+    var ec = load32(&code);
+    syscall(3, hThread);                           # CloseHandle(hThread)
+    syscall(3, hProcess);                          # CloseHandle(hProcess)
+    return ec;
+}
+
 # v6.0.85 — spawn `cc < source > output` for `cyrius build` on Windows. cycc
 # reads its source from stdin and writes the PE to stdout; Win32 has no
 # fork/dup2/execve, so we hand the redirect to cmd.exe via CreateProcessW.
@@ -291,11 +328,12 @@ fn wait_pid(pid): Result {
     return Ok(ec);
 }
 
-# Windows self-pid (GetCurrentProcessId) is out of this arc's scope —
-# the v6.0.51 arc routes process *creation*. Returns 0 until a consumer
-# needs it; see issue 2026-06-03-windows-pe-syscall-surface.
-fn getpid(): i64 { return 0; }
-# Parent-pid is likewise unavailable on Win32 within this arc's scope.
+# v6.3.44: real Windows self-PID via kernel32!GetCurrentProcessId (syscall 0xF01C
+# PE reroute). Was a 0-returning stub — the v6.0.51 process arc routed process
+# *creation* and left self-PID out of scope (issue 2026-07-03-getpid-cross-platform).
+fn getpid(): i64 { return syscall(0xF01C); }
+# Parent-pid has no cheap Win32 equivalent (would need a CreateToolhelp32Snapshot
+# walk), so getppid stays a documented 0 stub on Windows.
 fn getppid(): i64 { return 0; }
 
 # ================================================================
@@ -382,15 +420,22 @@ fn exec_env_str(args, env): i64 {
     return _win_wait_close(&pi);
 }
 
-# Build an args vec from a space-separated command string + run it.
+# Run a shell command line through `cmd /s /c "<cmdline>"` so pipes,
+# redirects, and `&&` work, and inherit the parent's environment (wenv=0)
+# so PATH/USERPROFILE reach the child. `/s` strips ONLY the outermost quote
+# pair, so the inner cmdline reaches cmd intact (same rule used by
+# _win_compile_spawn). Pre-v6.2.34 this space-split the cmdline and ran the
+# bare first token via CreateProcessW directly — shell metacharacters became
+# literal argv and nothing piped. See CHANGELOG; mirrors the POSIX
+# /bin/sh -c fix in lib/process.cyr.
 fn exec_cmd(cmdline): i64 {
-    var args = vec_new();
-    var parts = str_split(str_from(cmdline), 32);
-    var pi = 0;
-    while (pi < vec_len(parts)) {
-        var part = vec_get(parts, pi);
-        vec_push(args, str_data(part));
-        pi = pi + 1;
-    }
-    return exec_vec(args);
+    var wbuf = alloc(16384);
+    var o = 0;
+    o = _w_append_cstr(wbuf, o, "cmd /s /c \"");
+    o = _w_append_cstr(wbuf, o, cmdline);
+    o = _w_append_cstr(wbuf, o, "\"");
+    _w_terminate(wbuf, o);
+    var pi[24];
+    if (_win_create_process(wbuf, 0, 0, &pi) == 0) { return 0 - 1; }
+    return _win_wait_close(&pi);
 }

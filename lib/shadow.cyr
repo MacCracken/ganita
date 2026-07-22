@@ -83,7 +83,7 @@ fn _shadow_stash(p, n, strbuf, soff_ptr, strbufsz): i64 {
 }
 
 fn _shadow_parse_line(line_start, line_end, sprec, strbuf, strbufsz): i64 {
-    var soff_store[1];
+    var soff_store[8];
     store64(&soff_store, 0);
 
     # /etc/shadow has 9 fields (8 colons). We only parse 0 (name),

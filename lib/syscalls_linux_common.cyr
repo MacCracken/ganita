@@ -26,7 +26,20 @@
 # Constants centralized here at v6.1.3 (were aarch64-peer-only before).
 
 # Base dirfd meaning "relative to the current working directory".
+# v6.2.40: Darwin's AT_FDCWD is -2, NOT Linux's -100. On arm64 macOS the
+# at-family wrappers below are pulled in (lib/syscalls.cyr includes this
+# via syscalls_aarch64_linux.cyr) and the PURE-renumber at-family calls
+# (renameat 38→465, linkat 37→471, newfstatat 262→470) pass AT_FDCWD
+# straight through to the Darwin syscall — so a -100 dirfd is an invalid
+# fd there (EBADF), silently breaking e.g. `sys_rename` (→ renameat).
+# Found by ports: `cyrius port`'s rust-old/ move was a no-op on Apple
+# Silicon. x86 macOS is unaffected (syscalls_macos.cyr uses bare rename(128)).
+#ifdef CYRIUS_TARGET_MACOS
+var AT_FDCWD = 0 - 2;
+#endif
+#ifndef CYRIUS_TARGET_MACOS
 var AT_FDCWD = 0 - 100;
+#endif
 # fstatat(fd, "", ..., AT_EMPTY_PATH) — operate on the fd itself.
 var AT_EMPTY_PATH = 4096;          # 0x1000
 # unlinkat(...) treated as rmdir.
@@ -69,8 +82,21 @@ fn sys_fchmodat(dirfd, path, mode, flags): i64 {
     return syscall(SYS_FCHMODAT, dirfd, path, mode, flags);
 }
 # utimensat(dirfd, path, times, flags) — set atime/mtime (NULL times = now; UTIME_OMIT to skip one).
+# Darwin has NO utimensat syscall (absent from MacOSX.sdk sys/syscall.h — only
+# setattrlist/setattrlistat exist). No in-tree consumer sets file times on macOS,
+# so rather than emit an unrouted svc 280 (→ garbage/SIGSYS) we return -ENOSYS
+# (Darwin 78) on the macОS build; a setattrlist(2)-based emulation is deferred
+# until a consumer needs it. The two-#ifdef form keeps syscall(280) out of the
+# Mach-O emit entirely (no "syscall not routed" warning). The arch-Linux ESYSXLAT
+# maps 280→88 (utimensat); only the Darwin syscall table lacks it.
+# See issues/2026-06-08-macho-arm-at-family-darwin-syscall-mappings.md, CHANGELOG [6.1.20].
 fn sys_utimensat(dirfd, path, times, flags): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    #ifdef CYRIUS_TARGET_LINUX
     return syscall(SYS_UTIMENSAT, dirfd, path, times, flags);
+    #endif
 }
 
 # ================================================================
@@ -148,6 +174,13 @@ fn sys_setsid(): i64 {
 # Wait for state change in a child process; reaping form.
 fn sys_waitpid(pid, status_ptr, options): i64 {
     return syscall(SYS_WAIT4, pid, status_ptr, options, 0);
+}
+
+# pidfd_open(pid, flags) — a file descriptor for `pid` that becomes readable when
+# the process exits. Lets the async runtime await a child on the epoll reactor
+# without blocking (Linux 5.3+). v6.4.36 (P2 — async subprocess).
+fn sys_pidfd_open(pid, flags): i64 {
+    return syscall(SYS_PIDFD_OPEN, pid, flags);
 }
 
 # Wait-status decoding macros — same shape across both arches
@@ -380,6 +413,32 @@ fn sys_socket(domain, type, protocol): i64 {
 # in-process bidirectional loopback (e.g. TLS handshake e2e).
 fn sys_socketpair(domain, type, protocol, fds): i64 {
     return syscall(SYS_SOCKETPAIR, domain, type, protocol, fds);
+}
+
+# v6.4.64 — the socket band's last missing pair. `addr` points to a caller-owned
+# sockaddr (>= 16 B for sockaddr_in), `addrlen` to an i32 holding its capacity,
+# which the kernel overwrites with the actual length. Return 0 or -errno;
+# getpeername on an unconnected socket is -ENOTCONN.
+#
+# WHY THESE EXIST: there was no wrapper, so sandhi 1.9.0 hardcoded a raw
+# `syscall(52, ...)` for its peer-address API. That is right on x86_64-Linux (52 IS
+# getpeername) and silently catastrophic elsewhere: on aarch64, 52 is **fchmod**, and
+# it SUCCEEDS — the caller believes it obtained a peer address while its buffer is
+# untouched garbage. Verified on real pi. Each peer supplies the number for ITS OWN
+# arch (x86 52/51 · aarch64 205/204 · macOS x86-numbered + EMACHO xlat to BSD 31/32),
+# which is what this file's per-arch split is for. Do NOT "solve" this with an
+# ESYSXLAT entry for x86-52: it collides with the aarch64 peer's SYS_FCHMOD = 52 and
+# remaps fchmod to getpeername (CI caught precisely that — sandbox_syscalls RED on pi).
+# Gate: tests/tcyr/vr01_getpeername_xlat.tcyr.
+fn sys_getpeername(fd, addr, addrlen): i64 {
+    return syscall(SYS_GETPEERNAME, fd, addr, addrlen);
+}
+
+# getsockname(fd, addr, addrlen) — the LOCAL address of a socket. 0 / -errno.
+# Succeeds on an unconnected socket (unlike getpeername), which is what
+# vr01_getpeername_xlat.tcyr uses to prove 51 and 52 are not swapped.
+fn sys_getsockname(fd, addr, addrlen): i64 {
+    return syscall(SYS_GETSOCKNAME, fd, addr, addrlen);
 }
 
 # Set a socket option (e.g. SOL_SOCKET=1 / SO_REUSEADDR=2 to allow

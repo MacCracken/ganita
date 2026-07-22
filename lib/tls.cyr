@@ -44,37 +44,48 @@
 #   +16  socket fd
 #
 # Backend (.80, Mini-arc E bite 4): lib/tls.cyr keeps BOTH transports.
-# Build with `-D CYRIUS_TLS_NATIVE` (or `#define CYRIUS_TLS_NATIVE`) to pull in
-# the sovereign native TLS stack (lib/tls_native.cyr) and default the backend
-# to it; without the flag, the libssl.so.3 fdlopen bridge is the only backend
-# (libssl-only consumers stay light — the native stack isn't compiled in).
-# At runtime, tls_set_backend() switches between TLS_BACKEND_LIBSSL and
-# TLS_BACKEND_NATIVE when both are present. The native client path verifies
-# real certs via the OS trust store (set_ca_system); live external HTTPS still
-# awaits server-flight reassembly (Release B), so the native path is proven
-# our-client ↔ our native server today. Consumers use the same tls_* API +
-# typed tls_set_*() verbs regardless of backend (the handle stays opaque).
-#ifdef CYRIUS_TLS_NATIVE
+#
+# v6.1.21 — default polarity INVERTED (issue 2026-06-09-invert-tls-backend-
+# default-native-no-flag): the sovereign native TLS stack (lib/tls_native.cyr)
+# is now compiled in and selected by DEFAULT, no flag required. Build with
+# `-D CYRIUS_TLS_LIBSSL` to opt OUT to a libssl-only build (lighter — the native
+# stack + sigil X.509/crypto chain isn't linked; the libssl.so.3 fdlopen bridge
+# is the only backend). This makes native the no-flag default now that 6.1.19
+# made it crash-safe (alloc-brk fix) + able to reach public hosts (cert-chain
+# path building); libssl is the deprecated opt-out.
+#
+# BACK-COMPAT: the legacy `-D CYRIUS_TLS_NATIVE` flag (in use across sandhi
+# 1.4.5–1.4.7 CI/release + other consumers) is now a recognized NO-OP — native
+# is already the default, and every guard below is CYRIUS_TLS_LIBSSL-only, so an
+# extra `-D CYRIUS_TLS_NATIVE` is harmless (still native). Deprecated; drop once
+# the ecosystem has re-pinned.
+#
+# In a native (default) build BOTH transports are present, so tls_set_backend()
+# switches between TLS_BACKEND_LIBSSL and TLS_BACKEND_NATIVE at runtime; in a
+# libssl-only build the native path isn't compiled and selecting it returns -1.
+# Consumers use the same tls_* API + typed tls_set_*() verbs regardless of
+# backend (the handle stays opaque).
+#ifndef CYRIUS_TLS_LIBSSL
 include "lib/tls_native.cyr"
 #endif
 
 var TLS_BACKEND_LIBSSL = 0;
 var TLS_BACKEND_NATIVE = 1;
-# Default backend: native when built with CYRIUS_TLS_NATIVE, else libssl.
-#ifdef CYRIUS_TLS_NATIVE
+# Default backend: native unless built libssl-only (-D CYRIUS_TLS_LIBSSL).
+#ifndef CYRIUS_TLS_LIBSSL
 var _tls_backend = 1;
 #endif
-#ifndef CYRIUS_TLS_NATIVE
+#ifdef CYRIUS_TLS_LIBSSL
 var _tls_backend = 0;
 #endif
 
 # Select the active TLS backend (TLS_BACKEND_LIBSSL / TLS_BACKEND_NATIVE).
 # Returns 0 on success, -1 if the requested backend isn't compiled in.
 fn tls_set_backend(b): i64 {
-    if (b == TLS_BACKEND_LIBSSL) { _tls_backend = 0; return 0; }
-    #ifdef CYRIUS_TLS_NATIVE
+    #ifndef CYRIUS_TLS_LIBSSL
     if (b == TLS_BACKEND_NATIVE) { _tls_backend = 1; return 0; }
     #endif
+    if (b == TLS_BACKEND_LIBSSL) { _tls_backend = 0; return 0; }
     return 0 - 1;
 }
 
@@ -140,6 +151,20 @@ var _fn_SSL_CTX_free = 0;
 var _fn_SSL_CTX_set_default_verify_paths = 0;
 var _fn_SSL_CTX_set_verify = 0;
 var _fn_SSL_CTX_set_alpn_protos = 0;
+# v6.2.8: pre-handshake trust-store + mTLS config symbols (the residual of
+# 2026-05-22-cyrius-native-tls-in-6.0.x.md). Soft-resolved (NOT in the
+# minimum-viable hard-bail set) — a consumer fails closed if libssl lacks them.
+var _fn_SSL_CTX_load_verify_locations = 0;
+var _fn_SSL_CTX_use_certificate_file = 0;
+var _fn_SSL_CTX_use_PrivateKey_file = 0;
+# v6.2.24: libssl SERVER-side symbols for the tls_accept wrapper (in-memory DER
+# creds — the form the native backend takes — so the wrapper signature is
+# backend-uniform). Soft-resolved (server-irrelevant on a client-only libssl).
+var _fn_TLS_server_method = 0;
+var _fn_SSL_CTX_use_certificate_ASN1 = 0;   # (ctx, len, der) — DER leaf, in-memory
+var _fn_d2i_AutoPrivateKey = 0;             # (a, &der, len) → EVP_PKEY*, auto-detect type
+var _fn_SSL_CTX_use_PrivateKey = 0;         # (ctx, pkey)
+var _fn_SSL_accept = 0;                      # (ssl) — server handshake
 var _fn_SSL_new = 0;
 var _fn_SSL_free = 0;
 var _fn_SSL_set_fd = 0;
@@ -219,6 +244,9 @@ fn _tls_init(): i64 {
     _fn_SSL_CTX_set_default_verify_paths = fncall2(fn_dlsym, h, "SSL_CTX_set_default_verify_paths");
     _fn_SSL_CTX_set_verify               = fncall2(fn_dlsym, h, "SSL_CTX_set_verify");
     _fn_SSL_CTX_set_alpn_protos          = fncall2(fn_dlsym, h, "SSL_CTX_set_alpn_protos");
+    _fn_SSL_CTX_load_verify_locations    = fncall2(fn_dlsym, h, "SSL_CTX_load_verify_locations");
+    _fn_SSL_CTX_use_certificate_file     = fncall2(fn_dlsym, h, "SSL_CTX_use_certificate_file");
+    _fn_SSL_CTX_use_PrivateKey_file      = fncall2(fn_dlsym, h, "SSL_CTX_use_PrivateKey_file");
     _fn_SSL_new                          = fncall2(fn_dlsym, h, "SSL_new");
     _fn_SSL_free                         = fncall2(fn_dlsym, h, "SSL_free");
     _fn_SSL_set_fd                       = fncall2(fn_dlsym, h, "SSL_set_fd");
@@ -247,6 +275,18 @@ fn _tls_init(): i64 {
     # max-early-data probe (sandhi 1.3.2 client-side 0-RTT).
     _fn_SSL_get_early_data_status        = fncall2(fn_dlsym, h, "SSL_get_early_data_status");
     _fn_SSL_SESSION_get_max_early_data   = fncall2(fn_dlsym, h, "SSL_SESSION_get_max_early_data");
+    # v6.2.24 — server-side symbols for tls_accept (in-memory DER creds + SSL_accept).
+    # Soft-resolved; a client-only libssl simply leaves these 0 and the server
+    # wrapper fails closed (returns 0) rather than hard-bailing _tls_init.
+    _fn_TLS_server_method                = fncall2(fn_dlsym, h, "TLS_server_method");
+    _fn_SSL_CTX_use_certificate_ASN1     = fncall2(fn_dlsym, h, "SSL_CTX_use_certificate_ASN1");
+    _fn_d2i_AutoPrivateKey               = fncall2(fn_dlsym, h, "d2i_AutoPrivateKey");
+    _fn_SSL_CTX_use_PrivateKey           = fncall2(fn_dlsym, h, "SSL_CTX_use_PrivateKey");
+    _fn_SSL_accept                       = fncall2(fn_dlsym, h, "SSL_accept");
+    # EVP_PKEY_free for the d2i_AutoPrivateKey reference in tls_accept_alloc —
+    # _tls_resolve_introspect() also resolves it, but tls_accept_alloc doesn't
+    # call that, so resolve it here too (idempotent) to avoid a silent leak.
+    _fn_EVP_PKEY_free_v                  = fncall2(fn_dlsym, h, "EVP_PKEY_free");
 
     # Minimum viable set — bail if any critical symbol missing
     if (_fn_TLS_client_method == 0) { return 0; }
@@ -263,7 +303,7 @@ fn _tls_init(): i64 {
 }
 
 # Returns 1 if TLS support is available on this system
-#ifdef CYRIUS_TLS_NATIVE
+#ifndef CYRIUS_TLS_LIBSSL
 # ---- Native-backend client path (.80, Mini-arc E bite 4) ----
 # Shim ctx for the native backend: [native_ctx@0, 0@8, sock@16, NATIVE@24].
 # Mirrors the libssl shim's +0/+8/+16 so the per-ctx ops dispatch uniformly.
@@ -289,15 +329,11 @@ fn _tls_native_alloc(sock, host, hook_fp, hook_ctx): i64 {
 
 fn _tls_native_complete(ctx): i64 {
     var nctx = load64(ctx);
+    # CVE-18 (v6.1.36): tls_native_connect is now fail-closed — it verifies the
+    # chain (to a trusted root) AND the hostname (dNSName or iPAddress SAN) per
+    # the ctx verify mode before returning TLS_OK, so the wrapper no longer
+    # re-verifies (and no longer skips hostname binding when host==0).
     if (tls_native_connect(nctx, load64(ctx + 16)) != TLS_OK) { return 0; }
-    # connect() does NOT auto-verify — enforce the peer-verification contract
-    # (chain to a trusted root + SNI hostname) unless verify is NONE.
-    if (load64(nctx + TLS_CTX_OFF_VERIFY) != TLS_VERIFY_NONE) {
-        if (tls_native_client_verify_chain(nctx, syscall(201, 0)) != TLS_OK) { return 0; }
-        if (load64(nctx + TLS_CTX_OFF_HOST) != 0) {
-            if (tls_native_client_verify_hostname(nctx) != TLS_OK) { return 0; }
-        }
-    }
     return 1;
 }
 #endif
@@ -305,7 +341,7 @@ fn _tls_native_complete(ctx): i64 {
 # Returns 1 if the active TLS backend is usable. Native is always available;
 # the libssl backend reports whether libssl.so.3 loaded via the fdlopen bridge.
 fn tls_available(): i64 {
-    #ifdef CYRIUS_TLS_NATIVE
+    #ifndef CYRIUS_TLS_LIBSSL
     if (_tls_backend == 1) { return 1; }   # native is always available
     #endif
     _tls_init();
@@ -330,7 +366,7 @@ fn tls_available(): i64 {
 # page).
 fn tls_set_alpn(handle, protos, protos_len): i64 {
     if (handle == 0) { return 0 - 1; }
-    #ifdef CYRIUS_TLS_NATIVE
+    #ifndef CYRIUS_TLS_LIBSSL
     if (_tls_backend == 1) { return tls_native_set_alpn(handle, protos, protos_len); }
     #endif
     if (_fn_SSL_CTX_set_alpn_protos == 0) { return 0 - 1; }
@@ -351,7 +387,7 @@ fn tls_set_alpn(handle, protos, protos_len): i64 {
 # unresolved symbol.
 fn tls_set_verify(handle, mode, callback): i64 {
     if (handle == 0) { return 0 - 1; }
-    #ifdef CYRIUS_TLS_NATIVE
+    #ifndef CYRIUS_TLS_LIBSSL
     if (_tls_backend == 1) {
         # Native has no pluggable verify callback — map the OpenSSL mode
         # bitmask to native PEER/NONE; the callback arg is ignored.
@@ -363,6 +399,88 @@ fn tls_set_verify(handle, mode, callback): i64 {
     if (_fn_SSL_CTX_set_verify == 0) { return 0 - 1; }
     fncall3(_fn_SSL_CTX_set_verify, handle, mode, callback);
     return 0;
+}
+
+# ---- Typed pre-handshake trust-store + mTLS config verbs (v6.2.8) ----
+# The residual of docs/development/issues/2026-05-22-cyrius-native-tls-in-6.0.x.md:
+# backend-agnostic replacements for sandhi's remaining `tls_dlsym("SSL_CTX_*")`
+# trust/mTLS callers (src/tls_policy/apply.cyr). Native ENFORCES via the
+# tls_native trust-store + client-auth machinery; libssl routes to the SSL_CTX_*
+# symbols. Contract: return **1 = success**, <=0 = failure (OpenSSL convention,
+# which sandhi already checks with `!= 1`); native TLS_OK(0) maps to 1. The
+# `handle` is the bare native ctx (or SSL_CTX* under libssl) the hook receives.
+
+# Load a custom CA trust store from `cafile` (PEM). `capath` (per-directory
+# store) is honoured only under libssl — native has no directory store, so the
+# native path slurps `cafile` and installs it via the CA bundle. Returns 1/0/-1.
+fn tls_ctx_load_verify_locations(handle, cafile, capath): i64 {
+    if (handle == 0) { return 0 - 1; }
+    #ifndef CYRIUS_TLS_LIBSSL
+    if (_tls_backend == 1) {
+        var cap = 1048576;
+        var buf = alloc(cap);
+        if (buf == 0) { return 0; }
+        var n = file_read_all(cafile, buf, cap);
+        if (n <= 0) { return 0; }
+        if (tls_native_set_ca_bundle(handle, buf, n, 0) == TLS_OK) { return 1; }
+        return 0;
+    }
+    #endif
+    if (_fn_SSL_CTX_load_verify_locations == 0) { return 0 - 1; }
+    return fncall3(_fn_SSL_CTX_load_verify_locations, handle, cafile, capath);
+}
+
+# Trust the OS default CA store (system trust paths). Returns 1/0/-1.
+fn tls_ctx_set_verify_paths(handle): i64 {
+    if (handle == 0) { return 0 - 1; }
+    #ifndef CYRIUS_TLS_LIBSSL
+    if (_tls_backend == 1) {
+        if (tls_native_set_ca_system(handle) == TLS_OK) { return 1; }
+        return 0;
+    }
+    #endif
+    if (_fn_SSL_CTX_set_default_verify_paths == 0) { return 0 - 1; }
+    return fncall1(_fn_SSL_CTX_set_default_verify_paths, handle);
+}
+
+# mTLS: present the client's own certificate. `type` = SSL_FILETYPE_PEM(1) /
+# SSL_FILETYPE_ASN1(2 = DER). Pair with tls_ctx_use_private_key_file. Returns 1/0/-1.
+fn tls_ctx_use_certificate_file(handle, path, type): i64 {
+    if (handle == 0) { return 0 - 1; }
+    #ifndef CYRIUS_TLS_LIBSSL
+    if (_tls_backend == 1) {
+        var cap = 65536;
+        var buf = alloc(cap);
+        if (buf == 0) { return 0; }
+        var n = file_read_all(path, buf, cap);
+        if (n <= 0) { return 0; }
+        var is_der = 0;
+        if (type == 2) { is_der = 1; }
+        if (tls_native_set_client_cert(handle, buf, n, is_der) == TLS_OK) { return 1; }
+        return 0;
+    }
+    #endif
+    if (_fn_SSL_CTX_use_certificate_file == 0) { return 0 - 1; }
+    return fncall3(_fn_SSL_CTX_use_certificate_file, handle, path, type);
+}
+
+# mTLS: install the client's own private key. `type` as above (native auto-
+# detects PEM vs DER by content). Returns 1/0/-1.
+fn tls_ctx_use_private_key_file(handle, path, type): i64 {
+    if (handle == 0) { return 0 - 1; }
+    #ifndef CYRIUS_TLS_LIBSSL
+    if (_tls_backend == 1) {
+        var cap = 65536;
+        var buf = alloc(cap);
+        if (buf == 0) { return 0; }
+        var n = file_read_all(path, buf, cap);
+        if (n <= 0) { return 0; }
+        if (tls_native_set_client_key(handle, buf, n) == TLS_OK) { return 1; }
+        return 0;
+    }
+    #endif
+    if (_fn_SSL_CTX_use_PrivateKey_file == 0) { return 0 - 1; }
+    return fncall3(_fn_SSL_CTX_use_PrivateKey_file, handle, path, type);
 }
 
 # ---- Typed peer-introspection verbs (.82, Mini-arc E) ----
@@ -396,7 +514,7 @@ fn _tls_resolve_introspect(): i64 {
 # its byte length, or 0 if none was negotiated.
 fn tls_get_alpn_selected(ctx, buf, bufmax): i64 {
     if (ctx == 0) { return 0; }
-    #ifdef CYRIUS_TLS_NATIVE
+    #ifndef CYRIUS_TLS_LIBSSL
     if (_tls_backend == 1) { return tls_native_get_alpn_selected(load64(ctx), buf, bufmax); }
     #endif
     _tls_resolve_introspect();
@@ -423,7 +541,7 @@ fn tls_get_alpn_selected(ctx, buf, bufmax): i64 {
 # consumers SHA-256 it.
 fn tls_get_peer_spki_der(ctx, buf, bufmax): i64 {
     if (ctx == 0) { return 0; }
-    #ifdef CYRIUS_TLS_NATIVE
+    #ifndef CYRIUS_TLS_LIBSSL
     if (_tls_backend == 1) { return tls_native_get_peer_spki_der(load64(ctx), buf, bufmax); }
     #endif
     _tls_resolve_introspect();
@@ -529,7 +647,7 @@ fn tls_dlsym(name): i64 {
 # release. Returns 0 on any allocation/binding/hook failure (all
 # resources released in the error path before return).
 fn tls_connect_alloc(sock, host, hook_fp, hook_ctx): i64 {
-    #ifdef CYRIUS_TLS_NATIVE
+    #ifndef CYRIUS_TLS_LIBSSL
     if (_tls_backend == 1) { return _tls_native_alloc(sock, host, hook_fp, hook_ctx); }
     #endif
     _tls_init();
@@ -596,7 +714,7 @@ fn tls_connect_alloc(sock, host, hook_fp, hook_ctx): i64 {
 # may want to inspect SSL_get_error before freeing).
 fn tls_connect_complete(ctx): i64 {
     if (ctx == 0) { return 0; }
-    #ifdef CYRIUS_TLS_NATIVE
+    #ifndef CYRIUS_TLS_LIBSSL
     if (_tls_backend == 1) { return _tls_native_complete(ctx); }
     #endif
     var ssl = load64(ctx + 8);
@@ -628,10 +746,161 @@ fn tls_connect_with_ctx_hook(sock, host, hook_fp, hook_ctx): i64 {
     return ctx;
 }
 
+# ====================================================================
+# Server-side handshake wrapper (v6.2.24) — the symmetric mirror of the
+# client tls_connect_alloc / tls_connect_complete / tls_connect trio, so a
+# TLS *server* consumer rides the backend-dispatched contract instead of
+# reaching past it into the tls_native_* primitives (the asymmetry issue
+# 2026-06-18-lib-tls-cyr-no-server-handshake-wrapper). The I/O verbs
+# (tls_write/read/close) already operate on the shim for either role.
+#
+# creds is a 4-slot struct [cert@0, cert_len@8, key@16, key_len@24] — DER
+# buffers, the form tls_native_new_server takes. Packed into one pointer (vs
+# 4 positional args) so tls_accept_alloc stays within the 6-register ABI with
+# its hook pair, mirroring how the client passes a single `host`. The cert/key
+# buffers are referenced (not copied) until the handshake — the caller owns
+# their lifetime through tls_accept_complete.
+# ====================================================================
+#ifndef CYRIUS_TLS_LIBSSL
+# v6.2.25: `a` (Allocator handle, 0 = global bump) backs the native ctx + every
+# per-connection handshake alloc AND this 40-B shim, so a server loop reset_via(a)s
+# the whole connection footprint → flat RSS. a==0 is byte-identical to .24.
+fn _tls_native_accept_alloc_in(a, sock, creds, hook_fp, hook_ctx): i64 {
+    var nctx = tls_native_new_server_in(a, load64(creds), load64(creds + 8), load64(creds + 16), load64(creds + 24));
+    if (nctx == 0) { return 0; }
+    # creds must be loaded BEFORE the handshake (fail-fast on bad cert/key).
+    if (tls_native_server_load_creds(nctx) != TLS_OK) { return 0; }
+    # Hook fires on the native ctx (opaque handle) post-setup / pre-accept —
+    # the home for tls_set_alpn / client-cert-verify config, exactly as the
+    # client hook fires on nctx in _tls_native_alloc.
+    if (hook_fp != 0) {
+        if (fncall2(hook_fp, hook_ctx, nctx) != 0) { return 0; }
+    }
+    var ctx = _tn_alloc_a(a, 40);
+    store64(ctx, nctx);
+    store64(ctx + 8, 0);
+    store64(ctx + 16, sock);
+    store64(ctx + 24, TLS_BACKEND_NATIVE);
+    return ctx;
+}
+
+fn _tls_native_accept_alloc(sock, creds, hook_fp, hook_ctx): i64 {
+    return _tls_native_accept_alloc_in(0, sock, creds, hook_fp, hook_ctx);
+}
+
+fn _tls_native_accept_complete(ctx): i64 {
+    if (tls_native_accept(load64(ctx), load64(ctx + 16)) != TLS_OK) { return 0; }
+    return 1;
+}
+#endif
+
+# Phase 1: build a server ctx from DER cert/key (+ optional config hook), return
+# the standard backend shim (40B native [nctx,0,sock,NATIVE] / 24B libssl
+# [ssl_ctx,ssl,sock]) or 0. Configure ALPN/verify in the hook, then drive the
+# handshake with tls_accept_complete.
+fn tls_accept_alloc(sock, creds, hook_fp, hook_ctx): i64 {
+    #ifndef CYRIUS_TLS_LIBSSL
+    if (_tls_backend == 1) { return _tls_native_accept_alloc(sock, creds, hook_fp, hook_ctx); }
+    #endif
+    _tls_init();
+    if (_tls_ok == 0) { return 0; }
+    if (_fn_TLS_server_method == 0) { return 0; }   # client-only libssl: fail closed
+    var method = fncall0(_fn_TLS_server_method);
+    if (method == 0) { return 0; }
+    var ssl_ctx = fncall1(_fn_SSL_CTX_new, method);
+    if (ssl_ctx == 0) { return 0; }
+    # In-memory DER creds (vs the path-based SSL_CTX_use_*_file): leaf cert via
+    # *_ASN1, private key via d2i_AutoPrivateKey (auto-detects RSA/EC/Ed25519).
+    if (_fn_SSL_CTX_use_certificate_ASN1 == 0) { fncall1(_fn_SSL_CTX_free, ssl_ctx); return 0; }
+    if (fncall3(_fn_SSL_CTX_use_certificate_ASN1, ssl_ctx, load64(creds + 8), load64(creds)) != 1) {
+        fncall1(_fn_SSL_CTX_free, ssl_ctx); return 0;
+    }
+    if (_fn_d2i_AutoPrivateKey == 0) { fncall1(_fn_SSL_CTX_free, ssl_ctx); return 0; }
+    # d2i_AutoPrivateKey advances its 2nd arg, so pass the address of a cell
+    # holding the DER pointer (not the pointer directly).
+    var pcell = alloc(8);
+    store64(pcell, load64(creds + 16));
+    var pkey = fncall3(_fn_d2i_AutoPrivateKey, 0, pcell, load64(creds + 24));
+    if (pkey == 0) { fncall1(_fn_SSL_CTX_free, ssl_ctx); return 0; }
+    if (_fn_SSL_CTX_use_PrivateKey == 0) { fncall1(_fn_SSL_CTX_free, ssl_ctx); return 0; }
+    var pk_rc = fncall2(_fn_SSL_CTX_use_PrivateKey, ssl_ctx, pkey);
+    # SSL_CTX_use_PrivateKey up-refs the key, so release our d2i_AutoPrivateKey
+    # reference on EVERY path (success + failure) — else one EVP_PKEY leaks per
+    # accepted connection (matches the tls_get_peer_spki_der convention).
+    if (_fn_EVP_PKEY_free_v != 0) { fncall1(_fn_EVP_PKEY_free_v, pkey); }
+    if (pk_rc != 1) { fncall1(_fn_SSL_CTX_free, ssl_ctx); return 0; }
+    # Hook on the bare SSL_CTX (ALPN / verify / extra chain), mirroring client.
+    if (hook_fp != 0) {
+        if (fncall2(hook_fp, hook_ctx, ssl_ctx) != 0) { fncall1(_fn_SSL_CTX_free, ssl_ctx); return 0; }
+    }
+    var ssl = fncall1(_fn_SSL_new, ssl_ctx);
+    if (ssl == 0) { fncall1(_fn_SSL_CTX_free, ssl_ctx); return 0; }
+    fncall2(_fn_SSL_set_fd, ssl, sock);
+    var ctx = alloc(24);
+    store64(ctx, ssl_ctx);
+    store64(ctx + 8, ssl);
+    store64(ctx + 16, sock);
+    return ctx;
+}
+
+# Phase 2: drive the server handshake over the shim's socket. 1 on success, 0 on
+# failure (caller tls_close()s the ctx). Mirrors tls_connect_complete.
+fn tls_accept_complete(ctx): i64 {
+    if (ctx == 0) { return 0; }
+    #ifndef CYRIUS_TLS_LIBSSL
+    if (_tls_backend == 1) { return _tls_native_accept_complete(ctx); }
+    #endif
+    var ssl = load64(ctx + 8);
+    if (ssl == 0) { return 0; }
+    if (_fn_SSL_accept == 0) { return 0; }   # client-only libssl: fail closed
+    if (fncall1(_fn_SSL_accept, ssl) != 1) { return 0; }
+    return 1;
+}
+
+# Convenience: accept + complete in one call (no config hook). Mirrors
+# tls_connect. cert/key are DER buffers; for ALPN/verify config use
+# tls_accept_alloc with a hook + tls_accept_complete.
+fn tls_accept(sock, cert, cert_len, key, key_len): i64 {
+    var creds: i64[4];
+    store64(&creds, cert);
+    store64(&creds + 8, cert_len);
+    store64(&creds + 16, key);
+    store64(&creds + 24, key_len);
+    var ctx = tls_accept_alloc(sock, &creds, 0, 0);
+    if (ctx == 0) { return 0; }
+    if (tls_accept_complete(ctx) != 1) { tls_close(ctx); return 0; }
+    return ctx;
+}
+
+# v6.2.25: arena-backed server-accept (flat-RSS). `a` is an Allocator handle
+# (lib/alloc.cyr — e.g. arena_allocator(cap)). The ctx + the whole per-connection
+# native handshake/record footprint + the shim draw from `a`, so a server loop
+# can reclaim it all with one reset_via(a) per connection:
+#
+#   var a = arena_allocator(131072);            # once (mTLS-1.3 worst case)
+#   while (accept) {
+#       var c = tls_accept_alloc_in(a, sock, &creds, hook, 0);
+#       if (tls_accept_complete(c) == 1) { ...serve...; }
+#       tls_close(c);
+#       reset_via(a);                            # rewind → flat RSS
+#   }
+#
+# Use arena_new/arena_allocator ONCE (not per connection — arena_free doesn't
+# munmap); reset_via (NOT alloc_reset) between connections. The arena cap must
+# cover the worst single handshake, since reset only fires between connections.
+# The libssl backend manages its own memory, so `a` doesn't apply there — it
+# routes to the global tls_accept_alloc. tls_accept_alloc is the a==0 wrapper.
+fn tls_accept_alloc_in(a, sock, creds, hook_fp, hook_ctx): i64 {
+    #ifndef CYRIUS_TLS_LIBSSL
+    if (_tls_backend == 1) { return _tls_native_accept_alloc_in(a, sock, creds, hook_fp, hook_ctx); }
+    #endif
+    return tls_accept_alloc(sock, creds, hook_fp, hook_ctx);
+}
+
 # Write through TLS session
 fn tls_write(ctx, buf, len): i64 {
     if (ctx == 0) { return 0 - 1; }
-    #ifdef CYRIUS_TLS_NATIVE
+    #ifndef CYRIUS_TLS_LIBSSL
     if (_tls_backend == 1) {
         # Native caps a record at TLS_RECORD_MAX_PLAINTEXT; libssl fragments
         # internally, so loop-fragment here to keep the bytes-written contract.
@@ -654,7 +923,7 @@ fn tls_write(ctx, buf, len): i64 {
 # Read from TLS session
 fn tls_read(ctx, buf, maxlen): i64 {
     if (ctx == 0) { return 0 - 1; }
-    #ifdef CYRIUS_TLS_NATIVE
+    #ifndef CYRIUS_TLS_LIBSSL
     if (_tls_backend == 1) { return tls_native_read(load64(ctx), buf, maxlen); }
     #endif
     var ssl = load64(ctx + 8);
@@ -664,7 +933,7 @@ fn tls_read(ctx, buf, maxlen): i64 {
 # Close TLS session and free resources
 fn tls_close(ctx): i64 {
     if (ctx == 0) { return 0; }
-    #ifdef CYRIUS_TLS_NATIVE
+    #ifndef CYRIUS_TLS_LIBSSL
     if (_tls_backend == 1) { tls_native_close(load64(ctx)); return 0; }
     #endif
     var ssl_ctx = load64(ctx);
@@ -798,7 +1067,7 @@ fn tls_write_early_data(ctx, buf, len): i64 {
     if (ctx == 0) { return 0 - 1; }
     if (_fn_SSL_write_early_data == 0) { return 0 - 1; }
     var ssl = load64(ctx + 8);
-    var written[1];
+    var written[8];
     store64(&written, 0);
     var rc = fncall4(_fn_SSL_write_early_data, ssl, buf, len, &written);
     if (rc != 1) { return 0 - 1; }
@@ -816,7 +1085,7 @@ fn tls_read_early_data(ctx, buf, maxlen): i64 {
     if (ctx == 0) { return 0 - 1; }
     if (_fn_SSL_read_early_data == 0) { return 0 - 1; }
     var ssl = load64(ctx + 8);
-    var rdb[1];
+    var rdb[8];
     store64(&rdb, 0);
     var status = fncall4(_fn_SSL_read_early_data, ssl, buf, maxlen, &rdb);
     if (status == SSL_READ_EARLY_DATA_SUCCESS) { return load64(&rdb); }

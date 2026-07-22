@@ -65,6 +65,16 @@
 #     0..127 normal exit; 128+sig on signal; -1 on
 #     fork/exec/syscall failure; -2 specifically for timeout.
 
+# v6.2.7: AGNOS has no fork/dup2/execve/chdir/wait4 — the POSIX fork+exec model
+# the process/SSH verbs below use can't map onto agnos's in-memory-ELF SYS_SPAWN.
+# Route those verbs to a fail-closed peer (mirrors process.cyr → process_agnos.cyr,
+# v6.0.51). The PORTABLE verbs (display, buffer-scan, regression_network_probe,
+# regression_ssh_target) stay shared. Resolves the regression.cyr cascade layer of
+# docs/development/issues/2026-06-15-cyrius-thread-agnos-clone-dispatch.md.
+#ifdef CYRIUS_TARGET_AGNOS
+include "lib/regression_agnos.cyr"
+#endif
+
 # ── Display ───────────────────────────────
 
 var REGRESSION_ANSI_RED   = "\x1b[31m";
@@ -160,6 +170,7 @@ fn regression_file_contains_substr(path, substr): i64 {
 # Returns WEXITSTATUS or 128+sig on signal; -1 on syscall
 # failure. Fork+exec with explicit envp (caller supplies; pass
 # `0`-terminated array for empty env).
+#ifndef CYRIUS_TARGET_AGNOS
 fn regression_pipe_to_bin_capture(bin_path, src_path, out_path, envp): i64 {
     var src_cap = 1048576;
     var src_buf = alloc(src_cap);
@@ -208,7 +219,7 @@ fn regression_pipe_to_bin_capture(bin_path, src_path, out_path, envp): i64 {
         else { written = written + w; }
     }
     sys_close(wfd);
-    var stbuf[1];
+    var stbuf[4];
     sys_waitpid(pid, &stbuf, 0);
     var status = load32(&stbuf);
     if (WIFEXITED(status) == 1) { return WEXITSTATUS(status); }
@@ -250,7 +261,7 @@ fn regression_run_with_timeout(bin_path, timeout_ms, envp): i64 {
         sys_execve(bin_path, &argv, envp);
         sys_exit(127);
     }
-    var stbuf[1];
+    var stbuf[4];
     var elapsed = 0;
     while (elapsed < timeout_ms) {
         var w = sys_waitpid(pid, &stbuf, 1);
@@ -273,12 +284,25 @@ fn regression_run_with_timeout(bin_path, timeout_ms, envp): i64 {
 # Run `bin_path` (no args), capture stdout into `buf[0..buflen)`,
 # discard stderr. Returns bytes captured (>= 0) or 0 on
 # fork/open failure. envp threaded through.
-fn regression_exec_capture(bin_path, buf, buflen, envp): i64 {
+# v6.1.35 (CO-02): the exit-status-aware core. `status_out` points to TWO i64
+# slots: [0] = exit code (stdlib convention: 0..127 normal, 128+sig on signal,
+# -1 on fork/open/exec failure), [1] = 1 if the child was killed by a signal
+# (a crash), else 0. The split lets a caller distinguish a normal nonzero exit
+# (an output-only fixture returning its last value, e.g. 152) from a crash —
+# a single 128+sig code can't (exit(152) aliases signal 24). This closes
+# CO-02: the check.sh tcyr gate waited but never read status, so a tcyr that
+# crashed before its summary, or exited nonzero after "0 failed", was recorded
+# as PASS. `regression_exec_capture` keeps its bytes-only public contract below.
+fn regression_exec_capture_status(bin_path, buf, buflen, envp, status_out): i64 {
     var out_path = _regression_tmp_path("audit_xc_");
     var out_fd = sys_open(out_path, 577, 420);
-    if (out_fd < 0) { return 0; }
+    if (out_fd < 0) { store64(status_out, 0 - 1); store64(status_out + 8, 0); return 0; }
     var pid = sys_fork();
-    if (pid < 0) { sys_close(out_fd); sys_unlink(out_path); return 0; }
+    if (pid < 0) {
+        sys_close(out_fd); sys_unlink(out_path);
+        store64(status_out, 0 - 1); store64(status_out + 8, 0);
+        return 0;
+    }
     if (pid == 0) {
         sys_dup2(out_fd, 1);
         sys_close(out_fd);
@@ -293,12 +317,27 @@ fn regression_exec_capture(bin_path, buf, buflen, envp): i64 {
         sys_exit(127);
     }
     sys_close(out_fd);
-    var stbuf[1];
+    var stbuf[4];
     sys_waitpid(pid, &stbuf, 0);
+    var status = load32(&stbuf);
+    var code = 0 - 1;
+    var sig = 0;
+    if (WIFEXITED(status) == 1) { code = WEXITSTATUS(status); }
+    if (WIFSIGNALED(status) == 1) { code = 128 + WTERMSIG(status); sig = 1; }
+    store64(status_out, code);
+    store64(status_out + 8, sig);
     var total = file_read_all(out_path, buf, buflen);
     sys_unlink(out_path);
     if (total < 0) { return 0; }
     return total;
+}
+
+# Run `bin_path` (no args), capture stdout into `buf[0..buflen)`, discard
+# stderr. Returns bytes captured (>= 0) or 0 on fork/open failure; the exit
+# status is discarded (use regression_exec_capture_status to observe it).
+fn regression_exec_capture(bin_path, buf, buflen, envp): i64 {
+    var _st[16];
+    return regression_exec_capture_status(bin_path, buf, buflen, envp, &_st);
 }
 
 # Run `bin_path` (no args), discard stdout + stderr. Returns
@@ -319,7 +358,7 @@ fn regression_exec_run(bin_path, envp): i64 {
         sys_execve(bin_path, &argv, envp);
         sys_exit(127);
     }
-    var stbuf[1];
+    var stbuf[4];
     sys_waitpid(pid, &stbuf, 0);
     var status = load32(&stbuf);
     if (WIFEXITED(status) == 1) { return WEXITSTATUS(status); }
@@ -350,7 +389,7 @@ fn regression_exec_with_arg_capture(bin_path, arg, buf, buflen, envp): i64 {
         sys_exit(127);
     }
     sys_close(out_fd);
-    var stbuf[1];
+    var stbuf[4];
     sys_waitpid(pid, &stbuf, 0);
     var total = file_read_all(out_path, buf, buflen);
     sys_unlink(out_path);
@@ -382,13 +421,14 @@ fn regression_exec_with_arg_capture_both(bin_path, arg, buf, buflen, envp): i64 
         sys_exit(127);
     }
     sys_close(out_fd);
-    var stbuf[1];
+    var stbuf[4];
     sys_waitpid(pid, &stbuf, 0);
     var total = file_read_all(out_path, buf, buflen);
     sys_unlink(out_path);
     if (total < 0) { return 0; }
     return total;
 }
+#endif
 
 # ── Network ───────────────────────────────
 
@@ -408,12 +448,26 @@ fn regression_exec_with_arg_capture_both(bin_path, arg, buf, buflen, envp): i64 
 # Both now compose on the stdlib primitive (sandhi's
 # switchover is sandhi-side per ADR 0001).
 fn regression_network_probe(addr_ipv4, port, timeout_ms): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    # AGNOS: raw syscall(41) is SYS_SLEEP_MS (mis-dispatch). Use the portable
+    # net.cyr socket adapter (tcp_socket reserves a conn slot, net_connect_nb is
+    # agnos-guarded to the blocking #47 connect). v6.2.7.
+    var sr = tcp_socket();
+    if (is_err_result(sr) == 1) { return 0; }
+    var afd = payload(sr);
+    var arc = net_connect_nb(afd, addr_ipv4, port, timeout_ms);
+    sock_close(afd);
+    if (arc == 0) { return 1; }
+    return 0;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
     var fd = syscall(41, 2, 1, 0);                          # socket(AF_INET, SOCK_STREAM)
     if (fd < 0) { return 0; }
     var rc = net_connect_nb(fd, addr_ipv4, port, timeout_ms);
     sys_close(fd);
     if (rc == 0) { return 1; }
     return 0;
+    #endif
 }
 
 # ── SSH cluster ───────────────────────────
@@ -436,6 +490,7 @@ fn regression_ssh_target(env_name, default_name): i64 {
 # `echo alive` (not `true`) — v5.9.32 portability fix: `true` is
 # a Unix builtin missing on Windows PowerShell remotes (cass);
 # `echo alive` works on Linux + macOS + Windows-PowerShell.
+#ifndef CYRIUS_TARGET_AGNOS
 fn regression_ssh_skip_check(target): i64 {
     var pid = sys_fork();
     if (pid < 0) { return 0; }
@@ -461,7 +516,7 @@ fn regression_ssh_skip_check(target): i64 {
         sys_execve("/bin/ssh",     &argv, &envp);
         sys_exit(127);
     }
-    var stbuf[1];
+    var stbuf[4];
     sys_waitpid(pid, &stbuf, 0);
     var status = load32(&stbuf);
     if (WIFEXITED(status) == 1) {
@@ -491,7 +546,7 @@ fn regression_scp_to(target, local_path, remote_path, envp): i64 {
         sys_execve("/bin/scp",     &argv, envp);
         sys_exit(127);
     }
-    var stbuf[1];
+    var stbuf[4];
     sys_waitpid(pid, &stbuf, 0);
     var status = load32(&stbuf);
     if (WIFEXITED(status) == 1) { return WEXITSTATUS(status); }
@@ -521,7 +576,7 @@ fn regression_ssh_remote_exit(target, command, envp): i64 {
         sys_execve("/bin/ssh",     &argv, envp);
         sys_exit(127);
     }
-    var stbuf[1];
+    var stbuf[4];
     sys_waitpid(pid, &stbuf, 0);
     var status = load32(&stbuf);
     if (WIFEXITED(status) == 1) { return WEXITSTATUS(status); }
@@ -553,7 +608,7 @@ fn regression_ssh_remote_exec_capture(target, command, out_path, envp): i64 {
         sys_exit(127);
     }
     sys_close(out_fd);
-    var stbuf[1];
+    var stbuf[4];
     sys_waitpid(pid, &stbuf, 0);
     var status = load32(&stbuf);
     if (WIFEXITED(status) == 1) { return WEXITSTATUS(status); }
@@ -612,7 +667,7 @@ fn regression_exec_in_dir3(work_dir, bin_path, arg1, arg2, arg3, out_path, envp)
         sys_exit(127);
     }
     sys_close(out_fd);
-    var stbuf[1];
+    var stbuf[4];
     sys_waitpid(pid, &stbuf, 0);
     var status = load32(&stbuf);
     if (WIFEXITED(status) == 1) { return WEXITSTATUS(status); }
@@ -649,6 +704,7 @@ fn regression_exec_in_dir3_env(work_dir, bin_path, arg1, arg2, arg3, env_extras_
     store64(merged + mi * 8, 0);
     return regression_exec_in_dir3(work_dir, bin_path, arg1, arg2, arg3, out_path, merged);
 }
+#endif
 
 # ── Internal helpers (underscore prefix; not part of the
 # public surface but consistent within this module) ────────

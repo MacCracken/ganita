@@ -90,7 +90,7 @@ fn _grp_parse_header(line_start, line_end, grrec, strbuf, strbufsz): i64 {
     var soff_store[8];
     store64(&soff_store, 0);
 
-    var field_starts[4];
+    var field_starts: i64[4];   # v6.2.1: 4 i64 field-offset slots (was [4]=1 slot → OOB writing fields 1..3)
     var field_idx = 0;
     store64(&field_starts, line_start);
 

@@ -628,6 +628,13 @@ fn _dynlib_run_init(handle, bias, init_vaddr, init_array_vaddr, init_array_sz): 
 # Loads dependencies recursively, processes relocations, runs init.
 # Returns handle pointer or 0 on failure.
 fn dynlib_open(path): i64 {
+    # v6.2.43: agnos is static-only — no dynamic linking, no ELF .so loader. The
+    # raw Linux syscalls below (mmap/open/read/…) mis-dispatch on agnos, so fail
+    # closed (return 0 = no handle). Defensive — no agnos consumer reaches dynlib
+    # (issue 2026-06-23-agnos-portability-sweep-residuals, part 2).
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;
+    #endif
     # Check if already loaded
     var existing = _dynlib_find_loaded(path);
     if (existing != 0) { return existing; }
@@ -877,6 +884,11 @@ fn dynlib_open(path): i64 {
 # Returns the TLS block pointer (caller can keep it for debugging)
 # or 0 if the syscall failed.
 fn dynlib_bootstrap_tls(): i64 {
+    # v6.2.43: agnos static-only — no glibc TLS bootstrap (raw syscalls
+    # mis-dispatch). Fail closed. (agnos-portability-sweep-residuals, part 2.)
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;
+    #endif
     var tls = alloc(4096);
     if (tls == 0) { return 0; }
     var i = 0;
@@ -1063,6 +1075,11 @@ fn dynlib_bootstrap_environ(hc): i64 {
 # Shipping this primitive standalone — useful independent of the
 # NSS dispatch work (v5.5.25 auxv synthesis investigation).
 fn dynlib_read_auxv(buf, maxbytes): i64 {
+    # v6.2.43: agnos has no Linux ELF auxv (raw open/read of /proc mis-dispatch).
+    # Return 0 bytes. (agnos-portability-sweep-residuals, part 2.)
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;
+    #endif
     if (buf == 0) { return 0 - 3; }
     if (maxbytes < 16) { return 0 - 3; }
     var path = "/proc/self/auxv";

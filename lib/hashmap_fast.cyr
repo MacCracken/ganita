@@ -66,10 +66,9 @@ fn fhm_count(m): i64 { return load64(m + 32); }
 # Returns bitmask (each bit = 1 if meta byte matches h2).
 fn _fhm_probe16(meta, offset, h2): i64 {
     var result = 0;
-    # Load 16 metadata bytes into xmm0
-    # Broadcast h2 into xmm1
-    # pcmpeqb xmm0, xmm1
-    # pmovmskb eax, xmm0
+    #ifdef CYRIUS_ARCH_X86
+    # SSE2 fast path: load 16 metadata bytes into xmm0, broadcast h2
+    # into xmm1, pcmpeqb, pmovmskb → bitmask of matching slots.
     asm {
         # movdqu xmm0, [rdi]  — rdi = meta + offset (1st arg)
         # We need meta+offset in a register. It's param 0 + param 1.
@@ -98,6 +97,16 @@ fn _fhm_probe16(meta, offset, h2): i64 {
         # mov [rbp-32], rax    ; result
         0x48; 0x89; 0x45; 0xE0;
     }
+    #endif
+    #ifndef CYRIUS_ARCH_X86
+    # Portable scalar fallback: bit i set iff meta[offset+i] == h2.
+    # Identical bitmask semantics to the SSE2 pcmpeqb/pmovmskb path.
+    var i = 0;
+    while (i < 16) {
+        if (load8(meta + offset + i) == h2) { result = result | (1 << i); }
+        i = i + 1;
+    }
+    #endif
     return result;
 }
 

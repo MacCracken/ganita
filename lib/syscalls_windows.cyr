@@ -138,3 +138,79 @@ fn sys_munmap(addr, length) {
 fn sys_brk(addr) {
     return syscall(SYS_BRK, addr);
 }
+
+# v6.2.12 (CVE-19 follow-on): real Windows CSPRNG via bcryptprimitives.dll!
+# ProcessPrng, reached through the 0xF01A PE reroute (src/backend/pe/emit.cyr +
+# x86/emit.cyr). `BOOL ProcessPrng(PBYTE pbData, SIZE_T cbData)` fills `buf` with
+# `len` cryptographically-secure bytes and returns nonzero on success; on the
+# (practically-never) failure we return -1 so random_bytes() and its
+# ws/sandhi/sigil/tls_native consumers fail loudly. NEVER add a weak fallback
+# (uninitialised buffer / clock-ns / PID-mix) — a predictable mask/TXID/key is
+# worse than a failed op (exactly what CVE-19 closed). `flags` is ignored
+# (Linux getrandom flags have no ProcessPrng analog). See
+# issues/2026-06-11-windows-entropy-primitive.md.
+fn sys_getrandom(buf, len, flags): i64 {
+    if (syscall(0xF01A, buf, len) != 0) { return len; }
+    return 0 - 1;
+}
+
+# v6.3.2: POSIX process/wait/fs ops referenced on shared CLI paths that are
+# DEAD on Windows (the CLI spawns via CreateProcessW reroutes, not fork/exec/
+# wait). Stubbed so the PE cross-build has no undefined-fn reference under the
+# v6.3.2 default reachable-undef hard error. Returns degrade safely (better than
+# the pre-v6.3.2 ud2 stub, which would SIGILL if ever hit).
+# Windows has no fork(); the CLI spawns via CreateProcessW. Returns -1.
+fn sys_fork(): i64 { return 0 - 1; }
+# No execve on Windows; CreateProcessW is used instead. Returns -1.
+fn sys_execve(path, argv, envp): i64 { return 0 - 1; }
+# No POSIX waitpid; process exit is read via GetExitCodeProcess. Returns -1.
+fn sys_waitpid(pid, status_ptr, options): i64 { return 0 - 1; }
+# POSIX wait-status accessor: on Windows the exit code IS the status. Pass-through.
+fn WEXITSTATUS(status): i64 { return status; }
+# POSIX wait-status predicate: Windows exits are always "exited" (no signals). 1.
+fn WIFEXITED(status): i64 { return 1; }
+# POSIX wait-status predicate: no POSIX signals on Windows. 0.
+fn WIFSIGNALED(status): i64 { return 0; }
+# POSIX wait-status accessor: no terminating signal on Windows. 0.
+fn WTERMSIG(status): i64 { return 0; }
+# chmod has no Windows equivalent (ACL model differs); no-op success.
+fn sys_chmod(path, mode): i64 { return 0; }
+# Best-effort dup2 stub: returns the requested newfd (handle dup is rerouted).
+fn sys_dup2(oldfd, newfd): i64 { return newfd; }
+# mkdir — routed to kernel32!CreateDirectoryW by the PE backend's syscall(83)
+# reroute (src/backend/pe/emit.cyr _pe_ensure_createdir, v5.11.22). Returns 0 on
+# success, -1 on failure. (Was a no-op `return 0` stub through v6.3.42 — VR-01
+# surfaced that it never actually created the directory on Windows.)
+fn sys_mkdir(path, mode): i64 { return syscall(83, path, mode); }
+# unlink — routed to kernel32!DeleteFileW by the PE backend's syscall(87) reroute
+# (_pe_ensure_deletef, v5.11.22). Returns 0 on success, -1 on failure. (Was a
+# no-op `return 0` stub through v6.3.42 — VR-01 surfaced the file was never deleted.)
+fn sys_unlink(path): i64 { return syscall(87, path); }
+
+# v6.4.66 — getpeername / getsockname now route to ws2_32 (was a fail-closed -ENOSYS
+# stub v6.4.64→.65). The PE syscall router maps 0xF036 → ws2_32!getpeername and
+# 0xF037 → ws2_32!getsockname (src/backend/x86/emit.cyr EGETPEERNAME_PE / EGETSOCKNAME_PE),
+# 3-arg, same shape as bind — so sandhi's per-IP rate limiting has a real peer address
+# on Windows. Winsock returns 0 on success, SOCKET_ERROR (-1) with WSAGetLastError =
+# WSAENOTCONN (10057) on an unconnected socket (NOT the POSIX errno space). Consumers
+# still treat <0 as "peer unknown" and fail open — sandhi's peer API already does.
+# Closes docs/development/issues/2026-07-14-windows-getpeername-reroute-missing.md
+#
+# Normalize to the POSIX contract consumers check (`r < 0` = failure): ws2_32
+# returns 0 on success (peer written) or SOCKET_ERROR (int -1, which cyrius sees
+# ZERO-extended as 0xFFFFFFFF — a POSITIVE value that would defeat a `< 0` check
+# and let a caller fabricate a peer, cf. sandhi_server_peer_sockaddr's
+# `if (r < 0) return 0`). On failure return `-WSAGetLastError` (negative, and it
+# carries the real Winsock error, e.g. -10057 WSAENOTCONN). WSAGetLastError is read
+# immediately, before any other call can reset the per-thread last-error.
+fn sys_getpeername(fd, addr, addrlen): i64 {
+    var r = syscall(61494, fd, addr, addrlen);
+    if (r == 0) { return 0; }
+    return 0 - syscall(61476);      # -WSAGetLastError (0xF024)
+}
+# getsockname (0xF037 → ws2_32!getsockname): same normalization as getpeername.
+fn sys_getsockname(fd, addr, addrlen): i64 {
+    var r = syscall(61495, fd, addr, addrlen);
+    if (r == 0) { return 0; }
+    return 0 - syscall(61476);
+}

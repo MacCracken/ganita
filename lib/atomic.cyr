@@ -15,15 +15,22 @@
 #
 # Semantics: `atomic_load` / `atomic_store` are atomicity-only
 # (no ordering) — aligned 8-byte loads/stores are atomic on both
-# x86_64 (TSO) and aarch64 (naturally aligned). For sequential
-# consistency across threads, bracket them with `atomic_fence()`
-# or use `atomic_cas` / `atomic_fetch_add` (which are full
-# barriers on both arches).
+# x86_64 (TSO) and aarch64 (naturally aligned). `atomic_cas` /
+# `atomic_fetch_add` carry ACQUIRE-RELEASE ordering (CVE-28, v6.1.38:
+# x86 lock-prefixed RMW is full/seq-cst; aarch64 uses ldaxr/stlxr =
+# acquire-release — sufficient for lock acquire/release and the
+# publish-after-init pattern). The aarch64 bodies previously used bare
+# ldxr/stxr with NO barrier (the "dmb ish" the docs claimed was never
+# emitted), so a peer thread could observe a CAS-published pointer
+# before the pointee's writes. For a FULL (seq-cst) barrier, bracket
+# with `atomic_fence()` explicitly (the lock paths + the default_alloc
+# vtable publish do).
 #
 # x86_64:   `lock cmpxchg` / `lock xadd` / `mfence`
-# aarch64:  `ldxr`/`stxr` LL-SC loops + `dmb ish`.
-#           Plain `cas` / `ldadd` are ARMv8.1-LSE and not available
-#           on Pi 4 A72 (ARMv8.0-A), so the LL-SC form is used.
+# aarch64:  `ldaxr`/`stlxr` LL-SC loops (acquire/release exclusive) +
+#           `dmb ish` for `atomic_fence`. Plain `cas` / `ldadd` are
+#           ARMv8.1-LSE and not available on Pi 4 A72 (ARMv8.0-A), so
+#           the LL-SC form is used.
 #
 # >>> include "lib/atomic.cyr"
 
@@ -68,10 +75,13 @@ fn atomic_cas(ptr, expected, new): i64 {
         param_load(x2, 2);             # new
         0x03; 0x00; 0x80; 0xD2;        # movz x3, #0           ; result = 0 (fail default)
         # retry:
-        0x04; 0x7C; 0x5F; 0xC8;        # ldxr x4, [x0]         ; load-exclusive
+        # CVE-28 (v6.1.38): ldaxr (load-ACQUIRE exclusive) — byte[1] 0x7C→0xFC
+        # vs plain ldxr sets the acquire bit; same size, branch offsets unchanged.
+        0x04; 0xFC; 0x5F; 0xC8;        # ldaxr x4, [x0]        ; load-acquire-exclusive
         0x9F; 0x00; 0x01; 0xEB;        # cmp x4, x1            ; compare to expected
         0xA1; 0x00; 0x00; 0x54;        # b.ne fail (+5 instrs = +20 B)
-        0x02; 0x7C; 0x05; 0xC8;        # stxr w5, x2, [x0]     ; store-exclusive
+        # stlxr (store-RELEASE exclusive) — byte[1] 0x7C→0xFC sets the release bit.
+        0x02; 0xFC; 0x05; 0xC8;        # stlxr w5, x2, [x0]    ; store-release-exclusive
         0x85; 0xFF; 0xFF; 0x35;        # cbnz w5, retry (-4 instrs = -16 B; imm19=-4→0x7FFFC)
         0x23; 0x00; 0x80; 0xD2;        # movz x3, #1           ; success
         0x02; 0x00; 0x00; 0x14;        # b done (+2 instrs)
@@ -104,9 +114,11 @@ fn atomic_fetch_add(ptr, delta): i64 {
         param_load(x0, 0);             # ptr
         param_load(x1, 1);             # delta
         # retry:
-        0x03; 0x7C; 0x5F; 0xC8;        # ldxr x3, [x0]         ; old
+        # CVE-28 (v6.1.38): ldaxr/stlxr (acquire/release exclusive) — byte[1]
+        # 0x7C→0xFC vs plain ldxr/stxr; same size, retry offset unchanged.
+        0x03; 0xFC; 0x5F; 0xC8;        # ldaxr x3, [x0]        ; old (acquire)
         0x64; 0x00; 0x01; 0x8B;        # add x4, x3, x1        ; old + delta
-        0x04; 0x7C; 0x05; 0xC8;        # stxr w5, x4, [x0]
+        0x04; 0xFC; 0x05; 0xC8;        # stlxr w5, x4, [x0]    ; (release)
         0xA5; 0xFF; 0xFF; 0x35;        # cbnz w5, retry (-3 instrs)
         0xA3; 0x83; 0x1E; 0xF8;        # stur x3, [x29, #-24]  ; ret = old
     }

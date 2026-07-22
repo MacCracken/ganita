@@ -5,13 +5,15 @@
 
 ## Version
 
-**1.0.4** — `ganita_mat_new` CWE-190 overflow guard (2026-07-21). Prior: 1.0.3
+**1.0.4** — `ganita_mat_new` CWE-190 overflow guard + toolchain pin → 6.4.69
+(2026-07-21). Prior: 1.0.3
 inverse-trig aarch64 guard, 1.0.2 `f64_tanh` saturation, 1.0.1 pin sweep, 1.0.0
 initial carve-out of cyrius stdlib (2026-06-10, cyrius v6.1.26).
 
 ## Toolchain
 
-- **Cyrius pin**: `6.4.26` (in `cyrius.cyml [package].cyrius`)
+- **Cyrius pin**: `6.4.69` (in `cyrius.cyml [package].cyrius`). `lib/` re-vendored
+  to the 6.4.69 full snapshot (99 files, byte-identical to the pin).
 
 ## Source
 

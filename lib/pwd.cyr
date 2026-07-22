@@ -114,7 +114,7 @@ fn _pwd_parse_line(line_start, line_end, pwrec, strbuf, strbufsz): i64 {
     var soff_ptr = &soff_store;
 
     # Field starts
-    var field_starts[8];
+    var field_starts: i64[8];   # v6.2.1: 8 i64 field-offset slots (7 used; was [8]=1 slot → OOB writing fields 1..6)
     var field_idx = 0;
     store64(&field_starts, line_start);
 

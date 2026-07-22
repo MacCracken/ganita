@@ -116,6 +116,9 @@
 #   FDL_ERR_ARCH_UNSUPPORTED  = -6  not x86_64 Linux
 #   FDL_ERR_CALLBACK_FAILED   = -7  helper ran but callback never fired
 #   FDL_ERR_UNINIT            = -8  orchestration not yet landed (v5.5.28)
+#   FDL_ERR_UNTRUSTED         = -9  fdlopen_init_trusted: no root-owned system
+#                                   helper at /usr/lib/cyrius/dlopen-helper that
+#                                   passes the lstat trust check (v6.1.29)
 
 enum FdlopenOff {
     FDL_JMPBUF          = 0;
@@ -167,67 +170,143 @@ var _fdlopen_state_global = 0;
 # Return value: 0 on direct call, non-zero on return-via-longjmp. If
 # longjmp was called with val==0, returns 1 (POSIX convention).
 #
-# CAVEAT: cyrius functions pass first arg at [rbp-8]. The asm below
-# assumes the standard `push rbp; mov rbp, rsp; sub rsp, N` prologue.
+# v6.2.x: #naked so there is NO prologue — at entry the arg is in the first
+# arg register (rdi / x0) and the live sp + return address ARE the caller's. On
+# aarch64 the caller's sp is `x29 + frame_size` (not x86's fixed `rbp+16`), so a
+# framed version can't capture it by a constant offset; #naked sidesteps that
+# entirely. Buffer offsets the test relies on: +48 = caller sp, +56 = return addr.
+# (#naked on its own line: the byte-based fmt/lint/api-surface tools skip
+# `#`-prefixed lines, so this keeps the `fn` visible to them.)
+#naked
 fn dl_setjmp(buf): i64 {
     #ifdef CYRIUS_TARGET_LINUX
     #ifdef CYRIUS_ARCH_X86
     asm {
-        0x48; 0x8B; 0x45; 0xF8;    # mov rax, [rbp-8]   (buf)
-        0x48; 0x89; 0x58; 0x00;    # mov [rax+0],  rbx
-        0x48; 0x8B; 0x4D; 0x00;    # mov rcx, [rbp]     (caller rbp)
-        0x48; 0x89; 0x48; 0x08;    # mov [rax+8],  rcx
+        0x48; 0x89; 0xF8;          # mov rax, rdi       (buf)
+        0x48; 0x89; 0x18;          # mov [rax+0],  rbx
+        0x48; 0x89; 0x68; 0x08;    # mov [rax+8],  rbp  (caller rbp)
         0x4C; 0x89; 0x60; 0x10;    # mov [rax+16], r12
         0x4C; 0x89; 0x68; 0x18;    # mov [rax+24], r13
         0x4C; 0x89; 0x70; 0x20;    # mov [rax+32], r14
         0x4C; 0x89; 0x78; 0x28;    # mov [rax+40], r15
-        0x48; 0x8D; 0x4D; 0x10;    # lea rcx, [rbp+16]  (caller rsp)
+        0x48; 0x8D; 0x4C; 0x24; 0x08;  # lea rcx, [rsp+8]   (caller rsp)
         0x48; 0x89; 0x48; 0x30;    # mov [rax+48], rcx
-        0x48; 0x8B; 0x4D; 0x08;    # mov rcx, [rbp+8]   (return rip)
+        0x48; 0x8B; 0x0C; 0x24;    # mov rcx, [rsp]     (return rip)
         0x48; 0x89; 0x48; 0x38;    # mov [rax+56], rcx
+        0x31; 0xC0;                # xor eax, eax
+        0xC3;                      # ret
+    }
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    asm {
+        0x13; 0x50; 0x00; 0xA9;    # stp x19, x20, [x0, #0]
+        0x15; 0x58; 0x01; 0xA9;    # stp x21, x22, [x0, #16]
+        0x17; 0x60; 0x02; 0xA9;    # stp x23, x24, [x0, #32]
+        0xE9; 0x03; 0x00; 0x91;    # mov x9, sp
+        0x09; 0x18; 0x00; 0xF9;    # str x9, [x0, #48]   (caller sp)
+        0x1E; 0x1C; 0x00; 0xF9;    # str x30, [x0, #56]  (return addr)
+        0x19; 0x68; 0x04; 0xA9;    # stp x25, x26, [x0, #64]
+        0x1B; 0x70; 0x05; 0xA9;    # stp x27, x28, [x0, #80]
+        0x1D; 0x30; 0x00; 0xF9;    # str x29, [x0, #96]  (caller fp)
+        0x00; 0x00; 0x80; 0xD2;    # mov x0, #0
+        0xC0; 0x03; 0x5F; 0xD6;    # ret
     }
     #endif
     #endif
-    return 0;
+    #ifndef CYRIUS_TARGET_LINUX
+    #ifdef CYRIUS_ARCH_X86
+    asm { 0x31; 0xC0; 0xC3; }      # xor eax,eax; ret  (no foreign dlopen off-Linux)
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    asm { 0x00; 0x00; 0x80; 0xD2; 0xC0; 0x03; 0x5F; 0xD6; }  # mov x0,#0; ret
+    #endif
+    #endif
 }
 
-# Restore state captured by dl_setjmp. Does not return.
-# If `val` is 0, setjmp will see 1 (POSIX convention — caller can't
-# distinguish "direct call" from "longjmp with val=0" otherwise).
+# Restore state captured by dl_setjmp. Does not return (branches to the saved
+# return address). If `val` is 0, setjmp sees 1 (POSIX). #naked — see dl_setjmp.
+#naked
 fn dl_longjmp(buf, val): i64 {
     #ifdef CYRIUS_TARGET_LINUX
     #ifdef CYRIUS_ARCH_X86
     asm {
-        0x48; 0x8B; 0x45; 0xF0;    # mov rax, [rbp-16]  (val)
+        0x48; 0x89; 0xF0;          # mov rax, rsi       (val)
         0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;  # mov rcx, 1
         0x48; 0x85; 0xC0;          # test rax, rax
-        0x48; 0x0F; 0x44; 0xC1;    # cmove rax, rcx    (val==0 -> 1)
-
-        0x48; 0x8B; 0x55; 0xF8;    # mov rdx, [rbp-8]  (buf)
-        0x48; 0x8B; 0x5A; 0x00;    # mov rbx, [rdx+0]
+        0x48; 0x0F; 0x44; 0xC1;    # cmove rax, rcx     (val==0 -> 1)
+        0x48; 0x89; 0xFA;          # mov rdx, rdi       (buf)
+        0x48; 0x8B; 0x1A;          # mov rbx, [rdx+0]
         0x48; 0x8B; 0x6A; 0x08;    # mov rbp, [rdx+8]
         0x4C; 0x8B; 0x62; 0x10;    # mov r12, [rdx+16]
         0x4C; 0x8B; 0x6A; 0x18;    # mov r13, [rdx+24]
         0x4C; 0x8B; 0x72; 0x20;    # mov r14, [rdx+32]
         0x4C; 0x8B; 0x7A; 0x28;    # mov r15, [rdx+40]
-        0x48; 0x8B; 0x4A; 0x38;    # mov rcx, [rdx+56] (target rip)
-        0x48; 0x8B; 0x62; 0x30;    # mov rsp, [rdx+48] (caller rsp)
+        0x48; 0x8B; 0x4A; 0x38;    # mov rcx, [rdx+56]  (target rip)
+        0x48; 0x8B; 0x62; 0x30;    # mov rsp, [rdx+48]  (caller rsp)
         0xFF; 0xE1;                # jmp rcx
     }
     #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    asm {
+        0x3F; 0x00; 0x00; 0xF1;    # cmp x1, #0
+        0x22; 0x00; 0x80; 0xD2;    # mov x2, #1
+        0x42; 0x00; 0x81; 0x9A;    # csel x2, x2, x1, eq   (val==0 -> 1)
+        0x13; 0x50; 0x40; 0xA9;    # ldp x19, x20, [x0, #0]
+        0x15; 0x58; 0x41; 0xA9;    # ldp x21, x22, [x0, #16]
+        0x17; 0x60; 0x42; 0xA9;    # ldp x23, x24, [x0, #32]
+        0x19; 0x68; 0x44; 0xA9;    # ldp x25, x26, [x0, #64]
+        0x1B; 0x70; 0x45; 0xA9;    # ldp x27, x28, [x0, #80]
+        0x1D; 0x30; 0x40; 0xF9;    # ldr x29, [x0, #96]  (caller fp)
+        0x1E; 0x1C; 0x40; 0xF9;    # ldr x30, [x0, #56]  (return addr)
+        0x09; 0x18; 0x40; 0xF9;    # ldr x9, [x0, #48]   (caller sp)
+        0x3F; 0x01; 0x00; 0x91;    # mov sp, x9
+        0xE0; 0x03; 0x02; 0xAA;    # mov x0, x2          (return value)
+        0xC0; 0x03; 0x5F; 0xD6;    # ret
+    }
     #endif
-    return 0;  # unreachable on success
+    #endif
+    #ifndef CYRIUS_TARGET_LINUX
+    #ifdef CYRIUS_ARCH_X86
+    asm { 0x31; 0xC0; 0xC3; }      # xor eax,eax; ret
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    asm { 0x00; 0x00; 0x80; 0xD2; 0xC0; 0x03; 0x5F; 0xD6; }  # mov x0,#0; ret
+    #endif
+    #endif
 }
 
 # ================================================================
 # Helper path resolution
 # ================================================================
 
-# Build `$HOME/.cyrius/dlopen-helper` into `buf`, returning length
-# on success or 0 if HOME is unset.
+# Trusted-helper mode (v6.1.29). When set by fdlopen_init_trusted(), the helper
+# resolves to the root-owned SYSTEM path instead of the caller's $HOME — closing
+# the setuid privilege-escalation vector where a non-root caller's $HOME copy
+# would be execve'd as root. See the proposal in docs/development/proposals/.
+var _fdl_trusted_mode = 0;
+var _FDL_SYSTEM_HELPER = "/usr/lib/cyrius/dlopen-helper";
+
+# Build the dlopen-helper path into `buf`, returning length on success or 0.
+# Default: `$HOME/.cyrius/dlopen-helper`. In trusted mode: the root-owned
+# system helper (the $HOME copy is NEVER consulted).
 fn _fdlopen_helper_path(buf, bufsz): i64 {
+    # v6.2.43: fdlopen (setuid foreign-glibc dlopen) is Linux-host-only — agnos
+    # has no foreign glibc and the raw syscalls below mis-dispatch. Fail closed
+    # on agnos. (issue 2026-06-23-agnos-portability-sweep-residuals, part 2.)
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;
+    #endif
     if (buf == 0) { return 0; }
     if (bufsz < 64) { return 0; }
+    if (_fdl_trusted_mode == 1) {
+        var c = 0;
+        while (load8(_FDL_SYSTEM_HELPER + c) != 0) {
+            store8(buf + c, load8(_FDL_SYSTEM_HELPER + c));
+            c = c + 1;
+        }
+        store8(buf + c, 0);
+        return c;
+    }
     # Read HOME from environ via getenv-style walk. Since we may
     # be called before any libc bootstrap, walk /proc/self/environ
     # directly. Fallback: /home/$USER if HOME is empty.
@@ -290,6 +369,11 @@ fn _fdlopen_helper_path(buf, bufsz): i64 {
 # Check whether `$HOME/.cyrius/dlopen-helper` exists. Returns 1 if
 # yes, 0 if no.
 fn fdlopen_helper_available(): i64 {
+    # v6.2.43: fdlopen is Linux-host-only — report unavailable on agnos (the
+    # documented availability gate; callers check this before fdlopen_init*).
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;
+    #endif
     var pathbuf = alloc(512);
     if (pathbuf == 0) { return 0; }
     var pl = _fdlopen_helper_path(pathbuf, 512);
@@ -328,6 +412,9 @@ fn fdlopen_state_size(): i64 { return 256; }
 # Returns 0 on success, negative error code on failure.
 # ---------------------------------------------------------------
 fn _fdlopen_mmap_elf(path, out_info): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0 - 1;   # Linux-host-only (raw open/fstat/mmap mis-dispatch on agnos)
+    #endif
     var fd = syscall(2, path, 0, 0);   # O_RDONLY
     if (fd < 0) { return 0 - 1; }
 
@@ -625,6 +712,9 @@ fn _fdlopen_enter_ldso(ldso_entry, new_rsp): i64 {
 # negative error code on failure.
 # ---------------------------------------------------------------
 fn _fdlopen_run_loader(state): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0 - 3;   # Linux-host-only (raw auxv/loader syscalls mis-dispatch on agnos)
+    #endif
     # Read /proc/self/auxv once
     var auxv = alloc(4096);
     if (auxv == 0) { return 0 - 3; }
@@ -739,6 +829,53 @@ fn fdlopen_init_full(state): i64 {
     #endif
     #endif
     store64(state + 216, 0 - 6);
+    return 0 - 6;
+}
+
+# Verify a candidate helper is setuid-safe: a regular file (NOT a symlink),
+# owned by uid 0, and not group/other-writable. Uses lstat (syscall #6) — not
+# stat — so a symlink fails the S_IFREG check below rather than being followed.
+# x86_64 Linux `struct stat`: st_mode @24 (u32), st_uid @28 (u32). Returns 1 if
+# trusted, 0 otherwise.
+fn _fdlopen_verify_trusted(path): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;   # Linux-host-only (raw lstat mis-dispatches on agnos)
+    #endif
+    var st[144];
+    var r = syscall(6, path, &st);              # lstat(path, &st)
+    if (r < 0) { return 0; }
+    var mode = load32(&st + 24);
+    var uid = load32(&st + 28);
+    if ((mode & 0xF000) != 0x8000) { return 0; }  # S_IFMT != S_IFREG (rejects symlink/dir)
+    if (uid != 0) { return 0; }                    # not root-owned
+    if ((mode & 0x12) != 0) { return 0; }          # group/other-writable (0o022)
+    return 1;
+}
+
+# fdlopen using a TRUSTED, root-owned system helper — for setuid-root consumers
+# (e.g. shakti, "sudo for AGNOS"). Resolves /usr/lib/cyrius/dlopen-helper and
+# refuses it unless it is a regular file owned by uid 0, not a symlink, and not
+# group/other-writable. The caller's $HOME copy is NEVER consulted — a non-root
+# invoker of a setuid binary owns their $HOME and could replace the helper,
+# which fdlopen would then execve AS ROOT (arbitrary root code execution).
+# Returns -9 (FDL_ERR_UNTRUSTED) if no trusted helper is found; otherwise behaves
+# exactly like fdlopen_init_full. Callers should fail closed on any non-zero
+# return (treat NSS/TLS as unavailable) rather than fall back to the $HOME path.
+fn fdlopen_init_trusted(state): i64 {
+    #ifdef CYRIUS_TARGET_LINUX
+    #ifdef CYRIUS_ARCH_X86
+    if (_fdlopen_verify_trusted(_FDL_SYSTEM_HELPER) == 0) {
+        if (state != 0) { store64(state + 216, 0 - 9); }
+        return 0 - 9;
+    }
+    _fdl_trusted_mode = 1;
+    var rc = fdlopen_init_full(state);
+    _fdl_trusted_mode = 0;
+    return rc;
+    #endif
+    #endif
+    # Non-x86-Linux: foreign-dlopen is glibc-shaped; unsupported here.
+    if (state != 0) { store64(state + 216, 0 - 6); }
     return 0 - 6;
 }
 

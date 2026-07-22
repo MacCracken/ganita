@@ -82,10 +82,25 @@ fn _sat_mul_i64(a, b): i64 {
 
 # ---- checked ----
 
+# Abort on a checked-arithmetic overflow. Portable exit: agnos exit=#0; else
+# #60 (backend → per-target exit). v6.2.39 — the panic sites were bare
+# syscall(60,...) that no-op'd on agnos (#60 undefined → -1), so a checked
+# overflow FAILED-OPEN and returned the overflowed value. Same guard as
+# vec/str/hashmap/tagged _die.
+fn _overflow_die(): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    syscall(0, _CYR_OVERFLOW_EXIT);
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    syscall(60, _CYR_OVERFLOW_EXIT);
+    #endif
+    return 0;
+}
+
 fn _chk_add_i64(a, b): i64 {
     var r = a + b;
     if ((a ^ r) & (b ^ r) & _CYR_SIGN_BIT != 0) {
-        syscall(60, _CYR_OVERFLOW_EXIT);
+        _overflow_die();
     }
     return r;
 }
@@ -93,7 +108,7 @@ fn _chk_add_i64(a, b): i64 {
 fn _chk_sub_i64(a, b): i64 {
     var r = a - b;
     if ((a ^ b) & (a ^ r) & _CYR_SIGN_BIT != 0) {
-        syscall(60, _CYR_OVERFLOW_EXIT);
+        _overflow_die();
     }
     return r;
 }
@@ -101,10 +116,10 @@ fn _chk_sub_i64(a, b): i64 {
 fn _chk_mul_i64(a, b): i64 {
     if (b == 0) { return 0; }
     var r = a * b;
-    if (a == _CYR_INT64_MIN) { if (b == 0 - 1) { syscall(60, _CYR_OVERFLOW_EXIT); } }
-    if (b == _CYR_INT64_MIN) { if (a == 0 - 1) { syscall(60, _CYR_OVERFLOW_EXIT); } }
+    if (a == _CYR_INT64_MIN) { if (b == 0 - 1) { _overflow_die(); } }
+    if (b == _CYR_INT64_MIN) { if (a == 0 - 1) { _overflow_die(); } }
     if (r / b != a) {
-        syscall(60, _CYR_OVERFLOW_EXIT);
+        _overflow_die();
     }
     return r;
 }

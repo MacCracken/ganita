@@ -221,7 +221,10 @@ fn _hm_die(): i64 {
     syscall(0, 1);
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    _hm_die();
+    # CVE-22 (v6.1.34): exit(1) — backend translates 60 per target. v6.0.56
+    # regressed this to `_hm_die()` (infinite self-recursion → SIGSEGV instead
+    # of a clean abort).
+    syscall(60, 1);
     #endif
     return 0;
 }

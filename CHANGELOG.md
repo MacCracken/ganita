@@ -6,6 +6,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.0.4] — 2026-07-21
 
+### Changed
+
+- **Toolchain pin `6.4.26` → `6.4.69`.** Ecosystem sweep onto the current Cyrius;
+  ganita compiles and tests clean on the new pin (25/25, full-bundle smoke exits
+  42) with no source change beyond the security fix below, and `dist/ganita.cyr`
+  is byte-identical bar that fix. Re-vendored `lib/` to the 6.4.69 full snapshot
+  (`cyrius lib sync --full`) so the committed `lib/` is byte-identical to the
+  pinned snapshot (99 files) — clearing the stale-6.4.26 shadow/drift build
+  warnings — and pruned 10 vendored modules the old snapshot carried that 6.4.69
+  no longer ships and ganita never referenced (incl. the standalone
+  `matrix`/`linalg`, superseded upstream by the folded `ganita.cyr`).
+
 ### Security
 
 - **`ganita_mat_new` integer overflow → heap overflow (CWE-190).** The size

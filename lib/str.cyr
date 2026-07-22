@@ -464,9 +464,23 @@ fn _sb_grow_a(a, sb, n): i64 {
     return 0;
 }
 
-# Ensure builder has room for n more bytes
+# Ensure builder has room for n more bytes. Returns 0 on success or -1 on grow
+# OOM. CVE-25 (v6.1.38): previously dropped `_sb_grow_a`'s rc and returned 0, so
+# the back-compat builders below wrote past the un-grown buffer on OOM.
 fn _sb_grow(sb, n): i64 {
-    var rc = _sb_grow_a(default_alloc(), sb, n);
+    return _sb_grow_a(default_alloc(), sb, n);
+}
+
+# CVE-25 (v6.1.38): abort on a string-builder grow OOM, mirroring _vec_die — the
+# back-compat builders have no error return, so (like vec_push) they write the
+# diagnostic + exit(1) rather than corrupt the heap past the old allocation.
+fn _sb_die(): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    syscall(0, 1);
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    syscall(60, 1);
+    #endif
     return 0;
 }
 
@@ -485,7 +499,7 @@ fn str_builder_add_a(a, sb, s: Str): i64 {
 # Append a Str to the string builder
 fn str_builder_add(sb, s: Str): i64 {
     var slen = str_len(s);
-    _sb_grow(sb, slen);
+    if (_sb_grow(sb, slen) != 0) { syscall(1, 2, "str_builder: alloc failed\n", 26); _sb_die(); }
     var buf = load64(sb);
     var len = load64(sb + 8);
     memcpy(buf + len, str_data(s), slen);
@@ -507,7 +521,7 @@ fn str_builder_add_cstr_a(a, sb, cstr): i64 {
 # Append a C string to the string builder
 fn str_builder_add_cstr(sb, cstr): i64 {
     var slen = strlen(cstr);
-    _sb_grow(sb, slen);
+    if (_sb_grow(sb, slen) != 0) { syscall(1, 2, "str_builder: alloc failed\n", 26); _sb_die(); }
     var buf = load64(sb);
     var len = load64(sb + 8);
     memcpy(buf + len, cstr, slen);
@@ -521,7 +535,7 @@ fn str_builder_add_cstr(sb, cstr): i64 {
 # stash a one-byte cstring. Required by agnosys 1.1.12 verbatim
 # repro (the original filing's spec uses this shape).
 fn str_builder_putc(sb, ch): i64 {
-    _sb_grow(sb, 1);
+    if (_sb_grow(sb, 1) != 0) { syscall(1, 2, "str_builder: alloc failed\n", 26); _sb_die(); }
     var buf = load64(sb);
     var len = load64(sb + 8);
     store8(buf + len, ch & 0xFF);
@@ -545,7 +559,7 @@ fn str_builder_add_int_a(a, sb, n): i64 {
 fn str_builder_add_int(sb, n): i64 {
     var tmp[24];
     var tlen = fmt_int_buf(n, &tmp);
-    _sb_grow(sb, tlen);
+    if (_sb_grow(sb, tlen) != 0) { syscall(1, 2, "str_builder: alloc failed\n", 26); _sb_die(); }
     var buf = load64(sb);
     var len = load64(sb + 8);
     memcpy(buf + len, &tmp, tlen);
@@ -645,7 +659,7 @@ fn str_builder_add_str(sb, s): i64 {
 
 # str_builder_add_byte — append a single byte
 fn str_builder_add_byte(sb, byte): i64 {
-    _sb_grow(sb, 1);
+    if (_sb_grow(sb, 1) != 0) { syscall(1, 2, "str_builder: alloc failed\n", 26); _sb_die(); }
     var buf = load64(sb);
     var len = load64(sb + 8);
     store8(buf + len, byte);
