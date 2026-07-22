@@ -4,6 +4,31 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.4] — 2026-07-21
+
+### Security
+
+- **`ganita_mat_new` integer overflow → heap overflow (CWE-190).** The size
+  computation `16 + rows*cols*8` was unguarded: a large `rows*cols` wraps i64 to
+  a small (or negative) value, so `alloc` handed back an undersized buffer while
+  the following zero-fill loop still ran the full `rows*cols` iterations —
+  writing far past the allocation. With attacker-influenced dimensions that is a
+  heap-corruption primitive. `ganita_mat_new` now validates dimensions **before**
+  allocating: it returns `0` (null) for non-positive dims, for an element count
+  above the largest allocatable matrix (`GANITA_MAT_MAX_ELEMS = (ALLOC_MAX − 16)
+  / 8 = 33_554_430`, checked via a division that cannot itself overflow), and on
+  `alloc` failure. The derived dimension-taking constructors `ganita_mat_identity`
+  and `ganita_mat_from` — and their `_compat` aliases `mat_new` / `mat_identity`
+  / `mat_from` — propagate the null. **Contract change:** these constructors may
+  now return null, so a caller sizing a matrix from untrusted input MUST check
+  the result; the fast path is byte-for-byte unchanged for valid dimensions, and
+  every internal caller passes dims from already-allocated matrices. Regression
+  tests added (`tests/ganita.tcyr`: negative/zero dims, wrap-inducing dims,
+  over-cap rejection, valid-8×8 control → 16 → **25** assertions). Downstream
+  hisab has shipped a `mat_new_guarded` work-around for this since its 2.5.3;
+  this upstream fix lets that fold back into a plain `mat_new` once the cyrius
+  pin picks up this ganita.
+
 ## [1.0.3] — 2026-07-08
 
 ### Fixed

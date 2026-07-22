@@ -28,6 +28,25 @@ assert_eq(ganita_mat_rows(id), 2, "identity rows");
 assert_eq(ganita_mat_cols(id), 2, "identity cols");
 assert_eq(ganita_mat_get(id, 0, 1), 0, "identity off-diagonal == 0.0 bits");
 
+test_group("matrix: dimension guard (CWE-190 overflow)");
+# Non-positive dims -> null (was: built a degenerate / wild matrix).
+assert_eq(ganita_mat_new(0 - 1, 5), 0, "mat_new negative rows -> null");
+assert_eq(ganita_mat_new(5, 0), 0, "mat_new zero cols -> null");
+assert_eq(ganita_mat_new(0, 5), 0, "mat_new zero rows -> null");
+# rows*cols so large that the old `16 + rows*cols*8` wrapped i64 into a tiny
+# alloc, then the full-length zero-fill wrote past it (the heap overflow).
+# Now rejected before the multiply.
+assert_eq(ganita_mat_new(4611686018427387904, 8), 0, "mat_new wrap-inducing dims -> null");
+# One element past the allocatable cap -> rejected without attempting a 256 MB+ alloc.
+assert_eq(ganita_mat_new(33554431, 1), 0, "mat_new over element cap -> null");
+# A normal matrix is unaffected by the guard (fast path unchanged).
+var mg = ganita_mat_new(8, 8);
+assert_eq(ganita_mat_rows(mg), 8, "guarded mat_new still builds a valid 8x8");
+assert_eq(ganita_mat_cols(mg), 8, "guarded 8x8 has correct cols");
+# Derived dimension-taking constructors propagate the null.
+assert_eq(ganita_mat_identity(0 - 1), 0, "mat_identity negative n -> null");
+assert_eq(ganita_mat_from(0 - 1, 2, mg), 0, "mat_from negative rows -> null");
+
 test_group("advanced math (canonical)");
 assert_eq(ganita_binomial(5, 2), 10, "C(5,2)=10");
 assert_eq(ganita_binomial(6, 3), 20, "C(6,3)=20");

@@ -5,11 +5,13 @@
 
 ## Version
 
-**1.0.0** — initial carve out of cyrius stdlib (2026-06-10, cyrius v6.1.26).
+**1.0.4** — `ganita_mat_new` CWE-190 overflow guard (2026-07-21). Prior: 1.0.3
+inverse-trig aarch64 guard, 1.0.2 `f64_tanh` saturation, 1.0.1 pin sweep, 1.0.0
+initial carve-out of cyrius stdlib (2026-06-10, cyrius v6.1.26).
 
 ## Toolchain
 
-- **Cyrius pin**: `6.1.25` (in `cyrius.cyml [package].cyrius`)
+- **Cyrius pin**: `6.4.26` (in `cyrius.cyml [package].cyrius`)
 
 ## Source
 
@@ -23,13 +25,13 @@ functions prefixed `ganita_`:
 | `src/math_advanced.cyr` | 13 | `ganita_f64_*` / `ganita_fibonacci` / `ganita_binomial` |
 
 - `src/_compat.cyr` — 53 back-compat aliases (legacy names → `ganita_*`).
-- `dist/ganita.cyr` — 1,358-line bundle (53 canonical + 53 alias fns),
+- `dist/ganita.cyr` — 1,401-line bundle (53 canonical + 53 alias fns),
   regenerated via `cyrius distlib`. Folded into `cyrius/lib/ganita.cyr`.
 
 ## Tests
 
-- `tests/ganita.tcyr` — matrix dims + identity + binomial/fibonacci + alias
-  parity (11 assertions).
+- `tests/ganita.tcyr` — matrix dims + identity + **CWE-190 dimension guard** +
+  binomial/fibonacci + alias parity (25 assertions).
 - `src/main.cyr` — full-bundle compile smoke (exits 42).
 - Deep per-module coverage stays in cyrius's `matrix`/`linalg`/`math` `.tcyr` suite.
 
