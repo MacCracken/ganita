@@ -4,6 +4,52 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-08-17 — f32 scalar tier
+
+**MINOR, not a patch: new public API.** Ten `ganita_f32_*` helpers, so f32 consumers stop
+paying a widen-op-narrow round trip for shape-level operations. Requested from the ranga
+(image processing) Rust->Cyrius port, whose pixel loops are f32 throughout — `f32_abs` was
+`f32_from(f64_abs(f32_to(x)))`, three ops for a bit-clear.
+
+### Added — `src/math_f32.cyr`
+
+* Pure bit ops, exact, no widening: `ganita_f32_abs`, `_neg`, `_sign`.
+* One signed compare on a monotone key: `ganita_f32_min`, `_max`, `_clamp`.
+* `ganita_f32_lerp` — widens, and NOT by choice: there is no callable `f32_add`/`f32_sub`/
+  `f32_mul`. cyrius dispatches f32 arithmetic through the OPERATORS on an `F32_TYID`-typed
+  value (`EMIT_F32_BINOP`), reachable only from a `var x: f32` binding, and these params
+  arrive as untyped bit patterns. A first cut called `f32_add(...)` as a builtin and
+  `cyrius distlib` caught it (`undefined function`). Widening is exact on the inputs.
+* Exact widening (see below): `ganita_f32_floor`, `_ceil`, `_trunc`.
+
+⚠ **min/max/clamp are NOT a bare unsigned compare, and that distinction is the whole
+correctness story.** IEEE-754 is SIGN-MAGNITUDE. Raw patterns order correctly only among
+NON-NEGATIVE values: for two negatives the order REVERSES (-2.0 has the larger magnitude
+field), and any negative compares HIGH against every positive because bit 31 is set. The
+filing observed that "for non-negative finite f32 the raw pattern orders identically to an
+unsigned integer" — true, and exactly the trap, because pixel data IS non-negative, so a
+naive version passes every plausible test and breaks the first time a consumer subtracts.
+`_f32_key` applies the standard monotone transform (invert all bits when negative, else set
+the sign bit) so one signed compare is correct across the full range. Verified on the
+both-negative and mixed-sign cases, not just the easy one.
+
+⭐ **floor/ceil/trunc widen deliberately, and it costs no accuracy.** f32 -> f64 is exact
+(every f32 is representable), the f64 rounding intrinsic is exact on it, and an
+integer-valued result narrows back exactly. Hand-rolled exponent twiddling would need NaN
+and infinity special-cases for zero accuracy gain; the win this tier is about is
+min/max/clamp/abs/neg becoming branch-and-mask.
+
+### Changed
+
+* Toolchain pin `cyrius` **6.4.69 -> 6.5.23** (was 15 patches behind; the drift warning
+  was live).
+
+### Not included
+
+Tier 2 (`f32_sqrt` via `sqrtss`) and tier 3 (the `ganita_f32_*` transcendentals) from the
+filing. Tier 1 was called out there as the one to land if only one does — it is the part
+that is genuinely wasteful today and needs no new numerics.
+
 ## [1.0.4] — 2026-07-21
 
 ### Changed

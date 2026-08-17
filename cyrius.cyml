@@ -4,7 +4,7 @@ version = "${file:VERSION}"
 description = "ganita — linear algebra (matrix, linalg) + advanced math (transcendental + number theory) for the AGNOS-lineage Cyrius ecosystem; foldable into stdlib per the sandhi pattern"
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.4.69"
+cyrius = "6.5.23"
 
 [build]
 entry = "src/main.cyr"
@@ -30,5 +30,6 @@ modules = [
     "src/matrix.cyr",
     "src/linalg.cyr",
     "src/math_advanced.cyr",
+    "src/math_f32.cyr",
     "src/_compat.cyr",
 ]
