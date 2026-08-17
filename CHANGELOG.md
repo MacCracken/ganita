@@ -4,9 +4,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.1.0] — 2026-08-17 — f32 scalar tier
+## [1.1.0] — 2026-08-17 — f32 scalar tier (ALL THREE TIERS)
 
-**MINOR, not a patch: new public API.** Ten `ganita_f32_*` helpers, so f32 consumers stop
+**MINOR, not a patch: new public API.** **Twenty-three** `ganita_f32_*` helpers — the FULL surface the filing enumerated, all three tiers, so f32 consumers stop
 paying a widen-op-narrow round trip for shape-level operations. Requested from the ranga
 (image processing) Rust->Cyrius port, whose pixel loops are f32 throughout — `f32_abs` was
 `f32_from(f64_abs(f32_to(x)))`, three ops for a bit-clear.
@@ -44,11 +44,34 @@ min/max/clamp/abs/neg becoming branch-and-mask.
 * Toolchain pin `cyrius` **6.4.69 -> 6.5.23** (was 15 patches behind; the drift warning
   was live).
 
-### Not included
+### Added — tier 2: `ganita_f32_sqrt`
 
-Tier 2 (`f32_sqrt` via `sqrtss`) and tier 3 (the `ganita_f32_*` transcendentals) from the
-filing. Tier 1 was called out there as the one to land if only one does — it is the part
-that is genuinely wasteful today and needs no new numerics.
+⚠ The filing asks for `sqrtss` (direct single-precision, no widening). That needs a NEW
+cyrius intrinsic — a compiler change, not a library one — so this widens instead, and it
+is **correctly rounded rather than approximate**: f64 carries 53 mantissa bits against
+f32's 24, more than 2*24 + 2, so computing in double and rounding once to single yields
+exactly the single-precision result. Double-rounding cannot bite. The `sqrtss` intrinsic
+is recorded as a cyrius-side follow-up.
+
+### Added — tier 3: transcendentals
+
+`ganita_f32_exp`, `_ln`, `_log2`, `_exp2`, `_sin`, `_cos`, `_atan`, `_round`, `_pow`,
+`_atan2`, `_hypot`, `_cbrt`. Widen-compute-narrow, which the filing explicitly blesses
+here: the win is that the conversions stop being the consumer's problem and the naming
+stays symmetric with the f64 tier.
+
+⚠ **`ganita_f32_cbrt` splits on sign, and that is required rather than decorative.** There
+is no f64 cbrt in ganita or the stdlib, so it is built from `pow` — which routes through
+`exp(y * ln x)`, and `ln` of a negative is undefined. A bare `pow` returns garbage for
+every negative input while looking correct for the positives a naive test would use.
+Verified on -8 -> -2.
+
+### Process note
+
+An earlier cut of this release shipped **tier 1 only** and recorded tiers 2-3 as "interleaved
+fold-ins". That was a silent deferral of a consumer filing's enumerated surface, not a plan —
+the filing's tiering was labelled *suggested, cheapest first*, not an instruction to ship a
+third. Corrected before release: all three tiers are in this version.
 
 ## [1.0.4] — 2026-07-21
 

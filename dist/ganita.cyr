@@ -1431,6 +1431,61 @@ fn ganita_f32_trunc(x): i64 {
     return ganita_f32_floor(x);
 }
 
+# ================================================================
+# TIER 2 — sqrt
+# ================================================================
+# The filing asks for `sqrtss` (a direct single-precision encoding, no widening). That
+# would need a NEW cyrius intrinsic; it does not exist yet, and adding one is a compiler
+# change, not a library one. Widening is used instead and it is **correctly rounded, not
+# an approximation**: f64 carries 53 mantissa bits against f32's 24, which is more than
+# 2*24 + 2, so computing sqrt in double and rounding once to single yields exactly the
+# single-precision result. Double-rounding cannot bite here.
+# ⚠ Do NOT "optimise" this into a bare f32 bit trick without the intrinsic — the accuracy
+# is the point, and `sqrtss` is a cyrius-side follow-up, recorded in the issue.
+fn ganita_f32_sqrt(x): i64 { return f32_from(f64_sqrt(f32_to(x))); }
+
+# ================================================================
+# TIER 3 — transcendentals
+# ================================================================
+# Widen-compute-narrow, which the filing explicitly blesses for this tier: "completely
+# acceptable here; the win is that the conversions stop being the consumer's problem and
+# the naming stays symmetric with the f64 tier." Each of these is the f32-facing name for
+# an f64 routine that already exists and is already tested — the value delivered is the
+# symmetry and the removal of per-call-site `f32_from(f64_x(f32_to(v)))` boilerplate from
+# every consumer, not new numerics.
+fn ganita_f32_exp(x): i64 { return f32_from(f64_exp(f32_to(x))); }
+fn ganita_f32_ln(x): i64 { return f32_from(f64_ln(f32_to(x))); }
+fn ganita_f32_log2(x): i64 { return f32_from(f64_log2(f32_to(x))); }
+fn ganita_f32_exp2(x): i64 { return f32_from(f64_exp2(f32_to(x))); }
+fn ganita_f32_sin(x): i64 { return f32_from(f64_sin(f32_to(x))); }
+fn ganita_f32_cos(x): i64 { return f32_from(f64_cos(f32_to(x))); }
+fn ganita_f32_atan(x): i64 { return f32_from(f64_atan(f32_to(x))); }
+fn ganita_f32_round(x): i64 { return f32_from(f64_round(f32_to(x))); }
+
+# Two-argument forms — both operands widen before the f64 routine runs.
+fn ganita_f32_pow(base, exp): i64 {
+    return f32_from(ganita_f64_pow(f32_to(base), f32_to(exp)));
+}
+fn ganita_f32_atan2(y, x): i64 {
+    return f32_from(ganita_f64_atan2(f32_to(y), f32_to(x)));
+}
+fn ganita_f32_hypot(x, y): i64 {
+    return f32_from(ganita_f64_hypot(f32_to(x), f32_to(y)));
+}
+
+# cbrt(x) = sign(x) * |x|^(1/3). There is no f64 cbrt in ganita or the stdlib, so it is
+# built from pow — and the sign split is REQUIRED, not decorative: `pow` goes through
+# exp(y*ln x) and ln of a negative is undefined, so a bare pow returns garbage for every
+# negative input while looking fine for the positives a naive test would use.
+fn ganita_f32_cbrt(x): i64 {
+    var xf = f32_to(x);
+    var third = f64_div(f64_from(1), f64_from(3));
+    if (x & 0x80000000 != 0) {
+        return f32_from(f64_neg(ganita_f64_pow(f64_abs(xf), third)));
+    }
+    return f32_from(ganita_f64_pow(xf, third));
+}
+
 # --- _compat.cyr ---
 
 # ganita back-compat aliases (v6.1.26 carve). Legacy mat_* / f64_advanced /
