@@ -4,6 +4,66 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.1.3] — 2026-08-19 — linalg gets a test suite
+
+`linalg.cyr` was the largest untested surface in the repo at **2/26** — every
+decomposition and solver (LU, Cholesky, QR, SVD, Jacobi eigen, least squares,
+pseudo-inverse) shipped unverified. Now **26/26**, with 90 new assertions.
+Repo-wide reference coverage 37% → **80%** (105/131), and the exercise pulled
+`matrix.cyr` to 10/14 and `_compat.cyr` to 40/53 along the way.
+
+### Added — `tests/ganita.tcyr`
+
+Assertions are **properties**, not transcribed outputs, so they stay valid if an
+algorithm is reimplemented and they cannot be satisfied by a plausible-looking
+wrong answer:
+
+| Routine | Pinned by |
+|---|---|
+| `lu` / `det` | pivot sign after one swap; `det = -6` and `-306` by hand; `det(A^T) = det(A)`; singular → `lu` returns 0 and `det` is 0 |
+| `lu_solve` | 2x2 and a 3x3 round trip (solve `M·[1,2,3]`, recover `[1,2,3]`) |
+| `inv` | `A·A⁻¹ = I` **and** `A⁻¹·A = I`; `inv(inv(A)) = A`; singular → returns 0, not garbage |
+| `cholesky` | `L·Lᵀ = A`; `L` lower triangular; rejects a symmetric **non**-positive-definite matrix |
+| `qr` | `Q·R = A`; **`Qᵀ·Q = I`**; `R` upper triangular — square *and* 3x2 |
+| `gaussian_elim` | solution in the last column, agreeing with `lu_solve` on the same system; singular → 0 |
+| `least_squares` | consistent overdetermined system, so the exact answer is assertable |
+| `eigen_sym` | eigenvalues; **Σλ = trace** and **Πλ = det**; `A·v = λ·v`; eigenvectors orthonormal; diagonal input left alone |
+| `svd` | `U·Σ·Vᵀ = A` (diagonal and non-diagonal); σ sorted descending; **Πσ = \|det\|** |
+| `pseudo_inv` | equals `inv` when invertible; Moore–Penrose `A·A⁺·A = A` |
+| `rank` / `condition` | rank of full-rank vs rank-deficient; `cond(I) = 1`; `cond ≥ 1`; singular → the documented `-1` sentinel |
+
+`mat_eq` is the comparison tool for most of the above, so **both its polarities
+are pinned first** — an `eq` that always returned 1 would make the rest vacuous.
+Utilities (`copy` deep-not-aliased, `neg` involution, row/col accessors,
+`set_row`/`set_col` isolation, half-open `submatrix`, Frobenius, max-norm as max
+*row sum*, trace, symmetry incl. non-square) are covered too.
+
+**Mutation-verified.** Forcing the LU pivot sign to `+1` fails 2 assertions;
+deleting Cholesky's positive-definite check fails 1; making QR return an
+identity `Q` fails 6, including both least-squares assertions — which is the
+suite noticing that `least_squares` is built on QR.
+
+### Changed
+
+- CI coverage floor raised `37` → **`80`**.
+
+### Found, not fixed — `fmt_float` drops the carry when a fraction rounds to 1.0
+
+`fmt_float(2.9999999, 6)` prints `2.1000000` — seven fraction digits, carry
+dropped — and `1.0 - 1e-8` prints `0.1000000`. Display only; the values are
+correct. It surfaced here because near-integer results are routine after a
+decomposition: a correct `cholesky_solve` result of `3.0` printed as `2.1000000`
+and a correct `least_squares` result of `1.0` printed as `0.1000000`, both of
+which read as solver bugs. This is cyrius stdlib (`lib/fmt.cyr`), vendored, so
+it is **filed rather than changed**:
+[2026-08-19](docs/development/issues/2026-08-19-fmt-float-missing-carry-on-round-up.md).
+The suite is unaffected — it asserts numerically, never on printed text.
+
+### Verified on released 6.5.28
+
+`cyrius test` — **210 passed, 0 failed** (was 120). Build clean with zero
+warnings, smoke exits 42, `distlib --all --check` current, consumer-check clean.
+
 ## [1.1.2] — 2026-08-19 — f32 tier gets a test suite, and it found two bugs
 
 1.1.0 shipped 23 `ganita_f32_*` helpers with **no test at all** (`math_f32.cyr`

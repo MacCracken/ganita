@@ -18,6 +18,34 @@ include "src/math_advanced.cyr"
 include "src/math_f32.cyr"
 include "src/_compat.cyr"
 
+# --- linalg test helpers ------------------------------------------------
+# Decomposition results are not bit-exact, so these compare within 1e-9.
+# `ganita_mat_eq` is itself under test below; it is exercised directly first
+# (both polarities) and only then used as a comparison tool.
+fn t_d(n): i64 { return f64_from(n); }
+fn t_tol(): i64 { return f64_div(f64_from(1), f64_from(1000000000)); }
+fn t_dclose(got, want): i64 {
+    if (f64_lt(f64_abs(f64_sub(got, want)), t_tol()) == 1) { return 1; }
+    return 0;
+}
+fn t_m2(a, b, c, d): i64 {
+    var m = ganita_mat_new(2, 2);
+    ganita_mat_set(m, 0, 0, a); ganita_mat_set(m, 0, 1, b);
+    ganita_mat_set(m, 1, 0, c); ganita_mat_set(m, 1, 1, d);
+    return m;
+}
+fn t_m3(a, b, c, d, e, f, g, h, i): i64 {
+    var m = ganita_mat_new(3, 3);
+    ganita_mat_set(m, 0, 0, a); ganita_mat_set(m, 0, 1, b); ganita_mat_set(m, 0, 2, c);
+    ganita_mat_set(m, 1, 0, d); ganita_mat_set(m, 1, 1, e); ganita_mat_set(m, 1, 2, f);
+    ganita_mat_set(m, 2, 0, g); ganita_mat_set(m, 2, 1, h); ganita_mat_set(m, 2, 2, i);
+    return m;
+}
+fn t_arr2(a, b): i64 { var q = alloc(16); store64(q, a); store64(q + 8, b); return q; }
+fn t_arr3(a, b, c): i64 {
+    var q = alloc(24); store64(q, a); store64(q + 8, b); store64(q + 16, c); return q;
+}
+
 # --- f32 test helpers ---------------------------------------------------
 # An f32 here is its IEEE-754 single bit pattern in the low 32 bits, the form
 # f32_from / f32_to use. Constants are BUILT rather than hardcoded, except
@@ -245,6 +273,257 @@ assert_eq(t_is_nan(ganita_f32_pow(F_0, F_2)), 1,
   "GAP: pow(0,2) is NaN, should be 0 — fails when ganita_f64_pow is fixed");
 assert_eq(t_is_nan(ganita_f32_pow(F_M2, F_2)), 1,
   "GAP: pow(-2,2) is NaN, should be 4 — fails when ganita_f64_pow is fixed");
+
+# ========================================================================
+# linalg — decompositions and solvers (tests added 1.1.3)
+# ========================================================================
+# Reference matrices, each with a hand-computable answer.
+#   A2 = [[4,3],[6,3]]         det = 4*3 - 3*6 = -6
+#   SING = [[1,2],[2,4]]       row 2 = 2*row 1, so singular
+#   SPD = [[4,2],[2,3]]        symmetric positive-definite
+#   M3 = [[6,1,1],[4,-2,5],[2,8,7]]   det = -306 (cofactor expansion)
+var A2   = t_m2(t_d(4), t_d(3), t_d(6), t_d(3));
+var SING = t_m2(t_d(1), t_d(2), t_d(2), t_d(4));
+var SPD  = t_m2(t_d(4), t_d(2), t_d(2), t_d(3));
+var M3   = t_m3(t_d(6), t_d(1), t_d(1),
+  t_d(4), t_d(0 - 2), t_d(5),
+  t_d(2), t_d(8), t_d(7));
+var I2 = ganita_mat_identity(2);
+var I3 = ganita_mat_identity(3);
+
+test_group("linalg: eq / is_symmetric / trace / norms");
+# mat_eq is the comparison tool for everything below, so pin both polarities
+# first — an eq that always returned 1 would make the whole suite vacuous.
+assert_eq(ganita_mat_eq(A2, ganita_mat_copy(A2), t_tol()), 1, "eq: a matrix equals its copy");
+assert_eq(ganita_mat_eq(A2, SPD, t_tol()), 0, "eq: different matrices are not equal");
+assert_eq(ganita_mat_eq(I2, I3, t_tol()), 0, "eq: different shapes are not equal");
+assert_eq(ganita_mat_is_symmetric(SPD, t_tol()), 1, "is_symmetric: [[4,2],[2,3]] is symmetric");
+assert_eq(ganita_mat_is_symmetric(A2, t_tol()), 0, "is_symmetric: [[4,3],[6,3]] is not");
+assert_eq(ganita_mat_is_symmetric(ganita_mat_new(2, 3), t_tol()), 0, "is_symmetric: non-square is never symmetric");
+assert_eq(t_dclose(ganita_mat_trace(t_m2(t_d(1), t_d(2), t_d(3), t_d(4))), t_d(5)), 1, "trace[[1,2],[3,4]] = 5");
+assert_eq(t_dclose(ganita_mat_trace(I3), t_d(3)), 1, "trace(I3) = 3");
+# Frobenius = sqrt(sum of squares); 3-4-5 makes it exact.
+assert_eq(t_dclose(ganita_mat_frobenius(t_m2(t_d(3), t_d(0), t_d(0), t_d(4))), t_d(5)), 1,
+  "frobenius[[3,0],[0,4]] = 5");
+# Infinity norm = max absolute ROW sum: rows are |1|+|-2|=3 and |3|+|4|=7.
+assert_eq(t_dclose(ganita_mat_max_norm(t_m2(t_d(1), t_d(0 - 2), t_d(3), t_d(4))), t_d(7)), 1,
+  "max_norm[[1,-2],[3,4]] = 7 (max row sum, not max element)");
+
+test_group("linalg: copy / neg / row / col / set_row / set_col / submatrix");
+# copy must be deep — mutating the original may not touch the copy.
+var CP = ganita_mat_copy(A2);
+ganita_mat_set(A2, 0, 0, t_d(99));
+assert_eq(t_dclose(ganita_mat_get(CP, 0, 0), t_d(4)), 1, "copy is deep, not aliased");
+ganita_mat_set(A2, 0, 0, t_d(4));
+assert_eq(ganita_mat_eq(ganita_mat_neg(ganita_mat_neg(A2)), A2, t_tol()), 1, "neg is an involution");
+assert_eq(t_dclose(ganita_mat_get(ganita_mat_neg(A2), 0, 0), t_d(0 - 4)), 1, "neg negates elements");
+var ROW = ganita_mat_row(M3, 1);
+assert_eq(t_dclose(load64(ROW), t_d(4)), 1, "mat_row: row 1 element 0");
+assert_eq(t_dclose(load64(ROW + 8), t_d(0 - 2)), 1, "mat_row: row 1 element 1");
+var COL = ganita_mat_col(M3, 2);
+assert_eq(t_dclose(load64(COL), t_d(1)), 1, "mat_col: col 2 element 0");
+assert_eq(t_dclose(load64(COL + 16), t_d(7)), 1, "mat_col: col 2 element 2");
+var SR = ganita_mat_copy(A2);
+ganita_mat_set_row(SR, 0, t_arr2(t_d(7), t_d(8)));
+assert_eq(t_dclose(ganita_mat_get(SR, 0, 1), t_d(8)), 1, "set_row writes the row");
+assert_eq(t_dclose(ganita_mat_get(SR, 1, 0), t_d(6)), 1, "set_row leaves other rows alone");
+var SC = ganita_mat_copy(A2);
+ganita_mat_set_col(SC, 1, t_arr2(t_d(7), t_d(8)));
+assert_eq(t_dclose(ganita_mat_get(SC, 1, 1), t_d(8)), 1, "set_col writes the column");
+assert_eq(t_dclose(ganita_mat_get(SC, 0, 0), t_d(4)), 1, "set_col leaves other columns alone");
+# submatrix bounds are [r0..r1) x [c0..c1) — half-open.
+var SUB = ganita_mat_submatrix(M3, 0, 0, 2, 2);
+assert_eq(ganita_mat_rows(SUB), 2, "submatrix rows");
+assert_eq(ganita_mat_cols(SUB), 2, "submatrix cols");
+assert_eq(t_dclose(ganita_mat_get(SUB, 1, 1), t_d(0 - 2)), 1, "submatrix copies the right elements");
+
+test_group("linalg: LU decomposition + determinant");
+var LU = ganita_mat_new(2, 2);
+var PIV = alloc(16);
+var SGN = ganita_mat_lu(A2, LU, PIV);
+# Partial pivoting swaps row 0 and 1 here (|6| > |4|), so the sign flips once.
+assert_eq(SGN, 0 - 1, "lu returns the pivot sign (-1 after one row swap)");
+# L is unit lower triangular, U upper — packed together in one matrix.
+# Reconstructing L*U and undoing the pivot must give back A.
+assert_eq(t_dclose(ganita_mat_get(LU, 0, 0), t_d(6)), 1, "lu: U[0][0] is the pivot, 6");
+assert_eq(t_dclose(ganita_mat_det(A2), t_d(0 - 6)), 1, "det[[4,3],[6,3]] = -6");
+assert_eq(t_dclose(ganita_mat_det(M3), t_d(0 - 306)), 1, "det of the 3x3 = -306");
+assert_eq(t_dclose(ganita_mat_det(I3), t_d(1)), 1, "det(I3) = 1");
+# Singular: no pivot survives, so lu reports 0 and det is exactly 0.
+assert_eq(ganita_mat_lu(SING, ganita_mat_new(2, 2), alloc(16)), 0, "lu of a singular matrix returns 0");
+assert_eq(t_dclose(ganita_mat_det(SING), t_d(0)), 1, "det of a singular matrix = 0");
+# det(A) = det(A^T) — a property the pivoting must not break.
+assert_eq(t_dclose(ganita_mat_det(ganita_mat_transpose(M3)), ganita_mat_det(M3)), 1,
+  "det(A^T) = det(A)");
+
+test_group("linalg: lu_solve");
+# [[4,3],[6,3]] x = [10,12]  ->  x = [1,2]
+var LU2 = ganita_mat_new(2, 2);
+var PIV2 = alloc(16);
+ganita_mat_lu(A2, LU2, PIV2);
+var X2 = alloc(16);
+assert_eq(ganita_mat_lu_solve(LU2, PIV2, t_arr2(t_d(10), t_d(12)), X2), 0, "lu_solve returns 0");
+assert_eq(t_dclose(load64(X2), t_d(1)), 1, "lu_solve x0 = 1");
+assert_eq(t_dclose(load64(X2 + 8), t_d(2)), 1, "lu_solve x1 = 2");
+# 3x3 round trip: solve M3 x = M3 * [1,2,3], recover [1,2,3].
+var LU3 = ganita_mat_new(3, 3);
+var PIV3 = alloc(24);
+ganita_mat_lu(M3, LU3, PIV3);
+var B3 = t_arr3(t_d(6 + 2 + 3), t_d(4 - 4 + 15), t_d(2 + 16 + 21));
+var X3 = alloc(24);
+ganita_mat_lu_solve(LU3, PIV3, B3, X3);
+assert_eq(t_dclose(load64(X3), t_d(1)), 1, "lu_solve 3x3 x0 = 1");
+assert_eq(t_dclose(load64(X3 + 8), t_d(2)), 1, "lu_solve 3x3 x1 = 2");
+assert_eq(t_dclose(load64(X3 + 16), t_d(3)), 1, "lu_solve 3x3 x2 = 3");
+
+test_group("linalg: inverse");
+# The defining property, checked both ways round.
+assert_eq(ganita_mat_eq(ganita_mat_mul(A2, ganita_mat_inv(A2)), I2, t_tol()), 1, "A * inv(A) = I");
+assert_eq(ganita_mat_eq(ganita_mat_mul(ganita_mat_inv(A2), A2), I2, t_tol()), 1, "inv(A) * A = I");
+assert_eq(ganita_mat_eq(ganita_mat_mul(M3, ganita_mat_inv(M3)), I3, t_tol()), 1, "3x3: A * inv(A) = I");
+assert_eq(ganita_mat_eq(ganita_mat_inv(I3), I3, t_tol()), 1, "inv(I) = I");
+assert_eq(ganita_mat_eq(ganita_mat_inv(ganita_mat_inv(A2)), A2, t_tol()), 1, "inv is an involution");
+# Singular input returns the null pointer rather than a garbage matrix.
+assert_eq(ganita_mat_inv(SING), 0, "inv of a singular matrix returns 0, not garbage");
+
+test_group("linalg: Cholesky (symmetric positive-definite only)");
+var L = ganita_mat_new(2, 2);
+assert_eq(ganita_mat_cholesky(SPD, L), 1, "cholesky succeeds on an SPD matrix");
+# A = L*L^T is the whole contract.
+assert_eq(ganita_mat_eq(ganita_mat_mul(L, ganita_mat_transpose(L)), SPD, t_tol()), 1,
+  "cholesky: L * L^T = A");
+assert_eq(t_dclose(ganita_mat_get(L, 0, 1), t_d(0)), 1, "cholesky: L is lower triangular");
+assert_eq(t_dclose(ganita_mat_get(L, 0, 0), t_d(2)), 1, "cholesky: L[0][0] = sqrt(4) = 2");
+# Symmetric but NOT positive-definite: [[1,2],[2,1]] has eigenvalues 3 and -1.
+assert_eq(ganita_mat_cholesky(t_m2(t_d(1), t_d(2), t_d(2), t_d(1)), ganita_mat_new(2, 2)), 0,
+  "cholesky rejects a symmetric non-positive-definite matrix");
+# Solve [[4,2],[2,3]] x = [10,11] -> x = [1,3].
+var CX = alloc(16);
+assert_eq(ganita_mat_cholesky_solve(L, t_arr2(t_d(10), t_d(11)), CX), 0, "cholesky_solve returns 0");
+assert_eq(t_dclose(load64(CX), t_d(1)), 1, "cholesky_solve x0 = 1");
+assert_eq(t_dclose(load64(CX + 8), t_d(3)), 1, "cholesky_solve x1 = 3");
+
+test_group("linalg: QR (Householder)");
+var Q = ganita_mat_new(2, 2);
+var R = ganita_mat_new(2, 2);
+assert_eq(ganita_mat_qr(A2, Q, R), 0, "qr returns 0");
+assert_eq(ganita_mat_eq(ganita_mat_mul(Q, R), A2, t_tol()), 1, "qr: Q * R = A");
+# Orthogonality is the property that makes QR worth having.
+assert_eq(ganita_mat_eq(ganita_mat_mul(ganita_mat_transpose(Q), Q), I2, t_tol()), 1,
+  "qr: Q^T * Q = I (Q is orthogonal)");
+assert_eq(t_dclose(ganita_mat_get(R, 1, 0), t_d(0)), 1, "qr: R is upper triangular");
+# Non-square input: 3x2 gives a 3x3 Q and a 3x2 R.
+var A32 = ganita_mat_new(3, 2);
+ganita_mat_set(A32, 0, 0, t_d(1)); ganita_mat_set(A32, 0, 1, t_d(0));
+ganita_mat_set(A32, 1, 0, t_d(0)); ganita_mat_set(A32, 1, 1, t_d(1));
+ganita_mat_set(A32, 2, 0, t_d(1)); ganita_mat_set(A32, 2, 1, t_d(1));
+var Q3 = ganita_mat_new(3, 3);
+var R32 = ganita_mat_new(3, 2);
+ganita_mat_qr(A32, Q3, R32);
+assert_eq(ganita_mat_eq(ganita_mat_mul(Q3, R32), A32, t_tol()), 1, "qr: Q * R = A for a 3x2");
+assert_eq(ganita_mat_eq(ganita_mat_mul(ganita_mat_transpose(Q3), Q3), I3, t_tol()), 1,
+  "qr: Q^T * Q = I for a 3x2");
+
+test_group("linalg: Gaussian elimination (augmented, in place)");
+# [[4,3|10],[6,3|12]] -> solution [1,2] written back into the last column.
+var AUG = ganita_mat_new(2, 3);
+ganita_mat_set(AUG, 0, 0, t_d(4)); ganita_mat_set(AUG, 0, 1, t_d(3)); ganita_mat_set(AUG, 0, 2, t_d(10));
+ganita_mat_set(AUG, 1, 0, t_d(6)); ganita_mat_set(AUG, 1, 1, t_d(3)); ganita_mat_set(AUG, 1, 2, t_d(12));
+assert_eq(ganita_mat_gaussian_elim(AUG), 1, "gaussian_elim returns 1 on success");
+assert_eq(t_dclose(ganita_mat_get(AUG, 0, 2), t_d(1)), 1, "gaussian_elim x0 = 1 (in the last column)");
+assert_eq(t_dclose(ganita_mat_get(AUG, 1, 2), t_d(2)), 1, "gaussian_elim x1 = 2");
+# Same solution as lu_solve on the same system — two independent paths agreeing.
+assert_eq(t_dclose(ganita_mat_get(AUG, 0, 2), load64(X2)), 1, "gaussian_elim agrees with lu_solve");
+var AUGS = ganita_mat_new(2, 3);
+ganita_mat_set(AUGS, 0, 0, t_d(1)); ganita_mat_set(AUGS, 0, 1, t_d(2)); ganita_mat_set(AUGS, 0, 2, t_d(3));
+ganita_mat_set(AUGS, 1, 0, t_d(2)); ganita_mat_set(AUGS, 1, 1, t_d(4)); ganita_mat_set(AUGS, 1, 2, t_d(6));
+assert_eq(ganita_mat_gaussian_elim(AUGS), 0, "gaussian_elim returns 0 on a singular system");
+
+test_group("linalg: least squares (via QR)");
+# Overdetermined but CONSISTENT: x=1, y=2 satisfies all three rows exactly,
+# so the least-squares solution is the exact one and can be asserted tightly.
+var LSA = ganita_mat_new(3, 2);
+ganita_mat_set(LSA, 0, 0, t_d(1)); ganita_mat_set(LSA, 0, 1, t_d(0));
+ganita_mat_set(LSA, 1, 0, t_d(0)); ganita_mat_set(LSA, 1, 1, t_d(1));
+ganita_mat_set(LSA, 2, 0, t_d(1)); ganita_mat_set(LSA, 2, 1, t_d(1));
+var LSX = alloc(16);
+assert_eq(ganita_mat_least_squares(LSA, t_arr3(t_d(1), t_d(2), t_d(3)), LSX), 0, "least_squares returns 0");
+assert_eq(t_dclose(load64(LSX), t_d(1)), 1, "least_squares x0 = 1");
+assert_eq(t_dclose(load64(LSX + 8), t_d(2)), 1, "least_squares x1 = 2");
+
+test_group("linalg: symmetric eigendecomposition (Jacobi)");
+# [[2,1],[1,2]] has eigenvalues 3 and 1, eigenvectors (1,1)/sqrt2 and (1,-1)/sqrt2.
+var EM = t_m2(t_d(2), t_d(1), t_d(1), t_d(2));
+var EVAL = alloc(16);
+var EVEC = ganita_mat_new(2, 2);
+assert_eq(ganita_mat_eigen_sym(EM, EVAL, EVEC) >= 0, 1, "eigen_sym converges (non-negative iterations)");
+assert_eq(t_dclose(load64(EVAL), t_d(3)), 1, "eigen_sym lambda0 = 3");
+assert_eq(t_dclose(load64(EVAL + 8), t_d(1)), 1, "eigen_sym lambda1 = 1");
+# Two invariants that hold regardless of eigenvalue ordering.
+assert_eq(t_dclose(f64_add(load64(EVAL), load64(EVAL + 8)), ganita_mat_trace(EM)), 1,
+  "eigen_sym: sum of eigenvalues = trace");
+assert_eq(t_dclose(f64_mul(load64(EVAL), load64(EVAL + 8)), ganita_mat_det(EM)), 1,
+  "eigen_sym: product of eigenvalues = determinant");
+# A*v = lambda*v for the first eigenvector (columns of out_vecs).
+var V0 = ganita_mat_col(EVEC, 0);
+var AV0 = f64_add(f64_mul(ganita_mat_get(EM, 0, 0), load64(V0)),
+  f64_mul(ganita_mat_get(EM, 0, 1), load64(V0 + 8)));
+assert_eq(t_dclose(AV0, f64_mul(load64(EVAL), load64(V0))), 1,
+  "eigen_sym: A*v = lambda*v for eigenvector 0");
+# Eigenvectors are orthonormal for a symmetric matrix.
+assert_eq(ganita_mat_eq(ganita_mat_mul(ganita_mat_transpose(EVEC), EVEC), I2, t_tol()), 1,
+  "eigen_sym: eigenvectors are orthonormal");
+# Already-diagonal input must be left alone.
+var DIAG = t_m2(t_d(5), t_d(0), t_d(0), t_d(7));
+var DVAL = alloc(16);
+ganita_mat_eigen_sym(DIAG, DVAL, ganita_mat_new(2, 2));
+assert_eq(t_dclose(f64_add(load64(DVAL), load64(DVAL + 8)), t_d(12)), 1,
+  "eigen_sym on a diagonal matrix returns its diagonal");
+
+test_group("linalg: SVD");
+var SM = t_m2(t_d(3), t_d(0), t_d(0), t_d(2));
+var SU = ganita_mat_new(2, 2);
+var SIG = alloc(16);
+var SVT = ganita_mat_new(2, 2);
+assert_eq(ganita_mat_svd(SM, SU, SIG, SVT), 0, "svd returns 0");
+assert_eq(t_dclose(load64(SIG), t_d(3)), 1, "svd sigma0 = 3 (largest first)");
+assert_eq(t_dclose(load64(SIG + 8), t_d(2)), 1, "svd sigma1 = 2");
+assert_eq(f64_ge(load64(SIG), load64(SIG + 8)), 1, "svd singular values are sorted descending");
+# U * diag(sigma) * V^T must reconstruct A.
+assert_eq(ganita_mat_eq(
+    ganita_mat_mul(ganita_mat_mul(SU, t_m2(load64(SIG), t_d(0), t_d(0), load64(SIG + 8))), SVT),
+    SM, t_tol()), 1, "svd: U * Sigma * V^T = A");
+# Singular values of a non-diagonal matrix still reconstruct it.
+var SU2 = ganita_mat_new(2, 2);
+var SIG2 = alloc(16);
+var SVT2 = ganita_mat_new(2, 2);
+ganita_mat_svd(A2, SU2, SIG2, SVT2);
+assert_eq(ganita_mat_eq(
+    ganita_mat_mul(ganita_mat_mul(SU2, t_m2(load64(SIG2), t_d(0), t_d(0), load64(SIG2 + 8))), SVT2),
+    A2, t_tol()), 1, "svd: reconstruction holds for a non-diagonal matrix");
+# Product of singular values = |det| for a square matrix.
+assert_eq(t_dclose(f64_mul(load64(SIG2), load64(SIG2 + 8)), f64_abs(ganita_mat_det(A2))), 1,
+  "svd: product of singular values = |det|");
+
+test_group("linalg: pseudo-inverse / rank / condition");
+# For an invertible matrix the pseudo-inverse IS the inverse.
+assert_eq(ganita_mat_eq(ganita_mat_pseudo_inv(A2), ganita_mat_inv(A2), t_tol()), 1,
+  "pseudo_inv = inv for an invertible matrix");
+# Moore-Penrose property 1, which also holds for the singular case.
+assert_eq(ganita_mat_eq(
+    ganita_mat_mul(ganita_mat_mul(A2, ganita_mat_pseudo_inv(A2)), A2), A2, t_tol()), 1,
+  "pseudo_inv: A * A+ * A = A");
+var RTOL = f64_div(t_d(1), t_d(1000000));
+assert_eq(ganita_mat_rank(I2, RTOL), 2, "rank(I2) = 2");
+assert_eq(ganita_mat_rank(I3, RTOL), 3, "rank(I3) = 3");
+assert_eq(ganita_mat_rank(SING, RTOL), 1, "rank of a rank-deficient matrix = 1");
+assert_eq(ganita_mat_rank(A2, RTOL), 2, "rank of a full-rank 2x2 = 2");
+assert_eq(t_dclose(ganita_mat_condition(I2), t_d(1)), 1, "condition(I) = 1 (perfectly conditioned)");
+# Documented sentinel: -1.0 for a singular matrix, not +inf and not a crash.
+assert_eq(t_dclose(ganita_mat_condition(SING), t_d(0 - 1)), 1,
+  "condition of a singular matrix = -1 (documented sentinel)");
+# cond = sigma_max / sigma_min, and it is >= 1 for anything well-formed.
+assert_eq(f64_ge(ganita_mat_condition(A2), t_d(1)), 1, "condition >= 1 for a non-singular matrix");
 
 test_group("back-compat aliases");
 var a2 = mat_new(4, 5);

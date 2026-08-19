@@ -6,6 +6,12 @@
 
 ## Version
 
+**1.1.3** — `linalg.cyr` gets a test suite. It was the largest untested surface
+in the repo at **2/26** — every decomposition and solver shipped unverified —
+and is now **26/26** with 90 new assertions. Repo coverage 37% → **80%**.
+Found and filed, not fixed: `fmt_float` drops the carry when a fraction rounds
+up to 1.0, so a correct near-integer result prints as if it were wrong.
+
 **1.1.2** — the f32 tier gets a test suite, and it found two bugs.
 `math_f32.cyr` was **0/23 referenced** — `tests/ganita.tcyr` never even included
 it. Now 23/23, with 95 new assertions; overall coverage 16% → **37%**, 7/7 files
@@ -66,7 +72,7 @@ functions prefixed `ganita_`. Regenerated from the tree 2026-08-19:
 - `src/_compat.cyr` — 53 back-compat aliases (legacy names → `ganita_*`).
   Single-pass order: matrix → linalg → math_advanced → math_f32 → `_compat`
   last, since its aliases reference every `ganita_*` symbol.
-- `dist/ganita.cyr` — regenerated via `cyrius distlib` at 1.1.2 on released
+- `dist/ganita.cyr` — regenerated via `cyrius distlib` at 1.1.3 on released
   6.5.28. This is the artifact folded into
   `cyrius/lib/ganita.cyr`.
 - `dist/ganita.deps` — 7 stdlib leaves: `syscalls string alloc fmt vec str math`.
@@ -77,7 +83,18 @@ functions prefixed `ganita_`. Regenerated from the tree 2026-08-19:
 
 - `tests/ganita.tcyr` — matrix dims + identity + **CWE-190 dimension guard** +
   binomial/fibonacci + `f64_tanh` saturation + alias parity + **the full f32
-  tier** (1.1.2). **120 assertions, green** on released 6.5.28.
+  tier** (1.1.2) + **the full linalg surface** (1.1.3). **210 assertions,
+  green** on released 6.5.28.
+
+  The linalg block asserts **properties**, not transcribed outputs — `A·A⁻¹ = I`,
+  `Qᵀ·Q = I`, `L·Lᵀ = A`, `U·Σ·Vᵀ = A`, `Σλ = trace`, `Πλ = det`, `Πσ = |det|`,
+  Moore–Penrose `A·A⁺·A = A` — so they survive a reimplementation and cannot be
+  satisfied by a plausible-looking wrong answer. `mat_eq` is the comparison tool
+  for most of them, so both its polarities are pinned first; an `eq` that always
+  returned 1 would make the rest vacuous. Mutation-verified: forcing the LU
+  pivot sign fails 2, deleting Cholesky's positive-definite check fails 1, and
+  making QR return an identity `Q` fails 6 — including both least-squares
+  assertions, the suite noticing that `least_squares` is built on QR.
 
   **The f32 block is mutation-verified**, which matters because 1.1.0 named the
   exact trap: IEEE-754 is sign-magnitude, so raw patterns order correctly only
@@ -99,17 +116,17 @@ functions prefixed `ganita_`. Regenerated from the tree 2026-08-19:
 
 ### Coverage
 
-`cyrius coverage` — **49/131 fns (37%)**, 7/7 files referenced (was 22/131 and
-4/7 before 1.1.2). A floor, not a correctness proof, and the deep suite still
-lives upstream — but the remaining gaps are worth naming:
+`cyrius coverage` — **105/131 fns (80%)**, 7/7 files referenced (22/131 and 4/7
+before 1.1.2). A floor, not a correctness proof, but the two carved tiers are
+now fully exercised in-repo:
 
 | Module | Referenced |
 |---|---|
+| `linalg.cyr`        | **26/26** |
 | `math_f32.cyr`      | **23/23** |
-| `matrix.cyr`        | 6/14 |
-| `_compat.cyr`       | 12/53 |
+| `matrix.cyr`        | 10/14 |
+| `_compat.cyr`       | 40/53 |
 | `math_advanced.cyr` | 4/13 |
-| `linalg.cyr`        | **2/26** |
 
 ## CI
 
@@ -136,7 +153,7 @@ sweep. Three properties worth remembering when editing it:
 
 Gates: pin-drift · version consistency · `lib/` vs snapshot · format (src and
 tests) · lint · vet · build with 0 warnings · smoke exits 42 · test · fuzz ·
-bench · `coverage --min 37` · `distlib --all --check` · regeneration leaves no
+bench · `coverage --min 80` · `distlib --all --check` · regeneration leaves no
 tree diff · consumer-check.
 
 ## Known gaps
@@ -151,9 +168,17 @@ tree diff · consumer-check.
    [2026-08-19](issues/2026-08-19-f64-pow-zero-and-negative-base.md). The test
    suite pins the current behaviour in a **self-expiring** group that fails when
    the issue is fixed.
-3. **`linalg.cyr` is 2/26** — the decompositions (LU, det, inv, solve) are the
-   largest untested surface left in the repo now that the f32 tier is covered.
-4. **`lib/ganita.cyr` is ganita's own fold vendored back into ganita's own
+3. **`fmt_float` drops the carry when a fraction rounds up to 1.0** —
+   `fmt_float(2.9999999, 6)` prints `2.1000000` (seven fraction digits). Display
+   only, but near-integer results are routine after a decomposition, so correct
+   answers read as wrong ones. cyrius stdlib, vendored. Filed:
+   [2026-08-19](issues/2026-08-19-fmt-float-missing-carry-on-round-up.md).
+   ganita's tests assert numerically, never on printed text, so they are
+   unaffected.
+4. **`math_advanced.cyr` is 4/13** — the remaining in-repo coverage gap now that
+   the f32 and linalg tiers are done. Its deep coverage lives upstream in
+   cyrius's `math` `.tcyr` suite.
+5. **`lib/ganita.cyr` is ganita's own fold vendored back into ganita's own
    `lib/`** — new at this pin, because `lib sync --full` copies the whole
    snapshot and cyrius now carries the ganita fold. Nothing in `src/`,
    `tests/`, or `cyrius.cyml` includes it, so it is inert, but it defines the
@@ -161,7 +186,7 @@ tree diff · consumer-check.
    include it. Deleting it is not durable (`--full` re-adds it on every bump);
    the durable fix is upstream, a `lib sync` self-exclusion. bayan carries the
    identical gap.
-5. **`README.md` is stale** — still describes the pre-1.1.0 surface.
+6. **`README.md` is stale** — still describes the pre-1.1.0 surface.
 
 ## Dependencies
 
@@ -175,8 +200,8 @@ No sibling `[deps.NAME]` entries, so `cyrius deps` writes no `cyrius.lock`.
 ## Consumers
 
 - **cyrius** — folds `dist/ganita.cyr` → `lib/ganita.cyr`. The 6.5.28 snapshot
-  carries ganita **1.1.0**; 1.1.1 (toolchain/CI) and 1.1.2 (f32 tests + the
-  `cbrt(0)` fix) are not folded yet.
+  carries ganita **1.1.0**; 1.1.1 (toolchain/CI), 1.1.2 (f32 tests + the
+  `cbrt(0)` fix) and 1.1.3 (linalg tests) are not folded yet.
 - **ranga** (image-processing port) — drove the 1.1.0 f32 tier.
 - Downstream repos using matrix/linalg/advanced-math migrate to `ganita_*` on
   re-pin (aliases bridge the window).
