@@ -4,6 +4,80 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.1.2] — 2026-08-19 — f32 tier gets a test suite, and it found two bugs
+
+1.1.0 shipped 23 `ganita_f32_*` helpers with **no test at all** (`math_f32.cyr`
+was 0/23 referenced — the module was never even included by
+`tests/ganita.tcyr`). This closes that: **23/23 functions covered, 95 new
+assertions**, and overall reference coverage 16% → **37%** with 7/7 files
+referenced.
+
+### Fixed
+
+- **`ganita_f32_cbrt(0)` returned NaN.** Zero fell through to `pow`, `pow` is
+  `exp(y·ln x)`, and `ln(0)` is `-inf` — so the cube root of zero was NaN.
+  Guarded explicitly, `±0 -> ±0`, preserving the sign of zero. The failure was
+  invisible to any test that only tried positive non-zero inputs.
+
+### Added — `tests/ganita.tcyr`
+
+**The `_f32_key` sign-magnitude story is now pinned, and mutation-verified.**
+1.1.0 called it "the whole correctness story" and named the trap precisely:
+IEEE-754 is sign-magnitude, so raw bit patterns order correctly only among
+non-negatives — and pixel data *is* non-negative, so a naive unsigned compare
+passes every plausible test. The suite states the trap as an assertion
+(`-1.0f` sorts *below* `-2.0f`; every negative sorts *above* every positive),
+then checks the cases that discriminate:
+
+| Case | Correct | A bare unsigned compare gives |
+|---|---|---|
+| `min(-1,-2)` | `-2` | `-1` |
+| `max(-1,-2)` | `-1` | `-2` |
+| `min(-1, 1)` | `-1` | `1` |
+| `max(-1, 1)` | `1` | `-1` |
+
+Replacing `_f32_key` with the naive `b & 0xFFFFFFFF` fails **12** assertions
+across min/max/clamp and the hygiene group. Removing `cbrt`'s sign split fails
+exactly 2 — both negative-input cases, while every positive still passes, which
+is the shape of bug a positives-only suite misses.
+
+Also covered: signed zeros (`min(+0,-0) = -0`), infinities, commutativity;
+`clamp` including an all-negative range; `abs`/`neg`/`sign` on zeros and
+infinities with their involution and idempotence laws; **high-32 hygiene** —
+every entry point masks, so an operand with a dirty high half still yields a
+clean 32-bit result; `floor`/`ceil`/`trunc` at `±2.5` where all three differ,
+plus `trunc(-0.5) = -0`; `lerp` endpoints and a sign-spanning midpoint;
+`sqrt(2) = 0x3FB504F3`, the correctly-rounded single (f64's 53 mantissa bits
+exceed 2·24+2, so double-rounding cannot bite); and exact identities for every
+tier-3 function.
+
+**`round` is half-to-EVEN, not half-away-from-zero** — pinned explicitly with a
+note, because C's `roundf(2.5)` is `3.0` while this gives `2.0`. A consumer
+porting from C is otherwise quietly off by one on every tie.
+
+### Found, not fixed — `ganita_f64_pow` domain gap
+
+`pow` is `exp(y·ln base)`, valid only for `base > 0`. So `pow(0, 2)` is NaN
+(should be `0`) and `pow(-2, 2)` is NaN (should be `4`); `ganita_f32_pow`
+inherits both. This is the f64 tier, out of scope for an f32 test pass, so it is
+**filed rather than changed**:
+[2026-08-19](docs/development/issues/2026-08-19-f64-pow-zero-and-negative-base.md).
+
+The suite carries a **self-expiring** `f32: known domain gaps` group asserting
+the current NaN behaviour, so the gap is measured rather than merely known —
+those two assertions **fail when the issue is fixed**, which is the signal to
+rewrite them to the correct answers.
+
+### Changed
+
+- CI coverage floor raised `16` → **`37`**, matching the new measurement. It
+  ratchets up, never down.
+
+### Verified on released 6.5.28
+
+`cyrius test` — **120 passed, 0 failed** (was 25). Build clean with zero
+warnings, smoke exits 42, `distlib --all --check` current, consumer-check clean.
+
 ## [1.1.1] — 2026-08-19
 
 Toolchain + CI release. No behavioural change — the only `src/` edits are

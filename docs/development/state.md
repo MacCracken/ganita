@@ -6,6 +6,13 @@
 
 ## Version
 
+**1.1.2** — the f32 tier gets a test suite, and it found two bugs.
+`math_f32.cyr` was **0/23 referenced** — `tests/ganita.tcyr` never even included
+it. Now 23/23, with 95 new assertions; overall coverage 16% → **37%**, 7/7 files
+referenced. Fixed: `ganita_f32_cbrt(0)` returned NaN (zero reached `pow`, and
+`ln(0)` is `-inf`). Found and filed, not fixed: `ganita_f64_pow` is NaN for a
+zero or negative base.
+
 **1.1.1** — toolchain + CI. Cyrius pin `6.5.23` → `6.5.28`, `lib/` re-synced to
 an exact match, `dist/` regenerated. No behavioural change: the only `src/`
 edits are whitespace and one reworded comment. CI went from 4 steps to a full
@@ -59,8 +66,8 @@ functions prefixed `ganita_`. Regenerated from the tree 2026-08-19:
 - `src/_compat.cyr` — 53 back-compat aliases (legacy names → `ganita_*`).
   Single-pass order: matrix → linalg → math_advanced → math_f32 → `_compat`
   last, since its aliases reference every `ganita_*` symbol.
-- `dist/ganita.cyr` — **1,547**-line bundle, regenerated via `cyrius distlib`
-  at 1.1.1 on released 6.5.28. This is the artifact folded into
+- `dist/ganita.cyr` — regenerated via `cyrius distlib` at 1.1.2 on released
+  6.5.28. This is the artifact folded into
   `cyrius/lib/ganita.cyr`.
 - `dist/ganita.deps` — 7 stdlib leaves: `syscalls string alloc fmt vec str math`.
   Verified sufficient by `scripts/consumer-check.sh` (`str` is over-declared but
@@ -69,25 +76,40 @@ functions prefixed `ganita_`. Regenerated from the tree 2026-08-19:
 ## Tests
 
 - `tests/ganita.tcyr` — matrix dims + identity + **CWE-190 dimension guard** +
-  binomial/fibonacci + `f64_tanh` saturation + alias parity. **25 assertions,
-  green** on released 6.5.28.
+  binomial/fibonacci + `f64_tanh` saturation + alias parity + **the full f32
+  tier** (1.1.2). **120 assertions, green** on released 6.5.28.
+
+  **The f32 block is mutation-verified**, which matters because 1.1.0 named the
+  exact trap: IEEE-754 is sign-magnitude, so raw patterns order correctly only
+  among non-negatives, and pixel data *is* non-negative — a naive unsigned
+  compare passes every plausible test. Replacing `_f32_key` with the naive
+  `b & 0xFFFFFFFF` fails **12** assertions; removing `cbrt`'s sign split fails
+  exactly 2, both negative-input, while every positive still passes. The suite
+  also states the trap directly (`-1.0f` sorts *below* `-2.0f`; negatives sort
+  *above* positives) so a reader sees why those cases discriminate.
+
+  Also pinned: signed zeros and infinities through min/max/sign/abs/neg;
+  high-32 hygiene (a dirty high half must not leak into a result);
+  floor/ceil/trunc at `±2.5` where all three differ; `sqrt(2) = 0x3FB504F3`,
+  the correctly-rounded single; and that **`round` is half-to-EVEN**, unlike
+  C's `roundf` — a porting hazard worth a standing assertion.
 - `src/main.cyr` — full-bundle compile smoke (exits 42).
 - Deep per-module coverage stays in cyrius's `matrix`/`linalg`/`math` `.tcyr`
   suite.
 
 ### Coverage
 
-`cyrius coverage` — **22/131 fns (16%)**, 4/7 files referenced. A floor, not a
-correctness proof, and the deep suite still lives upstream — but the gaps are
-worth naming:
+`cyrius coverage` — **49/131 fns (37%)**, 7/7 files referenced (was 22/131 and
+4/7 before 1.1.2). A floor, not a correctness proof, and the deep suite still
+lives upstream — but the remaining gaps are worth naming:
 
 | Module | Referenced |
 |---|---|
+| `math_f32.cyr`      | **23/23** |
 | `matrix.cyr`        | 6/14 |
-| `_compat.cyr`       | 11/53 |
-| `math_advanced.cyr` | 3/13 |
+| `_compat.cyr`       | 12/53 |
+| `math_advanced.cyr` | 4/13 |
 | `linalg.cyr`        | **2/26** |
-| `math_f32.cyr`      | **0/23** |
 
 ## CI
 
@@ -114,7 +136,7 @@ sweep. Three properties worth remembering when editing it:
 
 Gates: pin-drift · version consistency · `lib/` vs snapshot · format (src and
 tests) · lint · vet · build with 0 warnings · smoke exits 42 · test · fuzz ·
-bench · `coverage --min 16` · `distlib --all --check` · regeneration leaves no
+bench · `coverage --min 37` · `distlib --all --check` · regeneration leaves no
 tree diff · consumer-check.
 
 ## Known gaps
@@ -123,11 +145,15 @@ tree diff · consumer-check.
    the fuzz harness does no fuzzing, the bench measures a no-op. Both report
    PASS, so the two CI gates that run them are vacuous until the harnesses are
    real.
-2. **The 1.1.0 f32 tier has no test** (`math_f32.cyr` 0/23), including the
-   `_f32_key` sign-magnitude transform that 1.1.0 itself called "the whole
-   correctness story" — and whose failure mode is precisely one that passes
-   naive testing. `linalg.cyr` is 2/26.
-3. **`lib/ganita.cyr` is ganita's own fold vendored back into ganita's own
+2. **`ganita_f64_pow` is NaN for a zero or negative base** — `exp(y·ln base)`
+   is only valid for `base > 0`, so `pow(0,2)` and `pow(-2,2)` are NaN instead
+   of `0` and `4`, and `ganita_f32_pow` inherits it. Filed:
+   [2026-08-19](issues/2026-08-19-f64-pow-zero-and-negative-base.md). The test
+   suite pins the current behaviour in a **self-expiring** group that fails when
+   the issue is fixed.
+3. **`linalg.cyr` is 2/26** — the decompositions (LU, det, inv, solve) are the
+   largest untested surface left in the repo now that the f32 tier is covered.
+4. **`lib/ganita.cyr` is ganita's own fold vendored back into ganita's own
    `lib/`** — new at this pin, because `lib sync --full` copies the whole
    snapshot and cyrius now carries the ganita fold. Nothing in `src/`,
    `tests/`, or `cyrius.cyml` includes it, so it is inert, but it defines the
@@ -135,7 +161,7 @@ tree diff · consumer-check.
    include it. Deleting it is not durable (`--full` re-adds it on every bump);
    the durable fix is upstream, a `lib sync` self-exclusion. bayan carries the
    identical gap.
-4. **`README.md` is stale** — still describes the pre-1.1.0 surface.
+5. **`README.md` is stale** — still describes the pre-1.1.0 surface.
 
 ## Dependencies
 
@@ -149,7 +175,8 @@ No sibling `[deps.NAME]` entries, so `cyrius deps` writes no `cyrius.lock`.
 ## Consumers
 
 - **cyrius** — folds `dist/ganita.cyr` → `lib/ganita.cyr`. The 6.5.28 snapshot
-  carries ganita **1.1.0**; 1.1.1 is a toolchain/CI release with no API change.
+  carries ganita **1.1.0**; 1.1.1 (toolchain/CI) and 1.1.2 (f32 tests + the
+  `cbrt(0)` fix) are not folded yet.
 - **ranga** (image-processing port) — drove the 1.1.0 f32 tier.
 - Downstream repos using matrix/linalg/advanced-math migrate to `ganita_*` on
   re-pin (aliases bridge the window).

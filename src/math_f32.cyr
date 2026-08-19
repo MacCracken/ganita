@@ -134,6 +134,10 @@ fn ganita_f32_hypot(x, y): i64 {
 # exp(y*ln x) and ln of a negative is undefined, so a bare pow returns garbage for every
 # negative input while looking fine for the positives a naive test would use.
 fn ganita_f32_cbrt(x): i64 {
+    # cbrt(±0) = ±0. Without this the zero falls into pow -> exp(third * ln 0),
+    # and ln(0) = -inf makes that NaN — so cbrt(0) returned NaN, which no caller
+    # expects and which a positives-only test never sees. Sign of zero preserved.
+    if (x & 0x7FFFFFFF == 0) { return x & 0xFFFFFFFF; }
     var xf = f32_to(x);
     var third = f64_div(f64_from(1), f64_from(3));
     if (x & 0x80000000 != 0) {

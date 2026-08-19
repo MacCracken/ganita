@@ -15,7 +15,21 @@ include "lib/math.cyr"
 include "src/matrix.cyr"
 include "src/linalg.cyr"
 include "src/math_advanced.cyr"
+include "src/math_f32.cyr"
 include "src/_compat.cyr"
+
+# --- f32 test helpers ---------------------------------------------------
+# An f32 here is its IEEE-754 single bit pattern in the low 32 bits, the form
+# f32_from / f32_to use. Constants are BUILT rather than hardcoded, except
+# where the exact pattern is itself the assertion (sqrt 2).
+fn t_f32(n): i64 { return f32_from(f64_from(n)); }
+fn t_f32div(a, b): i64 { return f32_from(f64_div(f64_from(a), f64_from(b))); }
+fn t_is_nan(b): i64 {
+    var lo = b & 0xFFFFFFFF;
+    if ((lo & 0x7F800000) != 0x7F800000) { return 0; }
+    if ((lo & 0x007FFFFF) == 0) { return 0; }
+    return 1;
+}
 
 alloc_init();
 
@@ -59,6 +73,178 @@ assert_eq(ganita_f64_tanh(f64_from(0 - 1000)), f64_from(0 - 1), "tanh(-1000) sat
 assert_eq(ganita_f64_tanh(f64_from(25)), f64_from(1), "tanh(25) (saturated) = 1");
 assert_eq(ganita_f64_tanh(f64_from(20)), ganita_f64_tanh(f64_from(21)),
   "tanh bit-exact across the saturation boundary (formula 20 == saturated 21)");
+
+# ========================================================================
+# f32 scalar tier (1.1.0 API; tests added 1.1.2)
+# ========================================================================
+# Named constants, so an assertion reads as the float it is about.
+var F_0    = t_f32(0);
+var F_NZ   = 0x80000000;              # -0.0f
+var F_1    = t_f32(1);
+var F_2    = t_f32(2);
+var F_3    = t_f32(3);
+var F_4    = t_f32(4);
+var F_5    = t_f32(5);
+var F_8    = t_f32(8);
+var F_M1   = t_f32(0 - 1);
+var F_M2   = t_f32(0 - 2);
+var F_M3   = t_f32(0 - 3);
+var F_HALF = t_f32div(1, 2);          # 0.5f
+var F_2H   = t_f32div(5, 2);          # 2.5f
+var F_M2H  = t_f32div(0 - 5, 2);      # -2.5f
+var F_INF  = 0x7F800000;
+var F_NINF = 0xFF800000;
+
+test_group("f32: min/max are sign-magnitude correct (the _f32_key story)");
+# The trap, stated as an assertion: raw patterns order -1.0f BELOW -2.0f, and
+# order every negative ABOVE every positive. A bare unsigned compare therefore
+# gets both of the next two groups backwards while passing the easy one below.
+assert_eq((F_M1 & 0xFFFFFFFF) < (F_M2 & 0xFFFFFFFF), 1,
+  "raw f32 patterns: -1.0f sorts BELOW -2.0f (sign-magnitude reversal)");
+assert_eq((F_M1 & 0xFFFFFFFF) > (F_1 & 0xFFFFFFFF), 1,
+  "raw f32 patterns: -1.0f sorts ABOVE +1.0f (sign bit dominates)");
+
+# Both negative — a naive unsigned min returns -1.0f here. The answer is -2.0f.
+assert_eq(ganita_f32_min(F_M1, F_M2), F_M2, "min(-1,-2) = -2 (naive unsigned gives -1)");
+assert_eq(ganita_f32_max(F_M1, F_M2), F_M1, "max(-1,-2) = -1 (naive unsigned gives -2)");
+# Mixed sign — a naive unsigned min returns +1.0f here. The answer is -1.0f.
+assert_eq(ganita_f32_min(F_M1, F_1), F_M1, "min(-1,1) = -1 (naive unsigned gives 1)");
+assert_eq(ganita_f32_max(F_M1, F_1), F_1, "max(-1,1) = 1 (naive unsigned gives -1)");
+# Non-negative — the case a naive implementation also passes. Kept so a
+# regression that breaks the easy path is caught too, not as the real evidence.
+assert_eq(ganita_f32_min(F_1, F_2), F_1, "min(1,2) = 1");
+assert_eq(ganita_f32_max(F_1, F_2), F_2, "max(1,2) = 2");
+# Operand order must not matter.
+assert_eq(ganita_f32_min(F_M2, F_M1), ganita_f32_min(F_M1, F_M2), "min is commutative (both negative)");
+assert_eq(ganita_f32_max(F_1, F_M1), ganita_f32_max(F_M1, F_1), "max is commutative (mixed sign)");
+assert_eq(ganita_f32_min(F_M2, F_M2), F_M2, "min(x,x) = x");
+# Signed zeros: -0.0f orders below +0.0f under the key.
+assert_eq(ganita_f32_min(F_0, F_NZ), F_NZ, "min(+0,-0) = -0");
+assert_eq(ganita_f32_max(F_0, F_NZ), F_0, "max(+0,-0) = +0");
+# Infinities are ordinary under the key.
+assert_eq(ganita_f32_min(F_NINF, F_1), F_NINF, "min(-inf,1) = -inf");
+assert_eq(ganita_f32_max(F_NINF, F_1), F_1, "max(-inf,1) = 1");
+assert_eq(ganita_f32_min(F_INF, F_1), F_1, "min(+inf,1) = 1");
+assert_eq(ganita_f32_max(F_INF, F_1), F_INF, "max(+inf,1) = +inf");
+
+test_group("f32: clamp");
+assert_eq(ganita_f32_clamp(t_f32(0 - 5), F_M1, F_1), F_M1, "clamp below range -> lo");
+assert_eq(ganita_f32_clamp(F_5, F_M1, F_1), F_1, "clamp above range -> hi");
+assert_eq(ganita_f32_clamp(F_HALF, F_M1, F_1), F_HALF, "clamp inside range -> unchanged");
+assert_eq(ganita_f32_clamp(F_M2, F_M3, F_M1), F_M2, "clamp inside an all-negative range");
+assert_eq(ganita_f32_clamp(F_0, F_M3, F_M1), F_M1, "clamp 0 into an all-negative range -> hi");
+
+test_group("f32: abs / neg / sign (pure bit ops, no widening)");
+assert_eq(ganita_f32_abs(F_M2H), F_2H, "abs(-2.5) = 2.5");
+assert_eq(ganita_f32_abs(F_2H), F_2H, "abs(2.5) = 2.5 (idempotent)");
+assert_eq(ganita_f32_abs(F_NZ), F_0, "abs(-0) = +0");
+assert_eq(ganita_f32_abs(F_NINF), F_INF, "abs(-inf) = +inf");
+assert_eq(ganita_f32_neg(F_2H), F_M2H, "neg(2.5) = -2.5");
+assert_eq(ganita_f32_neg(F_M2H), F_2H, "neg(-2.5) = 2.5 (involution)");
+assert_eq(ganita_f32_neg(F_0), F_NZ, "neg(+0) = -0");
+assert_eq(ganita_f32_neg(F_NZ), F_0, "neg(-0) = +0");
+assert_eq(ganita_f32_neg(F_INF), F_NINF, "neg(+inf) = -inf");
+assert_eq(ganita_f32_sign(F_M3), F_M1, "sign(-3) = -1.0f");
+assert_eq(ganita_f32_sign(F_2), F_1, "sign(2) = 1.0f");
+assert_eq(ganita_f32_sign(F_0), F_0, "sign(+0) = +0");
+assert_eq(ganita_f32_sign(F_NZ), F_0, "sign(-0) = +0 (both zeros, per the API contract)");
+assert_eq(ganita_f32_sign(F_NINF), F_M1, "sign(-inf) = -1.0f");
+assert_eq(ganita_f32_sign(F_INF), F_1, "sign(+inf) = 1.0f");
+
+test_group("f32: results stay clean 32-bit patterns");
+# An f32 lives in the LOW 32 bits with the high half clear. Callers may hand in
+# a value whose high half is dirty (a masked-off lane, a packed pair); every
+# entry point masks, so nothing may leak upward into the result.
+var F_DIRTY = 0x7FFFFFFF00000000 | F_M2;    # -2.0f with garbage above bit 31
+assert_eq(ganita_f32_abs(F_DIRTY), F_2, "abs ignores a dirty high half");
+assert_eq(ganita_f32_neg(F_DIRTY), F_2, "neg ignores a dirty high half");
+assert_eq(ganita_f32_min(F_DIRTY, F_M1), F_M2, "min ignores a dirty high half");
+assert_eq(ganita_f32_max(F_DIRTY, F_M1), F_M1, "max ignores a dirty high half");
+assert_eq(ganita_f32_abs(F_DIRTY) >> 32, 0, "abs result has a clear high half");
+assert_eq(ganita_f32_neg(F_DIRTY) >> 32, 0, "neg result has a clear high half");
+assert_eq(ganita_f32_min(F_DIRTY, F_M1) >> 32, 0, "min result has a clear high half");
+assert_eq(ganita_f32_sign(F_DIRTY), F_M1, "sign ignores a dirty high half");
+
+test_group("f32: floor / ceil / trunc (exact widening)");
+assert_eq(ganita_f32_floor(F_2H), F_2, "floor(2.5) = 2");
+assert_eq(ganita_f32_floor(F_M2H), F_M3, "floor(-2.5) = -3 (toward -inf)");
+assert_eq(ganita_f32_ceil(F_2H), F_3, "ceil(2.5) = 3");
+assert_eq(ganita_f32_ceil(F_M2H), F_M2, "ceil(-2.5) = -2 (toward +inf)");
+assert_eq(ganita_f32_trunc(F_2H), F_2, "trunc(2.5) = 2");
+assert_eq(ganita_f32_trunc(F_M2H), F_M2, "trunc(-2.5) = -2 (toward zero, NOT floor)");
+assert_eq(ganita_f32_trunc(t_f32div(0 - 1, 2)), F_NZ, "trunc(-0.5) = -0 (sign preserved)");
+assert_eq(ganita_f32_floor(t_f32div(0 - 1, 2)), F_M1, "floor(-0.5) = -1 (differs from trunc)");
+assert_eq(ganita_f32_floor(F_2), F_2, "floor of an integer is unchanged");
+assert_eq(ganita_f32_ceil(F_M2), F_M2, "ceil of a negative integer is unchanged");
+assert_eq(ganita_f32_trunc(F_M2), F_M2, "trunc of a negative integer is unchanged");
+
+test_group("f32: lerp");
+assert_eq(ganita_f32_lerp(F_0, t_f32(10), F_HALF), F_5, "lerp(0,10,0.5) = 5");
+assert_eq(ganita_f32_lerp(F_M1, F_1, F_HALF), F_0, "lerp(-1,1,0.5) = 0 (spans the sign change)");
+assert_eq(ganita_f32_lerp(F_2, F_8, F_0), F_2, "lerp(a,b,0) = a");
+assert_eq(ganita_f32_lerp(F_2, F_8, F_1), F_8, "lerp(a,b,1) = b");
+
+test_group("f32: sqrt is correctly rounded, not approximated");
+assert_eq(ganita_f32_sqrt(F_4), F_2, "sqrt(4) = 2");
+assert_eq(ganita_f32_sqrt(F_0), F_0, "sqrt(0) = 0");
+assert_eq(ganita_f32_sqrt(t_f32(9)), F_3, "sqrt(9) = 3");
+# f64 carries 53 mantissa bits vs f32's 24 (> 2*24+2), so computing in double
+# and rounding once to single yields exactly the single-precision result —
+# double-rounding cannot bite. 0x3FB504F3 is sqrtf(2).
+assert_eq(ganita_f32_sqrt(F_2), 0x3FB504F3, "sqrt(2) = 0x3FB504F3, the correctly-rounded single");
+assert_eq(t_is_nan(ganita_f32_sqrt(F_M1)), 1, "sqrt(-1) is NaN");
+
+test_group("f32: transcendentals — exact identities");
+assert_eq(ganita_f32_exp(F_0), F_1, "exp(0) = 1");
+assert_eq(ganita_f32_ln(F_1), F_0, "ln(1) = 0");
+assert_eq(ganita_f32_log2(F_8), F_3, "log2(8) = 3");
+assert_eq(ganita_f32_exp2(F_3), F_8, "exp2(3) = 8");
+assert_eq(ganita_f32_sin(F_0), F_0, "sin(0) = 0");
+assert_eq(ganita_f32_cos(F_0), F_1, "cos(0) = 1");
+assert_eq(ganita_f32_atan(F_0), F_0, "atan(0) = 0");
+assert_eq(ganita_f32_pow(F_2, t_f32(10)), t_f32(1024), "pow(2,10) = 1024");
+assert_eq(ganita_f32_pow(F_2, F_0), F_1, "pow(x,0) = 1");
+assert_eq(ganita_f32_pow(t_f32(9), F_HALF), F_3, "pow(9,0.5) = 3");
+assert_eq(ganita_f32_hypot(F_3, F_4), F_5, "hypot(3,4) = 5");
+assert_eq(ganita_f32_hypot(F_0, F_0), F_0, "hypot(0,0) = 0");
+assert_eq(ganita_f32_atan2(F_0, F_1), F_0, "atan2(0,1) = 0");
+assert_eq(ganita_f32_atan2(F_1, F_0), 0x3FC90FDB, "atan2(1,0) = pi/2 (0x3FC90FDB)");
+assert_eq(t_is_nan(ganita_f32_ln(F_M1)), 1, "ln(-1) is NaN");
+assert_eq(ganita_f32_ln(F_0), F_NINF, "ln(0) = -inf");
+
+test_group("f32: round is half-to-EVEN, not half-away-from-zero");
+# Worth pinning explicitly: C's roundf(2.5) is 3.0. This lowers to the f64
+# rounding intrinsic, which is round-half-to-even, so 2.5 -> 2 and 3.5 -> 4.
+# A consumer porting from C will otherwise be quietly off by one on ties.
+assert_eq(ganita_f32_round(F_2H), F_2, "round(2.5) = 2 (half-to-even; C roundf gives 3)");
+assert_eq(ganita_f32_round(t_f32div(7, 2)), F_4, "round(3.5) = 4 (half-to-even)");
+assert_eq(ganita_f32_round(F_M2H), F_M2, "round(-2.5) = -2 (half-to-even)");
+assert_eq(ganita_f32_round(t_f32div(12, 5)), F_2, "round(2.4) = 2");
+assert_eq(ganita_f32_round(t_f32div(13, 5)), F_3, "round(2.6) = 3");
+
+test_group("f32: cbrt keeps the sign split (1.1.2 zero fix)");
+# The sign split is required, not decorative: cbrt goes through pow, pow is
+# exp(y*ln x), and ln of a negative is NaN — so a bare pow returns garbage for
+# every negative input while looking perfect on the positives a naive test uses.
+assert_eq(ganita_f32_cbrt(F_8), F_2, "cbrt(8) = 2");
+assert_eq(ganita_f32_cbrt(t_f32(0 - 8)), F_M2, "cbrt(-8) = -2 (bare pow would give NaN)");
+assert_eq(ganita_f32_cbrt(t_f32(27)), F_3, "cbrt(27) = 3");
+assert_eq(ganita_f32_cbrt(t_f32(0 - 27)), F_M3, "cbrt(-27) = -3");
+assert_eq(ganita_f32_cbrt(F_1), F_1, "cbrt(1) = 1");
+# 1.1.2: zero used to reach pow, and ln(0) = -inf made cbrt(0) NaN.
+assert_eq(ganita_f32_cbrt(F_0), F_0, "cbrt(0) = 0 (was NaN before 1.1.2)");
+assert_eq(ganita_f32_cbrt(F_NZ), F_NZ, "cbrt(-0) = -0, sign of zero preserved");
+
+test_group("f32: known domain gaps — SELF-EXPIRING, these fail when fixed");
+# pow is exp(y * ln base), so its domain excludes a zero or negative base.
+# Asserted as-is so the gap is visible and measured rather than merely known;
+# when ganita_f64_pow gains the special cases these assertions FAIL and this
+# group must be rewritten to the correct answers (0.0f and 4.0f).
+# Filed: docs/development/issues/2026-08-19-f64-pow-zero-and-negative-base.md
+assert_eq(t_is_nan(ganita_f32_pow(F_0, F_2)), 1,
+  "GAP: pow(0,2) is NaN, should be 0 — fails when ganita_f64_pow is fixed");
+assert_eq(t_is_nan(ganita_f32_pow(F_M2, F_2)), 1,
+  "GAP: pow(-2,2) is NaN, should be 4 — fails when ganita_f64_pow is fixed");
 
 test_group("back-compat aliases");
 var a2 = mat_new(4, 5);
