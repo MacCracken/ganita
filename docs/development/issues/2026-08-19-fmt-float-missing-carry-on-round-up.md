@@ -3,6 +3,10 @@
 **Filed by**: ganita (1.1.3 linalg test pass — every near-integer result printed
 wrong while being numerically correct)
 **Against**: cyrius stdlib `lib/fmt.cyr` — vendored, so ganita cannot fix it
+**Filed upstream**: ✅ `cyrius/docs/development/issues/2026-08-19-fmt-float-missing-carry-on-round-up.md`
+(with repro `repros/2026-08-19-fmt-float-carry.cyr` and a verified fix). That is the
+authoritative report — this file is ganita's consumer-side record; close it when the
+upstream one is resolved and ganita re-pins.
 **Date**: 2026-08-19
 **Version**: cyrius 6.5.28 (released tarball)
 **Severity**: Low — display only, no wrong computation. But it misreports values
@@ -47,10 +51,19 @@ fmt_float(f64_sub(f64_from(3), f64_div(f64_from(1), f64_from(10000000))), 6);
 
 ## Asked for
 
-After rounding the fractional part, detect `frac == 10^decimals`: reset it to
-zero and increment the integer part (propagating the sign correctly, so
-`-2.9999999` becomes `-3.000000`). The zero-padding path then emits the right
-number of digits on its own.
+Root-caused to `lib/fmt.cyr:255` `fmt_float_buf`: the integer part is emitted at
+line 281, *before* the fraction is computed at line 287, so a carry has nowhere
+to go. The zero-pad block cannot rescue it either — `pad = decimals - flen`
+goes negative when the fraction has one digit too many, so the padding branch is
+skipped and `1000000` is written verbatim.
+
+Fix (verified against the released 6.5.28 toolchain by running a patched copy
+side by side with the stock one): compute the fraction first, then
+`if (frac >= f64_to(scale)) { frac = 0; whole = whole + 1; }` before emitting
+the integer part. Every broken case is corrected, every already-correct case is
+byte-identical, and the non-finite path is untouched. `9.9999999 -> 10.000000`
+confirms the carry propagates through a change in integer digit count. Full
+detail and the before/after table are in the upstream filing.
 
 ## Note for consumers
 

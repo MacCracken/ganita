@@ -52,6 +52,15 @@ fn t_arr3(a, b, c): i64 {
 # where the exact pattern is itself the assertion (sqrt 2).
 fn t_f32(n): i64 { return f32_from(f64_from(n)); }
 fn t_f32div(a, b): i64 { return f32_from(f64_div(f64_from(a), f64_from(b))); }
+fn t_f64_is_nan(b): i64 {
+    if (((b >> 52) & 0x7FF) != 0x7FF) { return 0; }
+    if ((b & 0x000FFFFFFFFFFFFF) == 0) { return 0; }
+    return 1;
+}
+fn t_f64_is_pos_inf(b): i64 {
+    if (b == 0x7FF0000000000000) { return 1; }
+    return 0;
+}
 fn t_is_nan(b): i64 {
     var lo = b & 0xFFFFFFFF;
     if ((lo & 0x7F800000) != 0x7F800000) { return 0; }
@@ -263,16 +272,17 @@ assert_eq(ganita_f32_cbrt(F_1), F_1, "cbrt(1) = 1");
 assert_eq(ganita_f32_cbrt(F_0), F_0, "cbrt(0) = 0 (was NaN before 1.1.2)");
 assert_eq(ganita_f32_cbrt(F_NZ), F_NZ, "cbrt(-0) = -0, sign of zero preserved");
 
-test_group("f32: known domain gaps — SELF-EXPIRING, these fail when fixed");
-# pow is exp(y * ln base), so its domain excludes a zero or negative base.
-# Asserted as-is so the gap is visible and measured rather than merely known;
-# when ganita_f64_pow gains the special cases these assertions FAIL and this
-# group must be rewritten to the correct answers (0.0f and 4.0f).
-# Filed: docs/development/issues/2026-08-19-f64-pow-zero-and-negative-base.md
-assert_eq(t_is_nan(ganita_f32_pow(F_0, F_2)), 1,
-  "GAP: pow(0,2) is NaN, should be 0 — fails when ganita_f64_pow is fixed");
-assert_eq(t_is_nan(ganita_f32_pow(F_M2, F_2)), 1,
-  "GAP: pow(-2,2) is NaN, should be 4 — fails when ganita_f64_pow is fixed");
+test_group("f32: pow domain (gap closed in 1.1.4)");
+# These two were a SELF-EXPIRING pair asserting the old NaN behaviour, so that
+# the gap stayed measured rather than merely known. 1.1.4 fixed
+# ganita_f64_pow's domain, they failed as designed, and they are now the real
+# answers. f32 rounding absorbs the exp/ln core's ~2e-15 error, so these are
+# exact bit comparisons.
+assert_eq(ganita_f32_pow(F_0, F_2), F_0, "pow(0,2) = 0 (was NaN before 1.1.4)");
+assert_eq(ganita_f32_pow(F_M2, F_2), t_f32(4), "pow(-2,2) = 4 (was NaN before 1.1.4)");
+assert_eq(ganita_f32_pow(F_M2, F_3), t_f32(0 - 8), "pow(-2,3) = -8, sign from exponent parity");
+assert_eq(t_is_nan(ganita_f32_pow(F_M2, F_HALF)), 1,
+  "pow(-2,0.5) is still NaN — undefined in the reals, correctly left alone");
 
 # ========================================================================
 # linalg — decompositions and solvers (tests added 1.1.3)
@@ -524,6 +534,36 @@ assert_eq(t_dclose(ganita_mat_condition(SING), t_d(0 - 1)), 1,
   "condition of a singular matrix = -1 (documented sentinel)");
 # cond = sigma_max / sigma_min, and it is >= 1 for anything well-formed.
 assert_eq(f64_ge(ganita_mat_condition(A2), t_d(1)), 1, "condition >= 1 for a non-singular matrix");
+
+test_group("linalg/math: f64 pow domain (1.1.4)");
+# pow is exp(y * ln base); ln is undefined at and below zero, so every base <= 0
+# returned NaN before 1.1.4. pow(0,y) and integral pow(negative,y) are ordinary
+# defined operations and are now handled ahead of the exp/ln path.
+assert_eq(t_dclose(ganita_f64_pow(t_d(0), t_d(2)), t_d(0)), 1, "pow(0,2) = 0 (was NaN)");
+assert_eq(t_dclose(ganita_f64_pow(t_d(0), t_d(3)), t_d(0)), 1, "pow(0,3) = 0");
+assert_eq(t_dclose(ganita_f64_pow(t_d(0), f64_div(t_d(1), t_d(2))), t_d(0)), 1,
+  "pow(0,0.5) = 0 (a non-integral exponent on zero is still zero)");
+assert_eq(t_f64_is_pos_inf(ganita_f64_pow(t_d(0), t_d(0 - 2))), 1, "pow(0,-2) = +inf");
+assert_eq(t_dclose(ganita_f64_pow(t_d(0 - 2), t_d(2)), t_d(4)), 1, "pow(-2,2) = 4 (was NaN)");
+assert_eq(t_dclose(ganita_f64_pow(t_d(0 - 2), t_d(3)), t_d(0 - 8)), 1,
+  "pow(-2,3) = -8 (odd exponent keeps the sign)");
+assert_eq(t_dclose(ganita_f64_pow(t_d(0 - 2), t_d(10)), t_d(1024)), 1, "pow(-2,10) = 1024 (even exponent)");
+# The negative path is exactly -(positive path) — it adds no error of its own.
+assert_eq(ganita_f64_pow(t_d(0 - 2), t_d(3)), f64_neg(ganita_f64_pow(t_d(2), t_d(3))),
+  "pow(-x,odd) is bit-identical to -pow(x,odd)");
+# x^0 = 1 for every x, checked ahead of the zero and negative branches.
+assert_eq(t_dclose(ganita_f64_pow(t_d(0), t_d(0)), t_d(1)), 1, "pow(0,0) = 1");
+assert_eq(t_dclose(ganita_f64_pow(t_d(0 - 2), t_d(0)), t_d(1)), 1, "pow(-2,0) = 1");
+# A non-integral exponent on a negative base has no real result. NaN is correct
+# and must NOT be papered over.
+assert_eq(t_f64_is_nan(ganita_f64_pow(t_d(0 - 3), f64_div(t_d(1), t_d(2)))), 1,
+  "pow(-3,0.5) is NaN — no real square root of a negative");
+assert_eq(t_f64_is_nan(ganita_f64_pow(t_d(0 - 8), f64_div(t_d(1), t_d(3)))), 1,
+  "pow(-8,1/3) is NaN — which is why ganita_f32_cbrt keeps its sign split");
+# Regressions: the positive path is untouched.
+assert_eq(t_dclose(ganita_f64_pow(t_d(2), t_d(10)), t_d(1024)), 1, "pow(2,10) = 1024 unchanged");
+assert_eq(t_dclose(ganita_f64_pow(t_d(9), f64_div(t_d(1), t_d(2))), t_d(3)), 1, "pow(9,0.5) = 3 unchanged");
+assert_eq(t_dclose(ganita_f64_pow(t_d(2), t_d(0 - 2)), f64_div(t_d(1), t_d(4))), 1, "pow(2,-2) = 0.25 unchanged");
 
 test_group("back-compat aliases");
 var a2 = mat_new(4, 5);

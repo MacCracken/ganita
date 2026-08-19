@@ -4,6 +4,94 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.1.4] — 2026-08-19 — `f64_pow` domain
+
+### Changed (toolchain)
+
+- **Cyrius pin `6.5.28` → `6.5.29`**, with `cyrius lib sync --full` run against
+  it; `lib/` matches the snapshot exactly (108 files, 0 differ). 6.5.29 carries
+  the `distlib` profile-sidecar fix that made ganita's own artifacts
+  irreproducible on CI at 1.1.1 — ganita's single-bundle sidecar is unchanged by
+  it (`syscalls string alloc fmt vec str math`), since the defect only bit
+  `[lib.X]` profiles.
+
+  ⚠ **The 6.5.29 GitHub release is not published yet.** Both workflows install
+  by handing the pin to the upstream `scripts/install.sh`, which downloads
+  `cyrius-<pin>-x86_64-linux.tar.gz` — that asset currently 404s, so CI fails at
+  the install step until the release goes out. Everything below was verified
+  against the **locally installed** 6.5.29, not a release tarball; re-verify
+  once it ships, per the standing rule in `state.md`.
+
+### Fixed
+
+- **`ganita_f64_pow` returned NaN for a zero or negative base.** It was
+  `exp(y · ln base)` and nothing else, and that identity only holds for
+  `base > 0` — `ln(0)` is `-inf`, `ln(negative)` is NaN, and the NaN propagated
+  out silently. `pow(0, 2)` and `pow(-2, 3)` are ordinary defined operations;
+  both came back NaN with no diagnostic. Filed at 1.1.2, fixed here.
+
+  The domain is now handled ahead of the exp/ln path, following C's `pow`:
+
+  | call | before | after |
+  |---|---|---|
+  | `pow(0, 2)` / `pow(0, 3)` / `pow(0, 0.5)` | NaN | `0.0` |
+  | `pow(0, -2)` | NaN | `+inf` |
+  | `pow(0, 0)` | `1.0` ✅ | `1.0` |
+  | `pow(-2, 2)` | NaN | `4.0` |
+  | `pow(-2, 3)` | NaN | `-8.0` |
+  | `pow(-2, 10)` | NaN | `1024.0` |
+  | `pow(-3, 0.5)` | NaN | **NaN, deliberately** |
+  | `pow(2, 10)` / `pow(9, 0.5)` / `pow(2, -2)` | correct | unchanged |
+
+  **A non-integral exponent on a negative base stays NaN** — there is no real
+  result, so NaN is the right answer and is left alone rather than papered over.
+  That is also why `ganita_f32_cbrt` keeps its sign split: `cbrt` needs
+  `pow(x, 1/3)`, which remains out of domain for negative `x`.
+
+  Sign comes from the exponent's parity, computed on the magnitude, so
+  `pow(-x, odd)` is **bit-identical** to `-pow(x, odd)` — the negative path adds
+  no error of its own. Parity treats every `|y| >= 2^53` as even, which is not a
+  shortcut: at that magnitude consecutive f64 values are 2 apart, so no odd
+  integer is representable.
+
+  **Deliberately not done:** C distinguishes `pow(-0, odd) = -0` from
+  `pow(+0, odd) = +0`. cyrius's `f64_neg(f64_from(0))` yields `+0`, so a negative
+  zero cannot be produced or asserted against through the f64 helper surface —
+  a branch for it would have been untestable dead code. Zero of either sign
+  returns `+0`, and the reasoning is recorded at the call site.
+
+- **`ganita_f32_pow` inherits the fix**, being a widen-compute-narrow wrapper.
+  f32 rounding absorbs the exp/ln core's ~2e-15 error, so `f32_pow(-2, 3)` is
+  now exactly `-8.0f`.
+
+### Changed — tests
+
+The **self-expiring** `f32: known domain gaps` group added at 1.1.2 did exactly
+what it was for: it asserted the old NaN behaviour, failed the moment the gap
+closed, and has been rewritten to the real answers. 227 assertions (was 210),
+including a new f64-level `pow` domain group covering zero, negative, integral
+and non-integral exponents, `+inf`, `x^0`, the bit-identity of the negative
+path, and the positive-path regressions.
+
+**Mutation-verified**: deleting the zero-base branch fails 5 assertions,
+dropping the parity sign flip fails 3, and treating every negative-base exponent
+as integral fails 3 — the last being the check that a genuinely undefined
+operation is still reported as NaN.
+
+### Note for cyrius
+
+cyrius ships this defect under the plain stdlib name `f64_pow` (the `_compat`
+alias in the folded `lib/ganita.cyr:1538`), so a consumer who never heard of
+ganita hits it. cyrius's fold is at **1.1.1**; a refold picks up this fix plus
+1.1.2's `cbrt(±0)` guard and the 1.1.2/1.1.3 test suites. Upstream filing:
+`cyrius/docs/development/issues/2026-08-19-f64-pow-nan-for-zero-and-negative-base.md`.
+
+### Verified on 6.5.29 (local install — see the toolchain note above)
+
+All 15 CI gates green. `cyrius test` — **227 passed, 0 failed**. Build clean
+with zero warnings, smoke exits 42, fmt + lint clean, `distlib --all --check`
+current and idempotent, consumer-check clean, coverage 80%.
+
 ## [1.1.3] — 2026-08-19 — linalg gets a test suite
 
 `linalg.cyr` was the largest untested surface in the repo at **2/26** — every

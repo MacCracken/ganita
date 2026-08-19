@@ -6,6 +6,12 @@
 
 ## Version
 
+**1.1.4** — `ganita_f64_pow`'s domain. It was `exp(y·ln base)` and nothing
+else, so every base ≤ 0 returned NaN: `pow(0,2)` and `pow(-2,3)` are ordinary
+defined operations and both came back NaN silently. Zero, negative-with-integral
+-exponent, and `x^0` are now handled ahead of the exp/ln path; a non-integral
+exponent on a negative base stays NaN because that is correct. 227 assertions.
+
 **1.1.3** — `linalg.cyr` gets a test suite. It was the largest untested surface
 in the repo at **2/26** — every decomposition and solver shipped unverified —
 and is now **26/26** with 90 new assertions. Repo coverage 37% → **80%**.
@@ -36,13 +42,19 @@ initial carve out of cyrius stdlib (2026-06-10, cyrius v6.1.26).
 
 ## Toolchain
 
-- **Cyrius pin**: `6.5.28` (`cyrius.cyml [package].cyrius`). `cyrius version`
-  reports `manifest-pin: 6.5.28` with no drift line.
+- **Cyrius pin**: `6.5.29` (`cyrius.cyml [package].cyrius`, since 1.1.4).
+  `cyrius version` reports `manifest-pin: 6.5.29` with no drift line.
 - **`lib/` matches the pin exactly**: 108 files, 0 differ. Verify by comparing
   the trees, not by trusting `cyrius lib sync --full`'s exit code.
-- **`lib/` grew 98 → 108 files** at this pin: `unicode/` (7 files) plus the
-  macOS `async`/`thread` variants. None is in `[deps].stdlib`; they ride along
-  because `--full` vendors the whole snapshot.
+- ⛔ **6.5.29 is not published as a GitHub release yet.** CI hands the pin to
+  `scripts/install.sh`, which downloads
+  `cyrius-<pin>-x86_64-linux.tar.gz`; that asset 404s today, so **CI fails at
+  the install step until the release ships**. 1.1.4 was verified against the
+  locally installed 6.5.29. Re-verify against the tarball when it lands — a
+  local install and a release can differ, which is exactly what bit bayan 1.4.2.
+- **`lib/` grew 98 → 108 files** at 1.1.1's 6.5.28 bump: `unicode/` (7 files)
+  plus the macOS `async`/`thread` variants. None is in `[deps].stdlib`; they
+  ride along because `--full` vendors the whole snapshot.
 - ⚠ **Verify against the RELEASE TARBALL, not `~/.cyrius`.** A machine that also
   develops cyrius can hold an in-flight build reporting the same version string;
   artifacts generated with it are not reproducible on CI. Install the release
@@ -72,7 +84,7 @@ functions prefixed `ganita_`. Regenerated from the tree 2026-08-19:
 - `src/_compat.cyr` — 53 back-compat aliases (legacy names → `ganita_*`).
   Single-pass order: matrix → linalg → math_advanced → math_f32 → `_compat`
   last, since its aliases reference every `ganita_*` symbol.
-- `dist/ganita.cyr` — regenerated via `cyrius distlib` at 1.1.3 on released
+- `dist/ganita.cyr` — regenerated via `cyrius distlib` at 1.1.4 on released
   6.5.28. This is the artifact folded into
   `cyrius/lib/ganita.cyr`.
 - `dist/ganita.deps` — 7 stdlib leaves: `syscalls string alloc fmt vec str math`.
@@ -83,7 +95,7 @@ functions prefixed `ganita_`. Regenerated from the tree 2026-08-19:
 
 - `tests/ganita.tcyr` — matrix dims + identity + **CWE-190 dimension guard** +
   binomial/fibonacci + `f64_tanh` saturation + alias parity + **the full f32
-  tier** (1.1.2) + **the full linalg surface** (1.1.3). **210 assertions,
+  tier** (1.1.2) + **the full linalg surface** (1.1.3). **227 assertions,
   green** on released 6.5.28.
 
   The linalg block asserts **properties**, not transcribed outputs — `A·A⁻¹ = I`,
@@ -162,23 +174,17 @@ tree diff · consumer-check.
    the fuzz harness does no fuzzing, the bench measures a no-op. Both report
    PASS, so the two CI gates that run them are vacuous until the harnesses are
    real.
-2. **`ganita_f64_pow` is NaN for a zero or negative base** — `exp(y·ln base)`
-   is only valid for `base > 0`, so `pow(0,2)` and `pow(-2,2)` are NaN instead
-   of `0` and `4`, and `ganita_f32_pow` inherits it. Filed:
-   [2026-08-19](issues/2026-08-19-f64-pow-zero-and-negative-base.md). The test
-   suite pins the current behaviour in a **self-expiring** group that fails when
-   the issue is fixed.
-3. **`fmt_float` drops the carry when a fraction rounds up to 1.0** —
+2. **`fmt_float` drops the carry when a fraction rounds up to 1.0** —
    `fmt_float(2.9999999, 6)` prints `2.1000000` (seven fraction digits). Display
    only, but near-integer results are routine after a decomposition, so correct
    answers read as wrong ones. cyrius stdlib, vendored. Filed:
    [2026-08-19](issues/2026-08-19-fmt-float-missing-carry-on-round-up.md).
    ganita's tests assert numerically, never on printed text, so they are
    unaffected.
-4. **`math_advanced.cyr` is 4/13** — the remaining in-repo coverage gap now that
+3. **`math_advanced.cyr` is 4/13** — the remaining in-repo coverage gap now that
    the f32 and linalg tiers are done. Its deep coverage lives upstream in
    cyrius's `math` `.tcyr` suite.
-5. **`lib/ganita.cyr` is ganita's own fold vendored back into ganita's own
+4. **`lib/ganita.cyr` is ganita's own fold vendored back into ganita's own
    `lib/`** — new at this pin, because `lib sync --full` copies the whole
    snapshot and cyrius now carries the ganita fold. Nothing in `src/`,
    `tests/`, or `cyrius.cyml` includes it, so it is inert, but it defines the
@@ -186,7 +192,7 @@ tree diff · consumer-check.
    include it. Deleting it is not durable (`--full` re-adds it on every bump);
    the durable fix is upstream, a `lib sync` self-exclusion. bayan carries the
    identical gap.
-6. **`README.md` is stale** — still describes the pre-1.1.0 surface.
+5. **`README.md` is stale** — still describes the pre-1.1.0 surface.
 
 ## Dependencies
 
@@ -201,7 +207,9 @@ No sibling `[deps.NAME]` entries, so `cyrius deps` writes no `cyrius.lock`.
 
 - **cyrius** — folds `dist/ganita.cyr` → `lib/ganita.cyr`. The 6.5.28 snapshot
   carries ganita **1.1.0**; 1.1.1 (toolchain/CI), 1.1.2 (f32 tests + the
-  `cbrt(0)` fix) and 1.1.3 (linalg tests) are not folded yet.
+  `cbrt(0)` fix), 1.1.3 (linalg tests) and 1.1.4 (the `f64_pow` domain fix) are
+  not folded yet. **cyrius ships the `f64_pow` NaN defect under that plain name**
+  via the fold's `_compat` alias, so the refold is worth scheduling.
 - **ranga** (image-processing port) — drove the 1.1.0 f32 tier.
 - Downstream repos using matrix/linalg/advanced-math migrate to `ganita_*` on
   re-pin (aliases bridge the window).

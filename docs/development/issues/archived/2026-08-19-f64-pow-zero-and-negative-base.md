@@ -1,11 +1,25 @@
 # `ganita_f64_pow` returns NaN for a zero or negative base
 
+> ✅ **RESOLVED in ganita 1.1.4** (2026-08-19). The domain is handled ahead of
+> the exp/ln path; `pow(0,y)`, `pow(0,0)`, `pow(0,y<0)` and integral
+> `pow(negative,y)` all return their defined results, and a non-integral
+> exponent on a negative base still returns NaN because that is correct.
+> The self-expiring test group did its job — it failed on the fix and was
+> rewritten to the real answers. **cyrius still ships the defect** via the
+> ganita 1.1.1 fold in `lib/ganita.cyr`; it clears on the next refold.
+> Upstream filing: `cyrius/docs/development/issues/2026-08-19-f64-pow-nan-for-zero-and-negative-base.md`.
+
 **Filed by**: ganita (1.1.2 f32-tier test pass — the gap surfaced through
 `ganita_f32_pow` / `ganita_f32_cbrt`)
 **Date**: 2026-08-19
 **Version**: ganita 1.1.2 / cyrius 6.5.28
 **Severity**: Medium — silently wrong (NaN) for inputs a caller has every reason
 to expect to work. No crash, no diagnostic.
+**Filed upstream**: ✅ `cyrius/docs/development/issues/2026-08-19-f64-pow-nan-for-zero-and-negative-base.md`
+(with repro `repros/2026-08-19-f64-pow-domain.cyr`). It reaches cyrius through the
+folded `lib/ganita.cyr`, where `_compat` exposes it under the plain stdlib name
+`f64_pow` — so a cyrius consumer who never heard of ganita hits it too. **The fix
+belongs here, in ganita**; cyrius picks it up on the next fold.
 
 ## What happens
 

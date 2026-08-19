@@ -265,6 +265,17 @@ fn _fl_arena_alloc(bsize): i64 {
 # A harness or driver calls `fl_poison_enable()` explicitly instead.
 var _fl_poison = 0;
 
+# v6.5.29 — `CYRIUS_POISON=1` at COMPILE time turns the mode on for the whole program, which
+# is what `cyrius fuzz --poison` sets. Without it a harness has to call `fl_poison_enable()`
+# itself, and the filed gap is precisely that every consumer's existing harnesses do not.
+# ⚠ Spelled as a top-level initializer rather than `#ifdef` / `#else` around the declaration
+# because this parser has NO `#else` and NO `#ifndef` — a two-branch declaration cannot be
+# written here. A top-level `var` initialised by a call runs at startup in declaration order,
+# after `_fl_poison = 0` above and before any consumer statement that follows the include.
+#ifdef CYRIUS_POISON
+var _fl_poison_default_on = fl_poison_enable();
+#endif
+
 # Turn on poison fill. Call once from a fuzz harness before exercising the code under test.
 fn fl_poison_enable(): i64 { _fl_poison = 1; return 0; }
 # Turn it back off (so one harness cannot leak the mode into an unrelated benchmark).
@@ -275,6 +286,74 @@ fn fl_poison_active(): i64 { return _fl_poison; }
 # without hardcoding the constant. 0xA5 is deliberately not 0x00 and not 0xFF: both of those
 # occur naturally in real data, so either would produce false negatives.
 fn fl_poison_byte(): i64 { return 165; }
+
+# v6.5.29 — REDZONE + QUARANTINE. `.28` shipped the alloc-side FILL and deferred these two,
+# stating that a free-side poison "needs the block's original size, and the size-class path
+# stores only its class". ⛔ That reasoning was wrong and it is worth recording why, because
+# it deferred the more valuable half of the filing: the class DOES yield the block's capacity
+# (`_fl_block_size(cls) - 16`), and filling the WHOLE capacity on free is not merely possible,
+# it is strictly SAFER than filling the requested size — it cannot leave a live tail unpoisoned.
+# Quarantine needed no size at all.
+#
+# The redzone genuinely does need the requested size, and the class table has ZERO slack
+# (`_fl_class(16) = 0`, capacity exactly 16), so poison mode BUMPS THE CLASS: it classifies
+# `size + _FL_RZ` instead of `size`. That costs a class step per allocation in a fuzz-only
+# mode and buys a real detection window, with no header change and therefore no heap-layout
+# change and no two-step bootstrap.
+#
+# Poison-mode block layout (size-class and large paths alike):
+#     blk+0                    next / 0
+#     blk+8                    cls  / total
+#     blk+16                   [ user data — `size` bytes ]
+#     blk+16+size              [ redzone — poison, up to cap-8 ]   <- overflow detector
+#     blk+16+cap-8             [ the requested size, stored ]      <- read back at free
+# An overWRITE past `size` corrupts poison and `fl_free` reports it. An overREAD returns the
+# poison pattern instead of live heap, which is what the filed sit defect needed: the leaked
+# bytes become recognisable rather than plausible.
+var _FL_RZ = 32;
+
+# Count of redzone violations observed at free. A harness asserts this is 0.
+var _fl_poison_viol = 0;
+# How many redzone violations have been detected since the counter was last reset.
+fn fl_poison_violations(): i64 { return _fl_poison_viol; }
+# Reset the violation counter (so one harness cannot inherit another's tally).
+fn fl_poison_reset(): i64 { _fl_poison_viol = 0; return 0; }
+
+# Usable capacity of the block `ptr` belongs to, in bytes (payload only, header excluded).
+fn _fl_capacity(blk): i64 {
+    var cls = load64(blk + 8);
+    if (cls > 8) { return cls - 16; }
+    return _fl_block_size(cls) - 16;
+}
+
+# Verify the redzone of a poison-mode block. Returns the number of corrupted bytes found
+# (0 = intact). The stored size lives in the last 8 bytes of capacity; anything between the
+# end of the user data and that slot must still read as poison.
+fn _fl_redzone_check(blk): i64 {
+    var cap = _fl_capacity(blk);
+    if (cap < _FL_RZ) { return 0; }
+    var size = load64(blk + 16 + cap - 8);
+    if (size < 0) { return 0; }
+    if (size > cap - 8) { return 0; }
+    var bad = 0;
+    var i = blk + 16 + size;
+    var e = blk + 16 + cap - 8;
+    while (i < e) {
+        if (load8(i) != 165) { bad = bad + 1; }
+        i = i + 1;
+    }
+    return bad;
+}
+
+# Arm a freshly-handed-out poison-mode block: poison the tail and record the requested size.
+fn _fl_redzone_arm(blk, size): i64 {
+    var cap = _fl_capacity(blk);
+    if (cap < _FL_RZ) { return 0; }
+    if (size > cap - 8) { return 0; }
+    _fl_poison_fill(blk + 16 + size, cap - 8 - size);
+    store64(blk + 16 + cap - 8, size);
+    return 0;
+}
 
 # Fill `n` bytes at `p` with the poison pattern. 8-byte stores with a byte tail, same shape as
 # fl_calloc's zero loop — a byte loop here would reintroduce the 369x cost this release just
@@ -312,15 +391,23 @@ fn _fl_poison_fill(p, n): i64 {
 # calls. Forgetting the LOCK is the bug this closes; forgetting the GATE is a
 # deadlock.
 fn fl_alloc(size): i64 {
-    var cls = _fl_class(size);
+    # v6.5.29 — in poison mode classify `size + _FL_RZ` so the block has room for a redzone
+    # and the stored size. The class table has zero slack, so without this bump a request that
+    # exactly fills its class has nowhere to put a guard band. Fuzz-only cost.
+    var csize = size;
+    if (_fl_poison == 1) { csize = size + _FL_RZ; }
+    var cls = _fl_class(csize);
     if (cls < 0) {
         # Large allocation: mmap directly. Touches NO shared allocator state — its
         # own fresh mapping, its own header — so it stays OUTSIDE the lock.
-        var total = size + 16;
+        var total = csize + 16;
         var blk = _fl_mmap(total);
         store64(blk, 0);
         store64(blk + 8, total);
-        if (_fl_poison == 1) { _fl_poison_fill(blk + 16, size); }
+        if (_fl_poison == 1) {
+            _fl_poison_fill(blk + 16, total - 16);
+            _fl_redzone_arm(blk, size);
+        }
         return blk + 16;
     }
     if (_threads_active != 0) { _fl_lock_acquire(); }
@@ -334,7 +421,10 @@ fn fl_alloc(size): i64 {
         if (_threads_active != 0) { _fl_lock_release(); }
         # Poison AFTER the lock is dropped — the block is exclusively ours by now, and
         # filling inside the critical section would lengthen it for a fuzz-only mode.
-        if (_fl_poison == 1) { _fl_poison_fill(head + 16, size); }
+        if (_fl_poison == 1) {
+            _fl_poison_fill(head + 16, _fl_capacity(head));
+            _fl_redzone_arm(head, size);
+        }
         return head + 16;
     }
     # No free block — allocate from arena (R4 + R5, both inside the lock).
@@ -350,7 +440,10 @@ fn fl_alloc(size): i64 {
     # header is written outside the lock — shorter critical section, same result.
     store64(blk, 0);
     store64(blk + 8, cls);
-    if (_fl_poison == 1) { _fl_poison_fill(blk + 16, size); }
+    if (_fl_poison == 1) {
+        _fl_poison_fill(blk + 16, _fl_capacity(blk));
+        _fl_redzone_arm(blk, size);
+    }
     return blk + 16;
 }
 
@@ -358,6 +451,14 @@ fn fl_alloc(size): i64 {
 fn fl_free(ptr): i64 {
     if (ptr == 0) { return 0; }
     var blk = ptr - 16;
+    # v6.5.29 — redzone check BEFORE anything else touches the block, and quarantine after.
+    # The check turns a silent heap overWRITE into a counted, reportable event; the quarantine
+    # makes a use-after-free read the poison pattern instead of the block's old contents.
+    # Both are free-side, so neither costs anything when poison mode is off.
+    if (_fl_poison == 1) {
+        var bad = _fl_redzone_check(blk);
+        if (bad > 0) { _fl_poison_viol = _fl_poison_viol + 1; }
+    }
     var cls = load64(blk + 8);
     if (cls > 8) {
         # Large allocation: munmap. No shared state — outside the lock, like its
@@ -365,6 +466,11 @@ fn fl_free(ptr): i64 {
         syscall(SYS_MUNMAP, blk, cls);
         return 0;
     }
+    # QUARANTINE (v6.5.29) — poison the whole capacity before the block re-enters the free
+    # list, so a use-after-free reads the pattern rather than its own stale contents. Only the
+    # RECYCLED path needs this: the large path above munmaps, where a UAF already faults.
+    # Done before the lock is taken — the block is not reachable by anyone until it is pushed.
+    if (_fl_poison == 1) { _fl_poison_fill(blk + 16, _fl_capacity(blk)); }
     # R3 — the push. Unlocked, this loses pushes outright, and once R2 has issued
     # one block twice it links `blk->next = blk` and the list eats itself.
     if (_threads_active != 0) { _fl_lock_acquire(); }
