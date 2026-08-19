@@ -7,7 +7,14 @@ on:
 permissions:
   contents: write
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
+  # Every gate in CI runs before anything is published — build, smoke, tests,
+  # fuzz, bench, lint, format, coverage floor, lib/-vs-pin, and the three
+  # distribution checks.
   ci:
     name: CI Gate
     uses: ./.github/workflows/ci.yml
@@ -19,31 +26,41 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify version
+      # CI already proved VERSION agrees with the manifest, the CHANGELOG, and
+      # every dist header. The one thing it cannot know is the tag — that is
+      # this job's job.
+      - name: Tag matches VERSION and has a CHANGELOG entry
         run: |
-          FILE_VERSION=$(cat VERSION | tr -d '[:space:]')
+          set -euo pipefail
+          FILE_VERSION=$(tr -d '[:space:]' < VERSION)
           TAG_VERSION="${GITHUB_REF_NAME}"
-          test "$FILE_VERSION" = "$TAG_VERSION" || { echo "VERSION ($FILE_VERSION) != tag ($TAG_VERSION)"; exit 1; }
+          test "$FILE_VERSION" = "$TAG_VERSION" || {
+            echo "::error::VERSION ($FILE_VERSION) != tag ($TAG_VERSION)"; exit 1; }
+          grep -q "^## \[$TAG_VERSION\]" CHANGELOG.md || {
+            echo "::error::CHANGELOG.md has no '## [$TAG_VERSION]' entry"; exit 1; }
+          echo "releasing $TAG_VERSION"
 
       - name: Install Cyrius toolchain
         run: |
-          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep 'cyrius *= *"' cyrius.cyml 2>/dev/null | head -1 | sed 's/.*"\(.*\)"/\1/')}"
+          # pipefail matters here: without it only `sh`'s status counts, so a
+          # failed download pipes empty input to sh, sh exits 0, and the install
+          # silently no-ops until some later step fails for the wrong reason.
+          set -eo pipefail
+          CYRIUS_VERSION="$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')"
+          test -n "$CYRIUS_VERSION" || { echo "::error::no [package].cyrius pin found in cyrius.cyml"; exit 1; }
           echo "Installing Cyrius $CYRIUS_VERSION"
-          curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
-          mkdir -p "$HOME/.cyrius/bin" "$HOME/.cyrius/lib"
-          cp "$CYRIUS_DIR/bin/"* "$HOME/.cyrius/bin/" 2>/dev/null || true
-          cp -r "$CYRIUS_DIR/lib/"* "$HOME/.cyrius/lib/" 2>/dev/null || true
-          chmod +x "$HOME/.cyrius/bin/"* 2>/dev/null || true
-          echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
-          echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
+          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+            CYRIUS_VERSION="$CYRIUS_VERSION" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
+          echo "CYRIUS_HOME=$HOME/.cyrius" >> "$GITHUB_ENV"
+          echo "CYRIUS_VERSION=$CYRIUS_VERSION" >> "$GITHUB_ENV"
 
       - name: Build
         run: |
+          set -euo pipefail
           cyrius deps
           mkdir -p build
-          cyrius build src/main.cyr build/${{ github.event.repository.name }}
+          cyrius build src/main.cyr "build/${{ github.event.repository.name }}"
 
       - name: Create release
         uses: softprops/action-gh-release@v2

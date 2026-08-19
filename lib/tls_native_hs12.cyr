@@ -187,7 +187,7 @@ fn tls_native_12_master_secret(cipher, pre_master, pm_len, client_random, server
     memcpy(&seed,                     client_random, TLS12_RANDOM_LEN);
     memcpy(&seed + TLS12_RANDOM_LEN,  server_random, TLS12_RANDOM_LEN);
     return tls_native_12_prf(cipher, pre_master, pm_len, "master secret", 13,
-    &seed, 64, out48, TLS12_MASTER_SECRET_LEN);
+      &seed, 64, out48, TLS12_MASTER_SECRET_LEN);
 }
 
 # Extended Master Secret variant (RFC 7627 §4): when EMS is negotiated,
@@ -199,7 +199,7 @@ fn tls_native_12_master_secret(cipher, pre_master, pm_len, client_random, server
 # class of attacks. See CHANGELOG [6.0.77].
 fn tls_native_12_master_secret_ems(cipher, pre_master, pm_len, session_hash, sh_len, out48): i64 {
     return tls_native_12_prf(cipher, pre_master, pm_len, "extended master secret", 22,
-    session_hash, sh_len, out48, TLS12_MASTER_SECRET_LEN);
+      session_hash, sh_len, out48, TLS12_MASTER_SECRET_LEN);
 }
 
 # key_block = PRF(master_secret, "key expansion",
@@ -211,7 +211,7 @@ fn tls_native_12_key_block(cipher, master48, client_random, server_random, out, 
     memcpy(&seed,                     server_random, TLS12_RANDOM_LEN);
     memcpy(&seed + TLS12_RANDOM_LEN,  client_random, TLS12_RANDOM_LEN);
     return tls_native_12_prf(cipher, master48, TLS12_MASTER_SECRET_LEN, "key expansion", 13,
-    &seed, 64, out, out_len);
+      &seed, 64, out, out_len);
 }
 
 # Bytes of key_block an AEAD suite needs: 2*key_len + 2*iv_len (no MAC
@@ -248,7 +248,7 @@ fn tls_native_12_partition_keys(cipher, key_block, cw_key, sw_key, cw_iv, sw_iv)
 # transcript. Writes 12 bytes to `out12`.
 fn tls_native_12_verify_data(cipher, master48, label, label_len, handshake_hash, hh_len, out12): i64 {
     return tls_native_12_prf(cipher, master48, TLS12_MASTER_SECRET_LEN,
-    label, label_len, handshake_hash, hh_len, out12, TLS12_VERIFY_DATA_LEN);
+      label, label_len, handshake_hash, hh_len, out12, TLS12_VERIFY_DATA_LEN);
 }
 
 # ================================================================
@@ -914,7 +914,7 @@ fn tls_native_12_build_finished(ctx, label, out, out_max): i64 {
     if (hh_len < 0) { return TLS_ERR_INTERNAL; }
     tls_native_handshake_write_header(out, TLS_HS_FINISHED, TLS12_VERIFY_DATA_LEN);
     if (tls_native_12_verify_data(identity, master, label, 15, hh, hh_len,
-    out + TLS_HANDSHAKE_HEADER_LEN) != TLS_OK) {
+        out + TLS_HANDSHAKE_HEADER_LEN) != TLS_OK) {
         return TLS_ERR_INTERNAL;
     }
     var total = TLS_HANDSHAKE_HEADER_LEN + TLS12_VERIFY_DATA_LEN;
@@ -974,7 +974,7 @@ fn tls_native_12_seal(ctx, ct, plain, plain_len, out, out_max): i64 {
     }
     if (key == 0) { return TLS_ERR_PROTOCOL; }
     return tls_native_record_seal_12(load64(ctx + TLS_CTX_OFF_CIPHER), key, iv,
-    ctx + seqoff, ct, plain, plain_len, out, out_max);
+      ctx + seqoff, ct, plain, plain_len, out, out_max);
 }
 
 # Open a peer 1.2 AEAD record with the PEER's write key, returning the
@@ -991,7 +991,7 @@ fn tls_native_12_open(ctx, record, record_len, out, out_max, out_ct): i64 {
     }
     if (key == 0) { return TLS_ERR_PROTOCOL; }
     return tls_native_record_open_12(load64(ctx + TLS_CTX_OFF_CIPHER), key, iv,
-    ctx + seqoff, record, record_len, out, out_max, out_ct);
+      ctx + seqoff, record, record_len, out, out_max, out_ct);
 }
 
 # ----------------------------------------------------------------
@@ -1458,8 +1458,8 @@ fn tls_native_server_seal_handshake(ctx, inner, inner_len, out, out_max): i64 {
     var iv = load64(ctx + TLS_CTX_OFF_SRV_HS_IV);
     if (key == 0) { return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL); }
     return tls_native_record_seal(load64(ctx + TLS_CTX_OFF_CIPHER), key, iv,
-    ctx + TLS_CTX_OFF_SRV_SEQ, TLS_CT_HANDSHAKE,
-    inner, inner_len, out, out_max);
+      ctx + TLS_CTX_OFF_SRV_SEQ, TLS_CT_HANDSHAKE,
+      inner, inner_len, out, out_max);
 }
 
 # Open a protected record from the client using the installed client
@@ -1470,8 +1470,8 @@ fn tls_native_server_open_handshake(ctx, record, record_len, out, out_max, out_c
     var iv = load64(ctx + TLS_CTX_OFF_CLI_HS_IV);
     if (key == 0) { return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL); }
     return tls_native_record_open(load64(ctx + TLS_CTX_OFF_CIPHER), key, iv,
-    ctx + TLS_CTX_OFF_CLI_SEQ, record, record_len,
-    out, out_max, out_ct);
+      ctx + TLS_CTX_OFF_CLI_SEQ, record, record_len,
+      out, out_max, out_ct);
 }
 
 # Set the ALPN protocol list. `protos` is a series of length-prefixed

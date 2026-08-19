@@ -9,12 +9,142 @@
 # / sys_geteuid in lib/syscalls.cyr) — only `is_root` is provided here since it
 # carries per-target euid-vs-uid logic.
 #
-# Linux + AGNOS are the real targets. uname/sysinfo are Linux-specific syscalls;
-# macOS (sysctl) / Windows (GetVersionEx / GlobalMemoryStatusEx) are not yet
-# wired, so they return -ENOSYS rather than mis-issuing a Linux number.
-# Requires: lib/syscalls.cyr. See CHANGELOG [6.1.28].
+# Linux + AGNOS issue the real uname/sysinfo syscalls. macOS has NEITHER, so
+# v6.5.16 synthesises both from sysctl(2) — see the sysctl section below; the
+# buffers handed back are the same Linux-shaped ones, so every accessor in this
+# file works unchanged there. Windows (GetVersionEx / GlobalMemoryStatusEx) is
+# still unwired and returns -ENOSYS rather than mis-issuing a Linux number.
+# Requires: lib/syscalls.cyr. See CHANGELOG [6.1.28], [6.5.16].
 
 include "lib/syscalls.cyr"
+
+# ================================================================
+# macOS: sysctl(2) plumbing  (v6.5.16)
+# ================================================================
+# Darwin has no uname(2) and no sysinfo(2). Both are synthesised from sysctl(2),
+# reached from cyrius source through the private alias SYS_SYSCTL (1202 → BSD
+# 202; see the alias-band comment in lib/syscalls_aarch64_linux.cyr) plus
+# SYS_GETTIMEOFDAY (1116 → BSD 116) for the wall clock that uptime needs.
+#
+# lib/ has no precedent for #ifdef-ing an entire `fn` away, so these stay defined
+# on every target and guard their BODIES instead — the same shape sys_uname
+# already uses. That is load-bearing, not cosmetic: SYS_SYSCTL exists only in the
+# two macOS peers, so the syscall line has to be REMOVED by the preprocessor on
+# Linux/AGNOS/Windows rather than merely left unreached.
+
+#ifdef CYRIUS_TARGET_MACOS
+# sysctl MIB selectors (<sys/sysctl.h>). Re-read from the SDK header AND
+# live-probed on both Mach-O hosts — ecb (arm64, Darwin 25.6.0) and ach (x86_64,
+# Darwin 22.6.0) returned identical MIBs, so the namespace does not vary by arch
+# even though the two targets are separate backends.
+enum SysctlMib {
+    CTL_UNSPEC = 0; CTL_KERN = 1; CTL_VM = 2; CTL_HW = 6;
+    KERN_OSTYPE = 1; KERN_OSRELEASE = 2; KERN_VERSION = 4;
+    KERN_HOSTNAME = 10; KERN_BOOTTIME = 21;
+    HW_MACHINE = 1; HW_PAGESIZE = 7; HW_MEMSIZE = 24;
+    CTL_NAME2OID = 3;      # {CTL_UNSPEC, 3} — resolve "a.b.c" to a numeric oid
+}
+#endif
+
+# Byte length of a NUL-terminated string, excluding the NUL. Hand-rolled: this
+# file is self-sufficient off ONE include (lib/syscalls.cyr) and must not grow a
+# dependency on lib/string.cyr just to measure a sysctl node name.
+fn _sys_cstr_len(s): i64 {
+    var n = 0;
+    while (load8(s + n) != 0) { n = n + 1; }
+    return n;
+}
+
+# Raw sysctl(2). `mib` is an array of 32-BIT ints and `miblen` its ELEMENT count
+# (not a byte count); `oldlenp` is IN/OUT — capacity in, actual byte length out.
+# Returns 0 / -errno: Darwin signals failure with the carry flag and a POSITIVE
+# errno, which both Mach-O backends already normalise to the Linux shape
+# (aarch64 `csneg x0,x0,x0,cc`, x86 `jnc +3; neg rax`), so `r < 0` is the correct
+# test on both. Live-probed on ecb and ach: bogus mib → -2 (ENOENT), undersized
+# buffer → -12 (ENOMEM).
+fn _sysctl_raw(mib, miblen, oldp, oldlenp, newp, newlen): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return syscall(SYS_SYSCTL, mib, miblen, oldp, oldlenp, newp, newlen);
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return 0 - 38;   # ENOSYS — sysctl is a Darwin-only path
+    #endif
+}
+
+# sysctl a two-element MIB {a, b}. The pair is built with store32 so the element
+# width stays explicit — MIB entries are 32-bit ints, not i64 slots.
+fn _sysctl_two(a, b, oldp, oldlenp): i64 {
+    var mib[8];            # two 32-bit ints
+    var m = &mib;
+    store32(m, a);
+    store32(m + 4, b);
+    return _sysctl_raw(m, 2, oldp, oldlenp, 0, 0);
+}
+
+# Read a fixed-width integer node into the caller's i64 slot. `width` is the
+# exact byte count the node publishes (8 for hw.memsize, 4 for hw.pagesize) and
+# cannot be guessed — Darwin rejects an integer node read at the wrong size with
+# -ERANGE. The staging slot starts at 0 so a 4-byte node zero-extends cleanly.
+fn _sysctl_int(a, b, width, out): i64 {
+    var v = 0;
+    var len = width;
+    var r = _sysctl_two(a, b, &v, &len);
+    if (r < 0) { return r; }
+    store64(out, v);
+    return 0;
+}
+
+# Copy a string node into one 65-byte utsname field, truncating to 64 chars + NUL.
+# ⚠ A short `oldlenp` does NOT truncate — Darwin FAILS the call with -ENOMEM and
+# writes NOTHING. Measured on both hosts: kern.version is 104 bytes on ecb / 103
+# on ach, and reading it with oldlenp = 65 returned -12 with the destination left
+# byte-for-byte untouched (the 0xAA fill survived intact). So every field lands in
+# a scratch buffer first and is copied in. Note `outlen` INCLUDES the NUL
+# ("Darwin" → 7), which is why the copy needs no separate terminator hunt.
+fn _uts_field(a, b, dst, scratch, cap): i64 {
+    var len = cap;
+    var r = _sysctl_two(a, b, scratch, &len);
+    if (r < 0) { return r; }
+    var n = len;
+    if (n > 64) { n = 64; }
+    var i = 0;
+    while (i < n) {
+        store8(dst + i, load8(scratch + i));
+        i = i + 1;
+    }
+    store8(dst + n, 0);    # n <= 64, so this stays inside the 65-byte field
+    return 0;
+}
+
+# Wall clock into a 16-byte struct timeval (tv_sec i64 @ +0, tv_usec i32 @ +8
+# with 4 bytes of tail pad — byte layout measured identically on ecb and ach).
+# clock_gettime is deliberately NOT used here: syscall(228) is unrouted on
+# x86-macOS (lib/chrono.cyr:27, "that arch is HELD"), so it would work on ecb and
+# be silently dead on ach — the exact "fixed one fork, not the other" shape.
+#
+# ⚠⚠ THE THIRD ARGUMENT IS NOT OPTIONAL AND MUST BE AN EXPLICIT NULL.
+# Darwin's gettimeofday syscall is
+#     gettimeofday(struct timeval *tp, struct timezone *tzp, uint64_t *mach_abs)
+# — the third parameter is an OUT-pointer the kernel writes mach_absolute_time
+# through. Passing only two args leaves the third ARG REGISTER (x2 / rdx) holding
+# whatever the previous code left there, and the kernel then writes 8 bytes to
+# that address. It is a silent, rc=0, arbitrary-address memory corruption.
+# This bit exactly once during development: `syscall(SYS_GETTIMEOFDAY, tv, 0)`
+# left x2 pointing at sys_sysinfo's OWN kern.boottime buffer, so the kernel
+# overwrote boottime's tv_sec (its tv_usec survived, which is what made the
+# corruption look like a plausible-but-wrong timestamp rather than garbage) and
+# uptime came out negative. Proven on hardware on BOTH targets by pointing the
+# third arg at a sentinel: ecb wrote 0x3AFC14FB55 (÷24 MHz timebase = 10523 s =
+# the box's uptime), ach wrote 0x35568623C86E1 ns (= 938 ks, likewise its
+# uptime); with the third arg 0, the sentinel was untouched on both.
+fn _macos_gettimeofday(tv): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return syscall(SYS_GETTIMEOFDAY, tv, 0, 0);
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return 0 - 38;   # ENOSYS — Darwin-only path
+    #endif
+}
 
 # ================================================================
 # uname (utsname)
@@ -41,7 +171,26 @@ fn sys_uname(out): i64 {
     return syscall(SYS_UNAME, out);
     #endif
     #ifdef CYRIUS_TARGET_MACOS
-    return 0 - 38;   # ENOSYS — macOS uname is sysctl-based (not yet wired)
+    # Darwin has no uname(2) — synthesise the Linux-shaped 390-byte utsname from
+    # five sysctl string nodes so uname_hostname/_release/_machine keep working.
+    # Zero first: the 6th field (domainname, +325) has no sysctl source and no
+    # named offset, and the caller's buffer is uninitialised stack — leaving it
+    # as garbage would hand back an unterminated field.
+    var z = 0;
+    while (z < UTS_SIZE) { store8(out + z, 0); z = z + 1; }
+    var scratch[384];   # kern.version measured 104 B (ecb) / 103 B (ach); headroom to grow
+    var sp = &scratch;
+    var r = _uts_field(CTL_KERN, KERN_OSTYPE, out + UTS_SYSNAME, sp, 384);
+    if (r < 0) { return r; }
+    r = _uts_field(CTL_KERN, KERN_HOSTNAME, out + UTS_NODENAME, sp, 384);
+    if (r < 0) { return r; }
+    r = _uts_field(CTL_KERN, KERN_OSRELEASE, out + UTS_RELEASE, sp, 384);
+    if (r < 0) { return r; }
+    r = _uts_field(CTL_KERN, KERN_VERSION, out + UTS_VERSION, sp, 384);
+    if (r < 0) { return r; }
+    r = _uts_field(CTL_HW, HW_MACHINE, out + UTS_MACHINE, sp, 384);
+    if (r < 0) { return r; }
+    return 0;
     #endif
     #ifdef CYRIUS_TARGET_WIN
     return 0 - 38;   # ENOSYS — Windows has no uname (GetVersionEx)
@@ -81,7 +230,73 @@ fn sys_sysinfo(out): i64 {
     return syscall(SYS_SYSINFO, out);
     #endif
     #ifdef CYRIUS_TARGET_MACOS
-    return 0 - 38;   # ENOSYS — macOS uses sysctl(hw.memsize / kern.boottime)
+    # Darwin has no sysinfo(2) — synthesise the Linux-shaped struct:
+    #   uptime   = gettimeofday().tv_sec - kern.boottime.tv_sec
+    #   totalram = hw.memsize
+    #   freeram  = vm.page_free_count * hw.pagesize   (see the note below)
+    # Zero FIRST: the caller's buffer is uninitialised stack and BOTH memory
+    # accessors read mem_unit (+104). Garbage there turns a correct totalram into
+    # a saturated 0x7FFF… via the overflow guard; 0 means "identity scale", so
+    # every field written below is a raw BYTE count. procs (+80) stays 0 — Darwin
+    # has no counter node for it (it needs a KERN_PROC table walk), and 0 is
+    # honest where a made-up figure would not be.
+    var z = 0;
+    while (z < SYSINFO_SIZE) { store8(out + z, 0); z = z + 1; }
+
+    # Uptime. kern.boottime is a struct timeval; only tv_sec (i64 @ +0) is used —
+    # tv_usec is a 32-bit field with tail padding, so load64 past it is not safe
+    # to interpret, and second resolution is all sysinfo carries anyway.
+    var bt[32];
+    var btp = &bt;
+    var btlen = 16;
+    var r = _sysctl_two(CTL_KERN, KERN_BOOTTIME, btp, &btlen);
+    if (r < 0) { return r; }
+    var tv[32];
+    var tvp = &tv;
+    r = _macos_gettimeofday(tvp);
+    if (r < 0) { return r; }
+    store64(out + SI_UPTIME, load64(tvp) - load64(btp));
+
+    # Total RAM. hw.memsize is the ONLY correct source: hw.physmem {6,5} is a
+    # 32-bit node that CLAMPS at 2 GiB (measured 2147483648 on ach's 16 GiB host).
+    var total = 0;
+    r = _sysctl_int(CTL_HW, HW_MEMSIZE, 8, &total);
+    if (r < 0) { return r; }
+    store64(out + SI_TOTALRAM, total);
+
+    # Free RAM. Darwin publishes NO fixed MIB for it: vm.page_free_count is an
+    # OID_AUTO node whose numeric oid is assigned in kernel-registration order at
+    # build time and measurably differs by kernel — {2,292} on ecb (Darwin 25.6.0)
+    # vs {2,259} on ach (Darwin 22.6.0). Hardcoding either is worse than useless:
+    # cross-tested on both hosts, the wrong oid returns rc=0 with value 0 — no
+    # carry, no errno, nothing a caller could check — so a fabricated number would
+    # sail through the `free >= 0` assertion green on both. Resolve the name at
+    # runtime through {CTL_UNSPEC, 3} (name2oid) instead; that reuses the single
+    # SYS_SYSCTL alias rather than adding a second one, and was verified live on
+    # both hosts. (Mach host_statistics64 also reports this, but it is a Mach trap,
+    # not a BSD syscall, so it is unreachable from the `syscall` builtin.)
+    # If either step fails, freeram stays 0 — honest for "not reported"; we do not
+    # invent a figure.
+    var oid[64];
+    var oidp = &oid;
+    var oidlen = 64;
+    var qmib[8];
+    var qp = &qmib;
+    store32(qp, CTL_UNSPEC);
+    store32(qp + 4, CTL_NAME2OID);
+    var nm = "vm.page_free_count";
+    var rq = _sysctl_raw(qp, 2, oidp, &oidlen, nm, _sys_cstr_len(nm));
+    if (rq == 0) {
+        var pages = 0;
+        var plen = 4;
+        var rp = _sysctl_raw(oidp, oidlen / 4, &pages, &plen, 0, 0);
+        var psz = 0;
+        var rs = _sysctl_int(CTL_HW, HW_PAGESIZE, 4, &psz);
+        if (rp == 0) {
+            if (rs == 0) { store64(out + SI_FREERAM, pages * psz); }
+        }
+    }
+    return 0;
     #endif
     #ifdef CYRIUS_TARGET_WIN
     return 0 - 38;   # ENOSYS — Windows uses GlobalMemoryStatusEx / GetTickCount64
@@ -188,7 +403,10 @@ fn sys_gettid(): i64 {
 # Root check
 # ================================================================
 # Linux: effective uid == 0. AGNOS: uid == 0 (no separate euid concept —
-# capability gates, not euid perms). macOS/Windows: stubbed false.
+# capability gates, not euid perms). Windows: stubbed false (no getuid;
+# identity is OpenProcessToken). macOS: REAL as of v6.5.16 — computes
+# sys_geteuid() == 0 (was hardcoded 0, which made the whole credential
+# family untestable — see issues/archived/2026-08-09-getuid-geteuid-*).
 fn is_root(): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     if (sys_getuid() == 0) { return 1; }
@@ -199,6 +417,14 @@ fn is_root(): i64 {
     return 0;
     #endif
     #ifdef CYRIUS_TARGET_MACOS
+    # v6.5.16: was a hardcoded `return 0`. Darwin is a real POSIX system with a real
+    # euid, so there was never a reason to stub it — and the stub was actively harmful:
+    # it was the ONLY consumer of sys_geteuid on macOS, so short-circuiting it meant the
+    # wrapper was never called, and the fact that sys_geteuid was UNROUTED on both
+    # Mach-O backends (SIGSYS on Intel-Mac, -9 on Apple Silicon) stayed invisible while
+    # the test in the area passed vacuously. Both routes landed this release; this arm is
+    # now identical to the Linux one. See tests/tcyr/crossos/uid_identity.tcyr.
+    if (sys_geteuid() == 0) { return 1; }
     return 0;
     #endif
     #ifdef CYRIUS_TARGET_WIN

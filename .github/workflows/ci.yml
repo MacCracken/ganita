@@ -11,6 +11,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build-and-test:
     name: Build & Test
@@ -18,32 +22,176 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The `[package].cyrius` pin is the single source of truth — no version is
+      # hardcoded in this YAML. Hand it to the UPSTREAM INSTALLER rather than
+      # untarring by hand: the installer lays out
+      # ~/.cyrius/versions/<v>/{bin,lib} and symlinks ~/.cyrius/{bin,lib} at it.
+      # `cyrius deps` requires versions/<v>/lib specifically and errors with
+      # "pins version <v> but it is not installed" if only ~/.cyrius/lib exists,
+      # which is exactly what the previous hand-rolled tar step produced.
       - name: Install Cyrius toolchain
         run: |
-          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep 'cyrius *= *"' cyrius.cyml 2>/dev/null | head -1 | sed 's/.*"\(.*\)"/\1/')}"
+          # pipefail matters here: without it only `sh`'s status counts, so a
+          # failed download pipes empty input to sh, sh exits 0, and the install
+          # silently no-ops until some later step fails for the wrong reason.
+          set -eo pipefail
+          CYRIUS_VERSION="$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')"
+          test -n "$CYRIUS_VERSION" || { echo "::error::no [package].cyrius pin found in cyrius.cyml"; exit 1; }
           echo "Installing Cyrius $CYRIUS_VERSION"
-          curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
-          mkdir -p "$HOME/.cyrius/bin" "$HOME/.cyrius/lib"
-          cp "$CYRIUS_DIR/bin/"* "$HOME/.cyrius/bin/" 2>/dev/null || true
-          cp -r "$CYRIUS_DIR/lib/"* "$HOME/.cyrius/lib/" 2>/dev/null || true
-          chmod +x "$HOME/.cyrius/bin/"* 2>/dev/null || true
-          echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
-          echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
+          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+            CYRIUS_VERSION="$CYRIUS_VERSION" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
+          echo "CYRIUS_HOME=$HOME/.cyrius" >> "$GITHUB_ENV"
+          echo "CYRIUS_VERSION=$CYRIUS_VERSION" >> "$GITHUB_ENV"
+
+      # `cyrius version` prints `manifest-pin: X` — and appends
+      # `(drift — wrapper is Y)` when the installed compiler is not the pin.
+      # Drift makes every gate below a measurement of the wrong toolchain.
+      - name: Toolchain pin resolves with no drift
+        run: |
+          set -euo pipefail
+          cyrius version
+          cyrius version | grep -qx "manifest-pin: ${CYRIUS_VERSION}" || {
+            echo "::error::cyrius does not report a clean manifest-pin of ${CYRIUS_VERSION}"; exit 1; }
+
+      # VERSION is the source of truth; everything that restates it must agree.
+      # release.yml separately checks VERSION == git tag.
+      - name: Version is consistent across VERSION / manifest / CHANGELOG / dist
+        run: |
+          set -euo pipefail
+          V=$(tr -d '[:space:]' < VERSION)
+          echo "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::VERSION '$V' is not semver"; exit 1; }
+          P=$(cyrius version --project | tr -d '[:space:]')
+          test "$P" = "$V" || { echo "::error::cyrius version --project ($P) != VERSION ($V)"; exit 1; }
+          grep -q "^## \[$V\]" CHANGELOG.md || { echo "::error::CHANGELOG.md has no '## [$V]' entry"; exit 1; }
+          for f in dist/*.cyr; do
+            H=$(sed -n 's/^# Version: //p' "$f" | head -1)
+            test "$H" = "$V" || {
+              echo "::error file=$f::dist header says '$H', VERSION says '$V' — run 'cyrius distlib --all'"; exit 1; }
+          done
+          echo "version $V consistent across manifest, CHANGELOG, and all $(ls dist/*.cyr | wc -l) bundle(s)"
 
       - name: Resolve dependencies
         run: cyrius deps
 
-      - name: Build
+      # ganita vendors the WHOLE pinned snapshot into lib/. Verify by comparing
+      # the trees — a green `cyrius lib sync --full` is not by itself proof.
+      - name: Vendored lib/ matches the pinned snapshot exactly
         run: |
-          mkdir -p build
-          cyrius build src/main.cyr build/${{ github.event.repository.name }}
+          set -euo pipefail
+          SNAP="$HOME/.cyrius/versions/${CYRIUS_VERSION}/lib"
+          test -d "$SNAP" || { echo "::error::no stdlib snapshot at $SNAP"; exit 1; }
+          if ! diff -rq lib "$SNAP" > /tmp/lib-drift.txt 2>&1; then
+            echo "::error::lib/ does not match the ${CYRIUS_VERSION} snapshot — run 'cyrius lib sync --full' and commit"
+            cat /tmp/lib-drift.txt
+            exit 1
+          fi
+          echo "lib/ matches ${CYRIUS_VERSION} exactly ($(find lib -type f | wc -l) files, 0 differ)"
 
+      # Per-file loop, deliberately NOT `cyrius fmt src/*.cyr --check`: cyrfmt
+      # reads only argv[1] and silently ignores the rest, so the glob form only
+      # ever checks the first entry and exits 0.
+      - name: Format
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in src/*.cyr tests/*.tcyr tests/*.bcyr tests/*.fcyr; do
+            [ -e "$f" ] || continue
+            if ! out=$(cyrius fmt "$f" --check 2>&1); then
+              echo "::error file=$f::not canonically formatted — run 'cyrius fmt $f'"
+              echo "$out"
+              fail=1
+            fi
+          done
+          test "$fail" -eq 0 || exit 1
+          echo "format clean"
+
+      # `cyrius lint` always exits 0, so gate on what it reports, not on $?.
+      - name: Lint — zero warnings, zero untracked deferrals
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in src/*.cyr; do
+            out=$(cyrius lint "$f" 2>&1)
+            w=$(printf '%s\n' "$out" | sed -n 's/^\([0-9]\+\) warnings$/\1/p' | tail -1)
+            d=$(printf '%s\n' "$out" | sed -n 's/^\([0-9]\+\) untracked deferrals$/\1/p' | tail -1)
+            if [ "${w:-0}" -ne 0 ] || [ "${d:-0}" -ne 0 ]; then
+              echo "::error file=$f::${w:-0} lint warning(s), ${d:-0} untracked deferral(s)"
+              printf '%s\n' "$out" | grep -E '^[[:space:]]+(warn|deferral) ' || true
+              fail=1
+            fi
+          done
+          test "$fail" -eq 0 || exit 1
+          echo "lint clean across $(ls src/*.cyr | wc -l) files"
+
+      - name: Include-dependency audit
+        run: |
+          set -euo pipefail
+          out=$(cyrius vet src/main.cyr 2>&1); printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '[0-9]+ deps, 0 untrusted, 0 missing' || {
+            echo "::error::cyrius vet reported untrusted or missing include deps"; exit 1; }
+
+      # `cyrius build` exits non-zero on error but only WARNS on the diagnostics
+      # that matter most here (bad pointer typing, lib/ shadowing, pin drift),
+      # and --strict does not promote them — so the warning text is the gate.
+      - name: Build — zero compiler warnings
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          out=$(cyrius build src/main.cyr "build/${{ github.event.repository.name }}" 2>&1)
+          printf '%s\n' "$out"
+          if printf '%s\n' "$out" | grep -q '^warning:'; then
+            echo "::error::build emitted compiler warnings"
+            printf '%s\n' "$out" | grep '^warning:'
+            exit 1
+          fi
+
+      - name: Smoke — full-bundle entry exits 42
+        run: |
+          set +e; "./build/${{ github.event.repository.name }}"; rc=$?; set -e
+          test "$rc" -eq 42 || { echo "::error::smoke exited $rc, expected 42"; exit 1; }
+          echo "smoke ok (exit 42)"
+
+      # v5.6.28: bare `cyrius test` picks up the [build].test entry AND
+      # auto-discovers tests/*.tcyr. It exits 1 on a failed assert.
       - name: Test
-        # v5.6.28: bare `cyrius test` picks up the [build].test entry
-        # AND auto-discovers tests/*.tcyr — avoids the previous
-        # `cyrius test src/test.cyr` form that hard-failed when the
-        # stub didn't exist (Issue 1) and also wouldn't ever exercise
-        # tests/${proj}.tcyr.
-        run: cyrius test
+        run: |
+          set -euo pipefail
+          if ! out=$(cyrius test 2>&1); then printf '%s\n' "$out"; echo "::error::tests failed"; exit 1; fi
+          printf '%s\n' "$out"
+          if printf '%s\n' "$out" | grep -q '^warning:'; then
+            echo "::error::test build emitted compiler warnings"; exit 1
+          fi
+
+      - name: Fuzz
+        run: cyrius fuzz
+
+      - name: Bench harness compiles and runs
+        run: cyrius bench
+
+      # A floor that ratchets, not a target. Raise it whenever real coverage
+      # lands; never lower it to make a red build green.
+      - name: Reference coverage floor
+        run: cyrius coverage --min 16
+
+      # --- Distribution: ganita's actual product is dist/, not build/ ---------
+
+      - name: Distribution — bundle is regenerable from src/
+        run: cyrius distlib --all --check
+
+      - name: Distribution — regenerating leaves no tree diff
+        run: |
+          set -euo pipefail
+          cyrius distlib --all
+          if ! git diff --exit-code -- dist/; then
+            echo "::error::dist/ differs after regeneration — run 'cyrius distlib --all' and commit"
+            exit 1
+          fi
+          echo "committed dist/ is byte-identical to a fresh regeneration"
+
+      # The other half of the contract: --check proves the bundle comes from
+      # src/, this proves a downstream repo can actually consume it from the
+      # leaves its .deps sidecar declares. See the script header for why it
+      # must build with --no-deps.
+      - name: Distribution — bundle compiles as a downstream consumer
+        run: ./scripts/consumer-check.sh "${RUNNER_TEMP}/consumer-check"

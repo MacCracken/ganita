@@ -756,13 +756,13 @@ fn dynlib_open(path): i64 {
             var map_msz = (msz + page_adj + 4095) & (0 - 4096);
             # Map file-backed portion
             cyr_mmap(bias + page_va, map_fsz, map_prot,
-            MAP_PRIVATE | MAP_FIXED, fd, page_off);
+              MAP_PRIVATE | MAP_FIXED, fd, page_off);
             # BSS: if memsz > filesz, map anonymous pages for the rest
             if (map_msz > map_fsz) {
                 cyr_mmap(bias + page_va + map_fsz,
-                map_msz - map_fsz, map_prot,
-                MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS,
-                0 - 1, 0);
+                  map_msz - map_fsz, map_prot,
+                  MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS,
+                  0 - 1, 0);
             }
             # Zero partial BSS within the last file-backed page
             if (msz > fsz) {

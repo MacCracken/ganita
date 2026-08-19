@@ -39,8 +39,17 @@ include "lib/async_agnos.cyr"
 include "lib/async_win.cyr"
 #endif
 
+# v6.5.27: macOS (Darwin) has no epoll either — its readiness API is kqueue, which cyrius has
+# no wrappers for. Before this guard macOS fell into the epoll body below and carried an
+# undefined `sys_epoll_wait`; route it to a serial/blocking peer, the same per-target split as
+# agnos and win. See lib/async_macos.cyr for why a fallback rather than a kqueue reactor.
+#ifdef CYRIUS_TARGET_MACOS
+include "lib/async_macos.cyr"
+#endif
+
 #ifndef CYRIUS_TARGET_AGNOS
 #ifndef CYRIUS_TARGET_WIN
+#ifndef CYRIUS_TARGET_MACOS
 
 # Task states
 var TASK_READY = 0;
@@ -57,7 +66,20 @@ var TASK_DONE = 2;
 # no fd. _async_retire closes it — without this a timed-out/retired connect or resolve
 # leaks its socket every time (CHANGELOG [6.4.42]). recv/send park on a CALLER-owned
 # fd so they leave owned_fd = -1; process cleanup is handled by async_run_process.
-var TASK_SIZE = 56;
+#
+# wait_ev (@56, v6.5.26) = the epoll event mask this task is parked on (EPOLLIN 1 /
+# EPOLLOUT 4 / their union), 0 when not fd-waiting. It exists because ONE waiter per fd
+# was a hard limit before: `_async_wait_events` put the TASK POINTER in epoll_data, so an
+# fd had room for exactly one task, and its EPOLL_CTL_ADD return was UNCHECKED — a second
+# waiter on the same fd got -EEXIST and was SILENTLY LOST (parked, never woken). epoll_data
+# now carries the FD and the wake path walks the task list, so an fd can have many waiters;
+# this mask is what keeps a read-waiter from being woken by EPOLLOUT and vice versa.
+#
+# ⭐ THIS IS WHAT BLOCKED stiva's `exec -it`. "Two independent directions inside one task"
+# and select!-style waiting over N streams were filed as needing stackless coroutines /
+# a CPS transform (2026-07-25). They did not: they needed a waiter REGISTRY that can hold
+# more than one entry per fd. The park/resume runtime already worked.
+var TASK_SIZE = 64;
 
 # Runtime struct: { epfd, tasks, task_count, active, allocator, current } = 48 bytes.
 # v6.1.22 — +allocator slot @32: async_new_in threads a caller-owned Allocator
@@ -112,6 +134,7 @@ fn async_spawn(rt, fp, arg): i64 {
     store64(t + 32, 0 - 1);          # wait_fd: not fd-waiting (F1)
     store64(t + 40, 0);              # result: task fn's return, captured on done (F2)
     store64(t + 48, 0 - 1);          # owned_fd: no task-owned fd to reclaim on retire (v6.4.42)
+    store64(t + 56, 0);              # wait_ev: not parked on any event mask (v6.5.26)
     store64(rt + 8, t);
     store64(rt + 16, load64(rt + 16) + 1);
     store64(rt + 24, load64(rt + 24) + 1);
@@ -149,22 +172,63 @@ fn _async_step(rt): i64 {
         if (ran == 0) {
             # every live task is parked on an fd; block on the shared epfd, then wake
             # the task whose fd fired.
-            var evbuf[16];
-            var nr = sys_epoll_wait(epfd, &evbuf, 1, 0 - 1);
-            if (nr > 0) {
+            # v6.5.26 — room for 8 ready fds per wait, not 1. maxevents was 1, so even with
+            # several fds ready the reactor woke one task per syscall; with multiple waiters
+            # that is a needless round trip per direction.
+            var evbuf[128];
+            var nr = sys_epoll_wait(epfd, &evbuf, 8, 0 - 1);
+            var ei = 0;
+            while (ei < nr) {
+                var eoff = ei * 16;
+                var fired = load32(&evbuf + eoff);
                 # epoll_event.data offset is ABI-dependent: x86_64 has EPOLL_PACKED
                 # (data @4); aarch64 leaves the struct unpacked so the u64 aligns to @8.
                 # Must match the write in _async_wait_events. (CHANGELOG [6.4.42])
                 #ifdef CYRIUS_ARCH_AARCH64
-                var wtask = load64(&evbuf + 8);
+                var wfd = load64(&evbuf + eoff + 8);
                 #endif
                 #ifndef CYRIUS_ARCH_AARCH64
-                var wtask = load64(&evbuf + 4);
+                var wfd = load64(&evbuf + eoff + 4);
                 #endif
-                var wfd = load64(wtask + 32);
-                syscall(SYS_EPOLL_CTL, epfd, 2, wfd, 0);   # EPOLL_CTL_DEL
-                store64(wtask + 32, 0 - 1);
-                store64(wtask + 16, TASK_READY);
+                # v6.5.26 — data is the FD, so resolve it to EVERY parked task waiting on
+                # it whose mask intersects what actually fired. Previously data was a single
+                # task pointer and exactly one task could ever be woken per fd.
+                # ⚠ EPOLLERR (8) and EPOLLHUP (16) are reported WITHOUT being requested, and
+                # a peer that closes mid-relay delivers HUP only — so they must wake every
+                # waiter on the fd, or a closed TTY/socket parks its readers forever.
+                var wake_all = 0;
+                if (fired & 24 != 0) { wake_all = 1; }
+                var t2 = load64(rt + 8);
+                while (t2 != 0) {
+                    if (load64(t2 + 16) == TASK_WAITING) {
+                        if (load64(t2 + 32) == wfd) {
+                            if (wake_all == 1 || (load64(t2 + 56) & fired) != 0) {
+                                store64(t2 + 32, 0 - 1);
+                                store64(t2 + 56, 0);
+                                store64(t2 + 16, TASK_READY);
+                            }
+                        }
+                    }
+                    t2 = load64(t2 + 24);
+                }
+                # Re-register the REMAINDER. Unconditionally DELeting the fd (what the old
+                # single-waiter path did) would drop the registration for waiters still
+                # parked on the other direction. DEL only when nobody is left.
+                var rem = _async_fd_mask(rt, wfd);
+                if (rem == 0) {
+                    syscall(SYS_EPOLL_CTL, epfd, 2, wfd, 0);   # EPOLL_CTL_DEL
+                } else {
+                    var rev[16];
+                    store32(&rev, rem);
+                    #ifdef CYRIUS_ARCH_AARCH64
+                    store64(&rev + 8, wfd);
+                    #endif
+                    #ifndef CYRIUS_ARCH_AARCH64
+                    store64(&rev + 4, wfd);
+                    #endif
+                    syscall(SYS_EPOLL_CTL, epfd, 3, wfd, &rev);   # EPOLL_CTL_MOD
+                }
+                ei = ei + 1;
             }
         }
     }
@@ -251,24 +315,63 @@ fn async_select(rt, handles, n): i64 {
 # top when woken. Returns -1 if called outside async_run (no current task).
 # v6.4.33 (F1) — the rt-integrated reactor path; async_await_readable stays the
 # standalone one-shot blocking helper (used by sandhi on the idle listen fd).
+# Union of the event masks every PARKED task is waiting on for `fd`. The registry IS the
+# task list — no separate waiter table, no allocation — which is why an fd can now hold
+# any number of waiters. Used to compute the mask to register with epoll, and again after
+# a wake to decide between EPOLL_CTL_MOD (waiters remain) and EPOLL_CTL_DEL (none do).
+fn _async_fd_mask(rt, fd): i64 {
+    var m = 0;
+    var t = load64(rt + 8);
+    while (t != 0) {
+        if (load64(t + 16) == TASK_WAITING) {
+            if (load64(t + 32) == fd) { m = m | load64(t + 56); }
+        }
+        t = load64(t + 24);
+    }
+    return m;
+}
+
 fn _async_wait_events(rt, fd, events): i64 {
     var cur = load64(rt + 40);
     if (cur == 0) { return 0 - 1; }
     var epfd = load64(rt);
+    # Park FIRST so this task is counted by _async_fd_mask below — the mask we register
+    # must include the waiter we are adding, not just the ones already there.
+    store64(cur + 32, fd);           # remember fd (wake match + EPOLL_CTL_DEL)
+    store64(cur + 56, events);       # remember the mask this task waits on (v6.5.26)
+    store64(cur + 16, TASK_WAITING); # park
+    var mask = _async_fd_mask(rt, fd);
     var ev[16];
-    store32(&ev, events);            # EPOLLIN (1) / EPOLLOUT (4)
-    # epoll_data = task ptr. Offset is ABI-dependent: x86_64 packs the struct
-    # (EPOLL_PACKED → data @4); aarch64 leaves it unpacked so the u64 aligns to @8.
-    # The wake read in _async_step must use the same offset. (CHANGELOG [6.4.42])
+    store32(&ev, mask);              # EPOLLIN (1) / EPOLLOUT (4) / union
+    # v6.5.26 — epoll_data now carries the FD, not the task pointer. With a task pointer
+    # an fd could identify exactly ONE waiter, which is the whole reason two concurrent
+    # directions on one fd (or two tasks on one listener) were inexpressible. The fd is
+    # the stable key; _async_step resolves it back to every matching parked task.
+    # Offset is ABI-dependent: x86_64 packs the struct (EPOLL_PACKED → data @4); aarch64
+    # leaves it unpacked so the u64 aligns to @8. The wake read in _async_step must use
+    # the same offset. (CHANGELOG [6.4.42])
     #ifdef CYRIUS_ARCH_AARCH64
-    store64(&ev + 8, cur);
+    store64(&ev + 8, fd);
     #endif
     #ifndef CYRIUS_ARCH_AARCH64
-    store64(&ev + 4, cur);
+    store64(&ev + 4, fd);
     #endif
-    syscall(SYS_EPOLL_CTL, epfd, 1, fd, &ev);   # EPOLL_CTL_ADD
-    store64(cur + 32, fd);           # remember fd for EPOLL_CTL_DEL on wake
-    store64(cur + 16, TASK_WAITING); # park
+    # ⛔ CHECK THE RETURN. EPOLL_CTL_ADD on an fd already in the set returns -EEXIST, and
+    # ignoring that is exactly how the second waiter used to be lost: it parked, its fd was
+    # never (re)registered with its event bit, and nothing ever woke it. On -EEXIST the fd
+    # is already there, so MOD it to the UNION mask instead (op 3 = EPOLL_CTL_MOD).
+    var rc = syscall(SYS_EPOLL_CTL, epfd, 1, fd, &ev);
+    if (rc < 0) {
+        rc = syscall(SYS_EPOLL_CTL, epfd, 3, fd, &ev);
+        if (rc < 0) {
+            # Neither ADD nor MOD took: un-park rather than sleep forever on an fd the
+            # reactor is not watching. A caller that sees -1 can fall back to blocking I/O.
+            store64(cur + 16, TASK_READY);
+            store64(cur + 32, 0 - 1);
+            store64(cur + 56, 0);
+            return 0 - 1;
+        }
+    }
     return 0;
 }
 # Cooperatively wait for `fd` to become READABLE (EPOLLIN) from inside a running task —
@@ -282,6 +385,36 @@ fn async_wait_fd(rt, fd): i64 {
 # writable, and a socket send that hit EAGAIN resumes here. v6.4.38.
 fn async_wait_writable(rt, fd): i64 {
     return _async_wait_events(rt, fd, 4);       # EPOLLOUT — wait for writable
+}
+
+# v6.5.26 — park until `fd` is readable OR writable, whichever comes first (EPOLLIN|EPOLLOUT).
+# Impossible before the waiter-list rework: registering both directions meant two waiters on
+# one fd, and the second was silently dropped by an unchecked EPOLL_CTL_ADD -EEXIST.
+# The woken task must test which direction is actually ready (attempt the read, then the
+# write, handling EAGAIN) — epoll is level-triggered here, so a spurious attempt is cheap and
+# a missed one re-arms on the next park.
+fn async_wait_rw(rt, fd): i64 {
+    return _async_wait_events(rt, fd, 5);       # EPOLLIN | EPOLLOUT
+}
+
+# v6.5.26 — one direction of a byte relay, as a reusable primitive rather than a state
+# machine every consumer re-writes. Parks until `rfd` is readable, reads once into `buf`,
+# writes what it read to `wfd`, and returns the byte count (0 = clean EOF, -1 = error or
+# not inside async_run). Poll-structured: a caller spawns TWO of these with the directions
+# reversed and both live in ONE runtime, which is exactly the shape
+# `docker exec -it`-style TTY relaying needs and the shape that had no expression before —
+# the two directions are independent tasks parked on different fds, and now on the SAME fd
+# too if the consumer wants a single duplex handle.
+#
+# ⚠ Short writes are the caller's business: this returns what it WROTE, so a caller relaying
+# a stream should compare against the read count and re-drive. Kept deliberately minimal
+# (one read, one write, no internal loop) because owning a loop is what made the previous
+# poll-loop workarounds unable to interleave two directions.
+fn async_relay_once(rt, rfd, wfd, buf, len): i64 {
+    if (async_wait_fd(rt, rfd) < 0) { return 0 - 1; }
+    var n = sys_read(rfd, buf, len);
+    if (n <= 0) { return n; }
+    return sys_write(wfd, buf, n);
 }
 
 # Record `fd` as owned by the CURRENT task, so _async_retire closes it if the task is
@@ -804,8 +937,18 @@ fn async_read(fd, buf, len): i64 {
     return n;
 }
 
-# Wait for fd to be readable using epoll (blocks efficiently)
-fn async_await_readable(fd): i64 {
+# Wait for fd to be readable, or until `ms` milliseconds elapse. Returns 1 if fd
+# became readable, 0 if the wait ended without it. A negative `ms` blocks forever.
+#
+# Prefer this over async_await_readable whenever the wait must be interruptible: a
+# cooperative server parked on an infinite wait cannot observe a stop flag set by
+# another thread, because control never leaves the epoll call. Bounding the wait is
+# what lets the caller re-check between waits.
+#
+# A signal-interrupted wait (EINTR) reports 0, the same as a timeout — the caller's
+# loop re-checks its own condition and waits again, which is the correct response to
+# both. CHANGELOG [6.5.6]
+fn async_await_readable_ms(fd, ms): i64 {
     var epfd = syscall(SYS_EPOLL_CREATE1, 0);
     # epoll_event: { events: u32, data: u64 } = 12 bytes (padded to 16)
     var ev[16];
@@ -820,8 +963,18 @@ fn async_await_readable(fd): i64 {
     #endif
     syscall(SYS_EPOLL_CTL, epfd, 1, fd, &ev);
     var revents[16];
-    sys_epoll_wait(epfd, &revents, 1, 0 - 1);
+    var n = sys_epoll_wait(epfd, &revents, 1, ms);
     syscall(SYS_CLOSE, epfd);
+    if (n > 0) { return 1; }
+    return 0;
+}
+
+# Wait for fd to be readable using epoll (blocks efficiently, without limit).
+# Always returns 0, discarding whether the fd is actually ready — that contract is
+# preserved for existing callers. Use async_await_readable_ms for a bounded wait
+# that reports which of the two happened.
+fn async_await_readable(fd): i64 {
+    async_await_readable_ms(fd, 0 - 1);
     return 0;
 }
 
@@ -870,6 +1023,7 @@ fn async_timeout(fp, arg, ms): i64 {
     return 0 - 1;
 }
 
+#endif
 #endif
 #endif
 
@@ -1001,14 +1155,14 @@ fn future_force(fut): i64 {
     if (argc == 3) { return fncall3(fp, load64(fut + 16), load64(fut + 24), load64(fut + 32)); }
     if (argc == 4) {
         return fncall4(fp, load64(fut + 16), load64(fut + 24), load64(fut + 32),
-        load64(fut + 40));
+          load64(fut + 40));
     }
     if (argc == 5) {
         return fncall5(fp, load64(fut + 16), load64(fut + 24), load64(fut + 32),
-        load64(fut + 40), load64(fut + 48));
+          load64(fut + 40), load64(fut + 48));
     }
     return fncall6(fp, load64(fut + 16), load64(fut + 24), load64(fut + 32),
-    load64(fut + 40), load64(fut + 48), load64(fut + 56));
+      load64(fut + 40), load64(fut + 48), load64(fut + 56));
 }
 
 # Spawn a Future onto an async runtime so async_run forces it cooperatively. The

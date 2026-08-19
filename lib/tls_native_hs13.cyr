@@ -202,8 +202,8 @@ fn tls_native_client_open_handshake(ctx, record, record_len, out, out_max, out_c
     var iv = load64(ctx + TLS_CTX_OFF_SRV_HS_IV);
     if (key == 0) { return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL); }
     return tls_native_record_open(load64(ctx + TLS_CTX_OFF_CIPHER), key, iv,
-    ctx + TLS_CTX_OFF_SRV_SEQ, record, record_len,
-    out, out_max, out_ct);
+      ctx + TLS_CTX_OFF_SRV_SEQ, record, record_len,
+      out, out_max, out_ct);
 }
 
 # Client: receive + process the server's encrypted flight (.26):
@@ -495,8 +495,8 @@ fn tls_native_client_seal_handshake(ctx, inner, inner_len, out, out_max): i64 {
     var iv = load64(ctx + TLS_CTX_OFF_CLI_HS_IV);
     if (key == 0) { return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL); }
     return tls_native_record_seal(load64(ctx + TLS_CTX_OFF_CIPHER), key, iv,
-    ctx + TLS_CTX_OFF_CLI_SEQ, TLS_CT_HANDSHAKE,
-    inner, inner_len, out, out_max);
+      ctx + TLS_CTX_OFF_CLI_SEQ, TLS_CT_HANDSHAKE,
+      inner, inner_len, out, out_max);
 }
 
 # Client: complete the handshake (.27). Verifies the server's Finished
@@ -694,7 +694,7 @@ fn _tn_seal_ct(ctx, ct, buf, len, out, out_max): i64 {
     }
     if (key == 0) { return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL); }
     return tls_native_record_seal(load64(ctx + TLS_CTX_OFF_CIPHER), key, iv,
-    ctx + seqoff, ct, buf, len, out, out_max);
+      ctx + seqoff, ct, buf, len, out, out_max);
 }
 
 # AEAD-seal `len` bytes of application data from `buf` into one protected
@@ -740,7 +740,7 @@ fn _tn_open_record(ctx, record, record_len, out, out_max, out_inner_ct): i64 {
     if (key == 0) { return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL); }
     var oct = 0;
     var n = tls_native_record_open(load64(ctx + TLS_CTX_OFF_CIPHER), key, iv,
-    ctx + seqoff, record, record_len, out, out_max, &oct);
+      ctx + seqoff, record, record_len, out, out_max, &oct);
     if (n < 0) { return n; }
     if (out_inner_ct != 0) { store64(out_inner_ct, oct); }
     if (oct == TLS_CT_ALERT) {
@@ -887,7 +887,7 @@ fn _tn_handle_post_handshake(ctx, msg, msg_len): i64 {
 fn tls_native_key_update_secret(sec, sec_len, hash_algo, out): i64 {
     var hlen = _tn_hash_len(hash_algo);
     return tls_native_hkdf_expand_label(sec, sec_len, "traffic upd", 11,
-    0, 0, hash_algo, out, hlen);
+      0, 0, hash_algo, out, hlen);
 }
 
 # Create a server-side context with the given certificate chain
@@ -2077,7 +2077,7 @@ fn tls_native_record_seal(cipher, key, static_iv, seq8, inner_ct, inner, inner_l
     var ct_out = out + TLS_RECORD_HEADER_LEN;
     var tag_out = ct_out + inner_len + 1;
     var er = tls_native_aead_encrypt(cipher, key, &nonce, out, TLS_RECORD_HEADER_LEN,
-    pt, inner_len + 1, ct_out, tag_out);
+      pt, inner_len + 1, ct_out, tag_out);
     if (er != TLS_OK) { return er; }
     tls_native_seq_increment(seq8);
     return total;
@@ -2106,7 +2106,7 @@ fn tls_native_record_open(cipher, key, static_iv, seq8, record, record_len, out,
     var cipher_in = record + TLS_RECORD_HEADER_LEN;
     var tag_in = cipher_in + inner_ct_len;
     var dr = tls_native_aead_decrypt(cipher, key, &nonce, record, TLS_RECORD_HEADER_LEN,
-    cipher_in, inner_ct_len, tag_in, out);
+      cipher_in, inner_ct_len, tag_in, out);
     if (dr != TLS_OK) { return dr; }
     # Scan back over zero padding; the last non-zero byte is the type.
     var idx = inner_ct_len - 1;

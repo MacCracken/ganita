@@ -4,6 +4,117 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.1.1] — 2026-08-19
+
+Toolchain + CI release. No behavioural change — the only `src/` edits are
+whitespace and one comment. What changed is that the project now *checks*
+considerably more of itself.
+
+### Changed (toolchain)
+
+- **Cyrius pin `6.5.23` → `6.5.28`**, with `cyrius lib sync --full` run against
+  it. `lib/` matches the pinned snapshot **exactly — 0 of 108 files differ**,
+  confirmed by comparing the trees rather than trusting the sync's exit code.
+  `lib/` had been left in a half-bumped state: seventeen `[deps].stdlib`
+  modules already carried 6.5.28 content (from a `cyrius deps` run) while the
+  pin still said `6.5.23`. The full sync completes it.
+- **`lib/` grew 98 → 108 files** — the 6.5.28 snapshot adds `unicode/` (7 files)
+  plus the macOS `async`/`thread` variants. None is in `[deps].stdlib`; they
+  ride along because `--full` vendors the whole snapshot.
+
+### Fixed
+
+- **`src/linalg.cyr` and `tests/ganita.tcyr` are canonically formatted.**
+  Continuation lines sat at column 0; `cyrius fmt` indents them to 2.
+  Whitespace only — still 25 assertions, still green. It had gone unnoticed
+  because there was no format gate.
+- **Lint is clean across all `src/` files.** `linalg.cyr:9` carried an untracked
+  deferral: the header prose "Complete pivoting is out of scope" reads to the
+  scanner as a deferral marker, when it is a permanent design boundary rather
+  than deferred work. Reworded to "deliberately excluded" — no `#skip-lint`
+  needed, and the sentence says what it means.
+
+### Added — CI now confirms the whole project
+
+`.github/workflows/ci.yml` went from 4 steps (install / deps / build / test) to
+a full gate: toolchain-pin drift · version consistency across
+`VERSION` / manifest / CHANGELOG / dist header · `lib/`-vs-snapshot tree diff ·
+format (`src/` **and** `tests/`) · lint (0 warnings, 0 untracked deferrals) ·
+`cyrius vet` · build with **zero compiler warnings** · smoke exits 42 · test ·
+fuzz · bench · `cyrius coverage --min 16` · and three distribution checks.
+
+`release.yml` gains a CHANGELOG-entry check alongside the existing tag/VERSION
+check.
+
+**Both workflows now install via the upstream installer** rather than untarring
+a release by hand:
+
+```sh
+curl -sSf .../cyrius/main/scripts/install.sh | CYRIUS_VERSION="$pin" sh
+```
+
+The hand-rolled step laid the toolchain down at `~/.cyrius/{bin,lib}` as real
+directories. 6.5.28's `cyrius deps` requires the snapshot at
+`~/.cyrius/versions/<pin>/lib` specifically and errors with *"pins version
+6.5.28 but it is not installed"*. The installer creates
+`versions/<pin>/{bin,lib}` and symlinks `~/.cyrius/{bin,lib}` at them; the
+`lib/`-vs-snapshot gate compares against `versions/<pin>/lib` for the same
+reason. The pipe carries `set -eo pipefail` — without it a failed download
+pipes empty input to `sh`, `sh` exits 0, and the install silently no-ops.
+(Same defect and same fix as bayan 1.4.2.)
+
+Three gate mechanics worth knowing before editing the workflow, each verified
+against a deliberately broken input rather than assumed:
+
+- `cyrius lint` **always exits 0** — the step parses its `N warnings` /
+  `N untracked deferrals` lines.
+- `cyrfmt` reads only `argv[1]`, so `cyrius fmt src/*.cyr --check` checks one
+  file and exits 0. The step is a per-file loop.
+- `cyrius build` only *warns* on bad pointer typing, `lib/` shadowing and pin
+  drift, and `--strict` does not promote them — so the step greps `^warning:`.
+
+**`scripts/consumer-check.sh`** (new) compiles a throwaway consumer against
+`dist/ganita.cyr` using **only** the seven leaves its `.deps` sidecar declares
+(`syscalls string alloc fmt vec str math`). It builds with `cyrius build
+--no-deps` — without that, `cyrius build` auto-prepends everything in
+`[deps].stdlib` and the check passes vacuously. Verified by deleting leaves one
+at a time: dropping `math`, `vec`, `fmt`, `string` or `alloc` fails the check as
+it should. **ganita's sidecar is correct** — the bundle compiles clean from its
+declared leaves. (`str` turns out to be over-declared, which is harmless: a
+consumer including one module more than it needs still builds.)
+
+### Verified on released 6.5.28
+
+Checked against the **release tarball** in an isolated `CYRIUS_HOME`, not the
+local `~/.cyrius` — a machine that also develops cyrius can hold an in-flight
+build reporting the same version string, and artifacts generated with it are
+not reproducible on CI (bayan 1.4.2 hit exactly that).
+
+| Gate | Result |
+|---|---|
+| `cyrius build src/main.cyr` | OK, **0 warnings**; smoke exits 42 |
+| `cyrius test` | **25 passed, 0 failed** (+ 1/1 `[build].test`) |
+| `cyrius fmt --check` (src + tests) | clean |
+| `cyrius lint` | 0 warnings, 0 untracked deferrals |
+| `cyrius vet src/main.cyr` | 11 deps, 0 untrusted, 0 missing |
+| `cyrius distlib --all --check` | current; regeneration stable across runs |
+| `scripts/consumer-check.sh` | clean from 7 declared leaves |
+| `cyrius fuzz` · `cyrius bench` | 1/1 · 1/1 |
+| `cyrius coverage` | 22/131 fns (16%) reference coverage |
+
+### Known, not fixed here
+
+- `tests/ganita.fcyr` and `tests/ganita.bcyr` are still `cyrius init` scaffolds
+  — the fuzz harness does no fuzzing and the bench measures a no-op. Both report
+  PASS, so the two CI gates that run them are currently vacuous.
+- **`src/math_f32.cyr` has no test at all** (0/23 fns referenced) — the whole
+  1.1.0 f32 tier is untested in-repo, including the `_f32_key` sign-magnitude
+  transform that 1.1.0 called "the whole correctness story". `linalg.cyr` is
+  2/26. Reference coverage is 16% overall; the floor is set there and should
+  ratchet up.
+- `docs/development/state.md` had been stale since 1.0.4 (it did not mention the
+  1.1.0 f32 tier); refreshed with this release.
+
 ## [1.1.0] — 2026-08-17 — f32 scalar tier (ALL THREE TIERS)
 
 **MINOR, not a patch: new public API.** **Twenty-three** `ganita_f32_*` helpers — the FULL surface the filing enumerated, all three tiers, so f32 consumers stop

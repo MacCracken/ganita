@@ -134,8 +134,15 @@ fn log_info_int(msg, key, val): i64 {
         var tmp[20];
         var ti = 19;
         var v = val;
-        if (v < 0) { store8(&buf + off, 45); off = off + 1; v = 0 - v; }
-        while (v > 0) { store8(&tmp + ti, 48 + v % 10); v = v / 10; ti = ti - 1; }
+        # i64::MIN — see lib/fmt.cyr:fmt_int. This site emits the sign EAGERLY (no `neg`
+        # flag), so only the negation and the loop condition change; `tmp[20]` still
+        # holds all 19 digits with ti starting at 19. CHANGELOG [6.5.8]
+        if (v < 0) { store8(&buf + off, 45); off = off + 1; }
+        while (v != 0) {
+            var d = v % 10;
+            if (d < 0) { d = 0 - d; }
+            store8(&tmp + ti, 48 + d); v = v / 10; ti = ti - 1;
+        }
         ti = ti + 1;
         while (ti < 20) { store8(&buf + off, load8(&tmp + ti)); off = off + 1; ti = ti + 1; }
     }

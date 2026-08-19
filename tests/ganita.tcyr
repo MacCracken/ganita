@@ -58,7 +58,7 @@ assert_eq(ganita_f64_tanh(f64_from(1000)), f64_from(1), "tanh(1000) saturates to
 assert_eq(ganita_f64_tanh(f64_from(0 - 1000)), f64_from(0 - 1), "tanh(-1000) saturates to -1");
 assert_eq(ganita_f64_tanh(f64_from(25)), f64_from(1), "tanh(25) (saturated) = 1");
 assert_eq(ganita_f64_tanh(f64_from(20)), ganita_f64_tanh(f64_from(21)),
-"tanh bit-exact across the saturation boundary (formula 20 == saturated 21)");
+  "tanh bit-exact across the saturation boundary (formula 20 == saturated 21)");
 
 test_group("back-compat aliases");
 var a2 = mat_new(4, 5);

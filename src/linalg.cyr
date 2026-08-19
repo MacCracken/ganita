@@ -6,7 +6,7 @@
 # All decompositions use out-params (Cyrius has no tuples):
 #   ganita_mat_lu(m, out_lu, out_piv)  not  (lu, piv) = ganita_mat_lu(m)
 #
-# Pivoting: partial pivoting only. Complete pivoting is out of scope
+# Pivoting: partial pivoting only. Complete pivoting is deliberately excluded
 # (O(n^3) column search per step, no benefit for hisab's use cases).
 #
 # ganita_mat_det and ganita_mat_inv are convenience wrappers around ganita_mat_lu — they are
@@ -264,7 +264,7 @@ fn ganita_mat_lu(m, out_lu, out_piv): i64 {
             var j = k + 1;
             while (j < n) {
                 var val = f64_sub(ganita_mat_get(out_lu, i, j),
-                f64_mul(factor, ganita_mat_get(out_lu, k, j)));
+                  f64_mul(factor, ganita_mat_get(out_lu, k, j)));
                 ganita_mat_set(out_lu, i, j, val);
                 j = j + 1;
             }
@@ -594,7 +594,7 @@ fn ganita_mat_gaussian_elim(aug): i64 {
             var j = k;
             while (j <= n) {
                 ganita_mat_set(aug, i, j, f64_sub(ganita_mat_get(aug, i, j),
-                f64_mul(factor, ganita_mat_get(aug, k, j))));
+                    f64_mul(factor, ganita_mat_get(aug, k, j))));
                 j = j + 1;
             }
             i = i + 1;
@@ -720,12 +720,12 @@ fn ganita_mat_eigen_sym(m, out_vals, out_vecs): i64 {
         var apq = ganita_mat_get(a, p, q);
 
         var theta = f64_div(f64_sub(aqq, app),
-        f64_mul(f64_from(2), apq));
+          f64_mul(f64_from(2), apq));
         # t = sign(theta) / (|theta| + sqrt(theta^2 + 1))
         var t = f64_from(0);
         var abs_theta = f64_abs(theta);
         var denom = f64_add(abs_theta,
-        f64_sqrt(f64_add(f64_mul(theta, theta), f64_from(1))));
+          f64_sqrt(f64_add(f64_mul(theta, theta), f64_from(1))));
         if (f64_gt(theta, f64_from(0)) == 1) {
             t = f64_div(f64_from(1), denom);
         } else {
@@ -733,7 +733,7 @@ fn ganita_mat_eigen_sym(m, out_vals, out_vecs): i64 {
         }
 
         var c = f64_div(f64_from(1),
-        f64_sqrt(f64_add(f64_mul(t, t), f64_from(1))));
+          f64_sqrt(f64_add(f64_mul(t, t), f64_from(1))));
         var s = f64_mul(t, c);
         var tau = f64_div(s, f64_add(f64_from(1), c));
 
@@ -745,9 +745,9 @@ fn ganita_mat_eigen_sym(m, out_vals, out_vecs): i64 {
                 var aip = ganita_mat_get(a, i, p);
                 var aiq = ganita_mat_get(a, i, q);
                 ganita_mat_set(a, i, p, f64_sub(aip, f64_mul(s,
-                f64_add(aiq, f64_mul(tau, aip)))));
+                      f64_add(aiq, f64_mul(tau, aip)))));
                 ganita_mat_set(a, i, q, f64_add(aiq, f64_mul(s,
-                f64_sub(aip, f64_mul(tau, aiq)))));
+                      f64_sub(aip, f64_mul(tau, aiq)))));
                 ganita_mat_set(a, p, i, ganita_mat_get(a, i, p));
                 ganita_mat_set(a, q, i, ganita_mat_get(a, i, q));
             }
@@ -766,9 +766,9 @@ fn ganita_mat_eigen_sym(m, out_vals, out_vecs): i64 {
             var vip = ganita_mat_get(out_vecs, i, p);
             var viq = ganita_mat_get(out_vecs, i, q);
             ganita_mat_set(out_vecs, i, p, f64_sub(vip, f64_mul(s,
-            f64_add(viq, f64_mul(tau, vip)))));
+                  f64_add(viq, f64_mul(tau, vip)))));
             ganita_mat_set(out_vecs, i, q, f64_add(viq, f64_mul(s,
-            f64_sub(vip, f64_mul(tau, viq)))));
+                  f64_sub(vip, f64_mul(tau, viq)))));
             i = i + 1;
         }
 

@@ -20,7 +20,8 @@
 # Pointer-form retained for callsites that have raw f64v2 pointers
 # (e.g. dynamically-allocated f64v2 arrays) AND as the sole shape
 # on Win64 PE — value-form fns are gated on
-# CYRIUS_HAS_VAL_SIMD_PARAMS (defined by every non-PE main_*.cyr).
+# CYRIUS_HAS_VAL_SIMD_PARAMS (defined by EVERY emit path since v6.4.31/.32;
+# main.cyr's PE/Mach-O cross arms were fixed at v6.4.81).
 # On PE the overload dispatch still works: `f64v2_add(&x, &y)`
 # routes to `f64v2_add_ptr` transparently.
 #
@@ -145,31 +146,47 @@ fn f64v4_lane2_ptr(p): i64 { return load64(p + 16); }
 # Lane 3 extractor (pointer form).
 fn f64v4_lane3_ptr(p): i64 { return load64(p + 24); }
 
+# --- f64v4 arithmetic: 256-bit ymm when the CPU has AVX2, else 2×SSE (v6.5.24) ---
+# All four ops (add/sub/mul/div), in BOTH the pointer and value forms below, pick the
+# 256-bit packed-double kernel `f64v256_*` (vaddpd/vsubpd/vmulpd/vdivpd ymm — ONE
+# iteration for all four lanes) when the host advertises AVX2, and otherwise keep the
+# 128-bit `f64v_*` path (two iterations). Measured 15.9 -> ~7.9 ns.
+#
+# ⚠ THE GATE IS NOT OPTIONAL. `f64v256_*` emits unconditional VEX, which #UDs (SIGILL) on
+# any pre-AVX2 x86. `simd_has_avx2()` also returns 0 on every non-x86 target — its CPUID
+# probe is `#ifdef CYRIUS_ARCH_X86` and no-ops elsewhere — so aarch64 / Mach-O-arm64 / cx
+# take the `f64v_*` NEON-or-portable path for free, exactly as the f32v8 wrappers do.
+# ⚠ n is 4 here and MUST stay a multiple of 4: the ymm emitter strides its index by 4.
+# The f64v2 wrappers above pass n=2 and MUST keep calling `f64v_*` — never widen them.
 # Pointer form of f64v4_add.
 fn f64v4_add_ptr(a_ptr, b_ptr): f64v4 {
     var r: f64v4;
-    f64v_add(&r, a_ptr, b_ptr, 4);
+    if (simd_has_avx2() == 1) { f64v256_add(&r, a_ptr, b_ptr, 4); }
+    else { f64v_add(&r, a_ptr, b_ptr, 4); }
     return r;
 }
 
 # Pointer form of f64v4_sub.
 fn f64v4_sub_ptr(a_ptr, b_ptr): f64v4 {
     var r: f64v4;
-    f64v_sub(&r, a_ptr, b_ptr, 4);
+    if (simd_has_avx2() == 1) { f64v256_sub(&r, a_ptr, b_ptr, 4); }
+    else { f64v_sub(&r, a_ptr, b_ptr, 4); }
     return r;
 }
 
 # Pointer form of f64v4_mul.
 fn f64v4_mul_ptr(a_ptr, b_ptr): f64v4 {
     var r: f64v4;
-    f64v_mul(&r, a_ptr, b_ptr, 4);
+    if (simd_has_avx2() == 1) { f64v256_mul(&r, a_ptr, b_ptr, 4); }
+    else { f64v_mul(&r, a_ptr, b_ptr, 4); }
     return r;
 }
 
 # Pointer form of f64v4_div.
 fn f64v4_div_ptr(a_ptr, b_ptr): f64v4 {
     var r: f64v4;
-    f64v_div(&r, a_ptr, b_ptr, 4);
+    if (simd_has_avx2() == 1) { f64v256_div(&r, a_ptr, b_ptr, 4); }
+    else { f64v_div(&r, a_ptr, b_ptr, 4); }
     return r;
 }
 
@@ -491,11 +508,12 @@ fn i64v2_sub_ptr(a_ptr, b_ptr): i64v2 { var r: i64v2; iv_sub(&r, a_ptr, b_ptr, 2
 # has no pmullq). CHANGELOG [6.4.53]: closes the integer-SIMD arc's last unbuilt op.
 fn i64v2_mul_ptr(a_ptr, b_ptr): i64v2 { var r: i64v2; iv_mul(&r, a_ptr, b_ptr, 2, 8); return r; }
 
-# --- Value-form typed wrappers (non-PE targets only) ---
-# Gated on CYRIUS_HAS_VAL_SIMD_PARAMS, predefined by every main_*.cyr
-# except main_win.cyr. On Win64 PE these fns are absent; the parser's
-# `&IDENT → _ptr` overload dispatch keeps `f64v2_add(&x, &y)` working
-# unchanged across all targets (it routes to the pointer-form sibling).
+# --- Value-form typed wrappers (ALL targets since v6.4.31/.32) ---
+# Gated on CYRIUS_HAS_VAL_SIMD_PARAMS, predefined by every emit path:
+# Win64 PE gained it at v6.4.31 and cx at v6.4.32, and v6.4.81 added it to
+# main.cyr's PE/Mach-O CROSS arms, which had been missing it since .31 (so a
+# cross-built binary silently lost these fns). The parser's `&IDENT → _ptr`
+# overload dispatch keeps `f64v2_add(&x, &y)` working unchanged everywhere.
 
 #ifdef CYRIUS_HAS_VAL_SIMD_PARAMS
 
@@ -585,30 +603,38 @@ fn f64v4_lane2(v: f64v4): i64 { return load64(&v + 16); }
 fn f64v4_lane3(v: f64v4): i64 { return load64(&v + 24); }
 
 # 4-lane packed-double add (value form): r[i] = a[i] + b[i].
+# ⚠ These four value forms carry the SAME AVX2 gate as their `_ptr` siblings — see the
+# comment block above `f64v4_add_ptr`. This fn's NAME is also why the builtin is spelled
+# `f64v256_add` rather than `f64v4_add`: the lane-count name was already taken here, and
+# reserving it as a keyword would make this very definition a parse error.
 fn f64v4_add(a: f64v4, b: f64v4): f64v4 {
     var r: f64v4;
-    f64v_add(&r, &a, &b, 4);
+    if (simd_has_avx2() == 1) { f64v256_add(&r, &a, &b, 4); }
+    else { f64v_add(&r, &a, &b, 4); }
     return r;
 }
 
 # 4-lane packed-double subtract (value form).
 fn f64v4_sub(a: f64v4, b: f64v4): f64v4 {
     var r: f64v4;
-    f64v_sub(&r, &a, &b, 4);
+    if (simd_has_avx2() == 1) { f64v256_sub(&r, &a, &b, 4); }
+    else { f64v_sub(&r, &a, &b, 4); }
     return r;
 }
 
 # 4-lane packed-double multiply (value form).
 fn f64v4_mul(a: f64v4, b: f64v4): f64v4 {
     var r: f64v4;
-    f64v_mul(&r, &a, &b, 4);
+    if (simd_has_avx2() == 1) { f64v256_mul(&r, &a, &b, 4); }
+    else { f64v_mul(&r, &a, &b, 4); }
     return r;
 }
 
 # 4-lane packed-double divide (value form).
 fn f64v4_div(a: f64v4, b: f64v4): f64v4 {
     var r: f64v4;
-    f64v_div(&r, &a, &b, 4);
+    if (simd_has_avx2() == 1) { f64v256_div(&r, &a, &b, 4); }
+    else { f64v_div(&r, &a, &b, 4); }
     return r;
 }
 
@@ -645,7 +671,7 @@ fn f64v4_sqrt(a: f64v4): f64v4 {
     return r;
 }
 
-# --- f32v4 value-form (non-PE) — v6.4.3+ SIMD Phase 1 ---
+# --- f32v4 value-form (all targets) — v6.4.3+ SIMD Phase 1 ---
 
 # Extract lane 0 (value form). Parser routes f32v4_lane0(v) here; &v → _ptr sibling.
 fn f32v4_lane0(v: f32v4): i64 { return load32(&v + 0); }

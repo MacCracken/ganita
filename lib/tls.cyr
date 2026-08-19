@@ -14,7 +14,7 @@
 # `fdlopen_init_full` / `fdlopen_dlopen` / `fdlopen_dlsym` resolve.
 # tls.cyr doesn't auto-include fdlopen because the preprocessor
 # output cap (1 MB expanded) is tight for programs that pull
-# in many heavy stdlib modules (e.g. `tests/tcyr/large_input.tcyr`
+# in many heavy stdlib modules (e.g. `tests/tcyr/compiler/large_input.tcyr`
 # already runs at 98% of cap) — an auto-include would put them
 # over.
 #

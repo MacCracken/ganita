@@ -250,6 +250,23 @@ fn async_wait_writable(rt, fd): i64 {
     return 0;
 }
 
+# v6.5.26 — read-OR-write wait. On IOCP there is no readiness model to combine, so this is
+# the same no-op park as its two siblings above: a task-body overlapped op is what parks.
+# Present so a consumer written against the epoll backend's async_wait_rw still LINKS and
+# still runs on Windows — the same target-agnostic-surface convention this file already uses.
+fn async_wait_rw(rt, fd): i64 {
+    return 0;
+}
+
+# v6.5.26 — one direction of a byte relay. The epoll backend parks until rfd is readable;
+# here the read itself blocks, which is the equivalent wait, so the body is the same shape
+# minus the park. Returns bytes WRITTEN, 0 on clean EOF, -1 on error.
+fn async_relay_once(rt, rfd, wfd, buf, len): i64 {
+    var n = sys_read(rfd, buf, len);
+    if (n <= 0) { return n; }
+    return sys_write(wfd, buf, n);
+}
+
 # Reactor connect task: create an overlapped socket, associate it with the IOCP, bind a
 # local address (ConnectEx prereq), fetch ConnectEx, issue an overlapped ConnectEx, park.
 # On completion, return the connected socket. ctx per the layout at the file head.
