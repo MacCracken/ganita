@@ -7,3 +7,6 @@ fmt
 vec
 str
 math
+io
+assert
+bench

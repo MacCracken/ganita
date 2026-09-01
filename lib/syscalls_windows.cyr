@@ -256,6 +256,40 @@ fn sys_getpid(): i64 { return syscall(61468); }
 # matching lib/process_win.cyr's own documented behaviour.
 fn sys_getppid(): i64 { return 0 - 1; }
 
+# ================================================================
+# Stat buffer contract — v6.5.30
+# ================================================================
+#
+# ⛔ THESE ARE A COMPILE-TIME CONTRACT, NOT A WINDOWS STAT LAYOUT. `xstat` (lib/io.cyr)
+# returns **-1 unconditionally** on `CYRIUS_TARGET_WIN` — GetFileAttributesExW is not wired,
+# and every correct caller already bails on `r < 0`. Nothing on Windows ever populates a stat
+# buffer, so no byte at these offsets is ever read.
+#
+# They exist because the OTHER four peers all define a `Stat` enum and consumers reference it
+# unconditionally. yukti 2.3.8 does exactly that — `var buf[STAT_BUFSZ]` then
+# `load32(&buf + STAT_MODE)` — so without these names a PE build of yukti (and of anything
+# including it) failed to COMPILE, with `array size identifier must be an enum constant`
+# followed by a run of undefined-variable errors. A build failure, not a runtime one.
+#
+# ⚠ THE HALF-FIX TRAP THIS AVOIDS, which CLAUDE.md records from v6.5.7: adding `STAT_SIZE`
+# alone, or only the names in the first error message, leaves the next consumer hitting the
+# next missing member. The full set the peers publish is defined here in one go.
+#
+# Values mirror the x86_64-Linux peer purely so the buffer SIZE contract (144) matches and the
+# offsets stay in range; they carry no Windows meaning. If GetFileAttributesExW is ever wired,
+# these offsets must be re-derived from what that fills in — do not assume they are already
+# right because the code compiles.
+enum Stat {
+    STAT_MODE = 24;
+    STAT_NLINK = 16;
+    STAT_UID = 28;
+    STAT_GID = 32;
+    STAT_SIZE = 48;
+    STAT_MTIME = 88;
+    STAT_MTIME_NSEC = 96;
+    STAT_BUFSZ = 144;
+}
+
 # access(path, mode) — 0xF019 (61465) → kernel32!GetFileAttributesW, live since v6.1.18.
 # ⚠ THE REROUTE TAKES AN ALREADY-WIDE (UTF-16) PATH, which is the one non-obvious part; the
 # widen loop below is the same shape lib/io.cyr uses for its own CreateFileW calls.

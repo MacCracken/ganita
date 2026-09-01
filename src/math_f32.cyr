@@ -8,7 +8,8 @@
 #
 # REPRESENTATION. An f32 is its IEEE-754 **single** bit pattern in the LOW 32 bits of an
 # i64, high 32 clear — the same convention `f32_from` / `f32_to` use. Every fn here takes
-# and returns that form.
+# and returns that form. The arithmetic tier declares its PARAMS `f32` so the value lands
+# in an xmm register as a single; callers still pass and receive the same bit patterns.
 #
 # ⚠ WHY min/max/clamp ARE NOT A BARE UNSIGNED COMPARE. IEEE-754 is SIGN-MAGNITUDE, not
 # two's complement. Raw patterns order correctly only among NON-NEGATIVE values; for two
@@ -20,6 +21,51 @@
 # first time a consumer subtracts. `_f32_key` applies the standard monotone transform
 # (flip all bits when negative, else set the sign bit) so ONE signed compare is correct
 # across the whole range, negatives and zero included.
+
+# ================================================================
+# TIER 0 — arithmetic, in NATIVE single precision
+# ================================================================
+# These are real `addss` / `subss` / `mulss` / `divss`: one rounding, in f32, per
+# operation. They are NOT widen-compute-narrow.
+#
+# The 1.1.0 header (and the filing that requested this tier) recorded that no f32
+# arithmetic tier could be written, because `f32_add(...)` is not a builtin and cyrius
+# reaches f32 arithmetic only through the OPERATORS on an `F32_TYID`-typed value, "and
+# these params arrive as untyped i64 bit patterns". That last clause is the part that was
+# wrong: a param can simply BE typed. `fn f(a: f32, b: f32)` puts the incoming pattern in
+# an xmm lane as a single, `var s: f32 = a + b` emits the single-precision op, and
+# returning `s` as `i64` hands the pattern back. Only the RETURN type is still barred
+# (`fn f(): f32` -> "fn return type must be struct or i8/i16/i32/i64/.../f64"), and that
+# does not matter here because the bit pattern is the interchange form anyway.
+#
+# WHY IT HAD TO BE NATIVE. For a SINGLE +, -, * or /, widen-compute-narrow is correctly
+# rounded — f64's 53 bits exceed 2*24+2, so double rounding cannot bite. So a one-op
+# helper would have been indistinguishable. It stops being true the moment a consumer
+# CHAINS operations: an f64 accumulator keeps precision f32 does not have, and the answers
+# diverge. `ganita_f32_add(2^24, 1.0)` is 2^24 in single precision (ties-to-even) and
+# 2^24+1 in double — that is the test that pins these as native rather than widened.
+fn ganita_f32_add(a: f32, b: f32): i64 {
+    var s: f32 = a + b;
+    return s;
+}
+
+# a - b, one f32 rounding.
+fn ganita_f32_sub(a: f32, b: f32): i64 {
+    var s: f32 = a - b;
+    return s;
+}
+
+# a * b, one f32 rounding.
+fn ganita_f32_mul(a: f32, b: f32): i64 {
+    var s: f32 = a * b;
+    return s;
+}
+
+# a / b, one f32 rounding. Finite/0 is a signed infinity; 0/0 is NaN.
+fn ganita_f32_div(a: f32, b: f32): i64 {
+    var s: f32 = a / b;
+    return s;
+}
 
 # Monotone sort key: maps an f32 bit pattern to an i64 that orders like the float.
 fn _f32_key(b): i64 {
@@ -39,6 +85,7 @@ fn ganita_f32_min(a, b): i64 {
     if (_f32_key(a) <= _f32_key(b)) { return a & 0xFFFFFFFF; }
     return b & 0xFFFFFFFF;
 }
+# max(a, b) — one signed compare on the monotone key.
 fn ganita_f32_max(a, b): i64 {
     if (_f32_key(a) >= _f32_key(b)) { return a & 0xFFFFFFFF; }
     return b & 0xFFFFFFFF;
@@ -58,19 +105,14 @@ fn ganita_f32_sign(x): i64 {
 }
 
 # lerp(a, b, t) = a + (b - a) * t.
-# ⚠ WIDENS, and not by choice: there is no callable `f32_add` / `f32_sub` / `f32_mul`.
-# cyrius dispatches f32 arithmetic through the OPERATORS on an `F32_TYID`-typed value
-# (`EMIT_F32_BINOP`), so it is reachable only from a `var x: f32` binding — and these
-# params arrive as untyped i64 bit patterns. A first cut here called `f32_add(...)` as if
-# it were a builtin; `cyrius distlib` caught it as `undefined function 'f32_add'`.
-# The widening is exact on the inputs (f32 -> f64 loses nothing); the arithmetic then
-# rounds once in f64 rather than once in f32, which is never less accurate than the
-# single-precision result.
-fn ganita_f32_lerp(a, b, t): i64 {
-    var af = f32_to(a);
-    var bf = f32_to(b);
-    var tf = f32_to(t);
-    return f32_from(f64_add(af, f64_mul(f64_sub(bf, af), tf)));
+# ⭐ NO LONGER WIDENS (1.2.0). It used to compute the whole expression in f64 and round
+# once at the end, because the tier believed f32 arithmetic was unreachable from a library
+# fn — see TIER 0 for why that was wrong. It now rounds three times, in single, exactly as
+# the same expression does in Rust or C. Results can differ from 1.1.x by 1 ULP; the new
+# ones are the single-precision answers.
+fn ganita_f32_lerp(a: f32, b: f32, t: f32): i64 {
+    var r: f32 = a + (b - a) * t;
+    return r;
 }
 
 # floor / ceil / trunc.
@@ -81,7 +123,9 @@ fn ganita_f32_lerp(a, b, t): i64 {
 # have to special-case the exponent range, NaN and infinity by hand for no accuracy gain
 # — the win this tier is about is min/max/clamp/abs/neg, which are now branch-and-mask.
 fn ganita_f32_floor(x): i64 { return f32_from(f64_floor(f32_to(x))); }
+# ceil(x) — smallest integral value >= x.
 fn ganita_f32_ceil(x): i64 { return f32_from(f64_ceil(f32_to(x))); }
+# trunc(x) — toward zero, so it differs from floor for negatives.
 fn ganita_f32_trunc(x): i64 {
     if (x & 0x80000000 != 0) { return ganita_f32_neg(ganita_f32_floor(ganita_f32_abs(x))); }
     return ganita_f32_floor(x);
@@ -110,21 +154,30 @@ fn ganita_f32_sqrt(x): i64 { return f32_from(f64_sqrt(f32_to(x))); }
 # symmetry and the removal of per-call-site `f32_from(f64_x(f32_to(v)))` boilerplate from
 # every consumer, not new numerics.
 fn ganita_f32_exp(x): i64 { return f32_from(f64_exp(f32_to(x))); }
+# Natural logarithm.
 fn ganita_f32_ln(x): i64 { return f32_from(f64_ln(f32_to(x))); }
+# Base-2 logarithm.
 fn ganita_f32_log2(x): i64 { return f32_from(f64_log2(f32_to(x))); }
+# 2 raised to x.
 fn ganita_f32_exp2(x): i64 { return f32_from(f64_exp2(f32_to(x))); }
+# Sine, x in radians.
 fn ganita_f32_sin(x): i64 { return f32_from(f64_sin(f32_to(x))); }
+# Cosine, x in radians.
 fn ganita_f32_cos(x): i64 { return f32_from(f64_cos(f32_to(x))); }
+# Arctangent, result in radians.
 fn ganita_f32_atan(x): i64 { return f32_from(f64_atan(f32_to(x))); }
+# Round to nearest, ties to even.
 fn ganita_f32_round(x): i64 { return f32_from(f64_round(f32_to(x))); }
 
 # Two-argument forms — both operands widen before the f64 routine runs.
 fn ganita_f32_pow(base, exp): i64 {
     return f32_from(ganita_f64_pow(f32_to(base), f32_to(exp)));
 }
+# Two-argument arctangent of y/x, quadrant-correct.
 fn ganita_f32_atan2(y, x): i64 {
     return f32_from(ganita_f64_atan2(f32_to(y), f32_to(x)));
 }
+# sqrt(x*x + y*y) without intermediate overflow.
 fn ganita_f32_hypot(x, y): i64 {
     return f32_from(ganita_f64_hypot(f32_to(x), f32_to(y)));
 }

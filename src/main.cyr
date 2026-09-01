@@ -17,6 +17,8 @@ include "src/linalg.cyr"
 include "src/math_advanced.cyr"
 include "src/_compat.cyr"
 
+# Binary entry point: smoke-exercises the matrix / linalg / advanced-math surface.
+# The library API is consumed from dist/ganita.cyr, not from here.
 fn main(): i64 {
     alloc_init();
 

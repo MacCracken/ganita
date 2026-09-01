@@ -2,56 +2,109 @@
 # fibonacci / binomial names → canonical ganita_* API. Deprecated (migration
 # window only). See CHANGELOG [ganita 1.0.0] / cyrius [6.1.26].
 
+# Deprecated alias for `ganita_mat_new()`. Migration window only.
 fn mat_new(rows, cols): i64 { return ganita_mat_new(rows, cols); }
+# Deprecated alias for `ganita_mat_rows()`. Migration window only.
 fn mat_rows(m): i64 { return ganita_mat_rows(m); }
+# Deprecated alias for `ganita_mat_cols()`. Migration window only.
 fn mat_cols(m): i64 { return ganita_mat_cols(m); }
+# Deprecated alias for `ganita_mat_get()`. Migration window only.
 fn mat_get(m, r, c): i64 { return ganita_mat_get(m, r, c); }
+# Deprecated alias for `ganita_mat_set()`. Migration window only.
 fn mat_set(m, r, c, val): i64 { return ganita_mat_set(m, r, c, val); }
+# Deprecated alias for `ganita_mat_identity()`. Migration window only.
 fn mat_identity(n): i64 { return ganita_mat_identity(n); }
+# Deprecated alias for `ganita_mat_from()`. Migration window only.
 fn mat_from(rows, cols, data): i64 { return ganita_mat_from(rows, cols, data); }
+# Deprecated alias for `ganita_mat_add()`. Migration window only.
 fn mat_add(a, b): i64 { return ganita_mat_add(a, b); }
+# Deprecated alias for `ganita_mat_sub()`. Migration window only.
 fn mat_sub(a, b): i64 { return ganita_mat_sub(a, b); }
+# Deprecated alias for `ganita_mat_scale()`. Migration window only.
 fn mat_scale(a, scalar): i64 { return ganita_mat_scale(a, scalar); }
+# Deprecated alias for `ganita_mat_mul()`. Migration window only.
 fn mat_mul(a, b): i64 { return ganita_mat_mul(a, b); }
+# Deprecated alias for `ganita_mat_transpose()`. Migration window only.
 fn mat_transpose(a): i64 { return ganita_mat_transpose(a); }
+# Deprecated alias for `ganita_mat_dot()`. Migration window only.
 fn mat_dot(a, b, n): i64 { return ganita_mat_dot(a, b, n); }
+# Deprecated alias for `ganita_mat_print()`. Migration window only.
 fn mat_print(m): i64 { return ganita_mat_print(m); }
+# Deprecated alias for `ganita_mat_copy()`. Migration window only.
 fn mat_copy(m): i64 { return ganita_mat_copy(m); }
+# Deprecated alias for `ganita_mat_neg()`. Migration window only.
 fn mat_neg(m): i64 { return ganita_mat_neg(m); }
+# Deprecated alias for `ganita_mat_row()`. Migration window only.
 fn mat_row(m, r): i64 { return ganita_mat_row(m, r); }
+# Deprecated alias for `ganita_mat_col()`. Migration window only.
 fn mat_col(m, c): i64 { return ganita_mat_col(m, c); }
+# Deprecated alias for `ganita_mat_set_row()`. Migration window only.
 fn mat_set_row(m, r, data): i64 { return ganita_mat_set_row(m, r, data); }
+# Deprecated alias for `ganita_mat_set_col()`. Migration window only.
 fn mat_set_col(m, c, data): i64 { return ganita_mat_set_col(m, c, data); }
+# Deprecated alias for `ganita_mat_submatrix()`. Migration window only.
 fn mat_submatrix(m, r0, c0, r1, c1): i64 { return ganita_mat_submatrix(m, r0, c0, r1, c1); }
+# Deprecated alias for `ganita_mat_frobenius()`. Migration window only.
 fn mat_frobenius(m): i64 { return ganita_mat_frobenius(m); }
+# Deprecated alias for `ganita_mat_max_norm()`. Migration window only.
 fn mat_max_norm(m): i64 { return ganita_mat_max_norm(m); }
+# Deprecated alias for `ganita_mat_is_symmetric()`. Migration window only.
 fn mat_is_symmetric(m, tol): i64 { return ganita_mat_is_symmetric(m, tol); }
+# Deprecated alias for `ganita_mat_eq()`. Migration window only.
 fn mat_eq(a, b, tol): i64 { return ganita_mat_eq(a, b, tol); }
+# Deprecated alias for `ganita_mat_trace()`. Migration window only.
 fn mat_trace(m): i64 { return ganita_mat_trace(m); }
+# Deprecated alias for `ganita_mat_lu()`. Migration window only.
 fn mat_lu(m, out_lu, out_piv): i64 { return ganita_mat_lu(m, out_lu, out_piv); }
+# Deprecated alias for `ganita_mat_lu_solve()`. Migration window only.
 fn mat_lu_solve(lu, piv, b, out_x): i64 { return ganita_mat_lu_solve(lu, piv, b, out_x); }
+# Deprecated alias for `ganita_mat_det()`. Migration window only.
 fn mat_det(m): i64 { return ganita_mat_det(m); }
+# Deprecated alias for `ganita_mat_inv()`. Migration window only.
 fn mat_inv(m): i64 { return ganita_mat_inv(m); }
+# Deprecated alias for `ganita_mat_cholesky()`. Migration window only.
 fn mat_cholesky(m, out_l): i64 { return ganita_mat_cholesky(m, out_l); }
+# Deprecated alias for `ganita_mat_cholesky_solve()`. Migration window only.
 fn mat_cholesky_solve(l, b, out_x): i64 { return ganita_mat_cholesky_solve(l, b, out_x); }
+# Deprecated alias for `ganita_mat_qr()`. Migration window only.
 fn mat_qr(m, out_q, out_r): i64 { return ganita_mat_qr(m, out_q, out_r); }
+# Deprecated alias for `ganita_mat_gaussian_elim()`. Migration window only.
 fn mat_gaussian_elim(aug): i64 { return ganita_mat_gaussian_elim(aug); }
+# Deprecated alias for `ganita_mat_least_squares()`. Migration window only.
 fn mat_least_squares(a, b, out_x): i64 { return ganita_mat_least_squares(a, b, out_x); }
+# Deprecated alias for `ganita_mat_eigen_sym()`. Migration window only.
 fn mat_eigen_sym(m, out_vals, out_vecs): i64 { return ganita_mat_eigen_sym(m, out_vals, out_vecs); }
+# Deprecated alias for `ganita_mat_svd()`. Migration window only.
 fn mat_svd(m, out_u, out_sigma, out_vt): i64 { return ganita_mat_svd(m, out_u, out_sigma, out_vt); }
+# Deprecated alias for `ganita_mat_pseudo_inv()`. Migration window only.
 fn mat_pseudo_inv(m): i64 { return ganita_mat_pseudo_inv(m); }
+# Deprecated alias for `ganita_mat_rank()`. Migration window only.
 fn mat_rank(m, tol): i64 { return ganita_mat_rank(m, tol); }
+# Deprecated alias for `ganita_mat_condition()`. Migration window only.
 fn mat_condition(m): i64 { return ganita_mat_condition(m); }
+# Deprecated alias for `ganita_f64_sinh()`. Migration window only.
 fn f64_sinh(x): i64 { return ganita_f64_sinh(x); }
+# Deprecated alias for `ganita_f64_cosh()`. Migration window only.
 fn f64_cosh(x): i64 { return ganita_f64_cosh(x); }
+# Deprecated alias for `ganita_f64_tanh()`. Migration window only.
 fn f64_tanh(x): i64 { return ganita_f64_tanh(x); }
+# Deprecated alias for `ganita_f64_pow()`. Migration window only.
 fn f64_pow(base, exp): i64 { return ganita_f64_pow(base, exp); }
+# Deprecated alias for `ganita_f64_asin()`. Migration window only.
 fn f64_asin(x): i64 { return ganita_f64_asin(x); }
+# Deprecated alias for `ganita_f64_acos()`. Migration window only.
 fn f64_acos(x): i64 { return ganita_f64_acos(x); }
+# Deprecated alias for `ganita_f64_atan2()`. Migration window only.
 fn f64_atan2(y, x): i64 { return ganita_f64_atan2(y, x); }
+# Deprecated alias for `ganita_f64_asinh()`. Migration window only.
 fn f64_asinh(x): i64 { return ganita_f64_asinh(x); }
+# Deprecated alias for `ganita_f64_acosh()`. Migration window only.
 fn f64_acosh(x): i64 { return ganita_f64_acosh(x); }
+# Deprecated alias for `ganita_f64_atanh()`. Migration window only.
 fn f64_atanh(x): i64 { return ganita_f64_atanh(x); }
+# Deprecated alias for `ganita_f64_hypot()`. Migration window only.
 fn f64_hypot(x, y): i64 { return ganita_f64_hypot(x, y); }
+# Deprecated alias for `ganita_fibonacci()`. Migration window only.
 fn fibonacci(n): i64 { return ganita_fibonacci(n); }
+# Deprecated alias for `ganita_binomial()`. Migration window only.
 fn binomial(n, k): i64 { return ganita_binomial(n, k); }

@@ -146,6 +146,12 @@ enum SysNrAgnos {
     # break. (#96 fork is NOT minted — see the header; no kernel arm exists yet.)
     SYS_CHAN_OP          = 97;    # chan_op(op, a1, a2, a3) → 0/len / negative CH_E_*
     SYS_PTRSCAN          = 98;    # ptrscan(buf, max) → 16 / 0 (idle) / -1  (agnos 1.56.42)
+    SYS_PROCLIST         = 99;    # proclist(buf, max) → record count / -1  (agnos 1.56.47)
+    # v6.5.36 — the RESUMABLE directory listing. A separate number from #81, not a 4th argument on
+    # it, for the reason #100 records: the compiler pops only as many registers as a call site
+    # passes, so an unused syscall argument register carries stale data rather than zero — and this
+    # argument is a POINTER the kernel writes through.
+    SYS_READDIR_AT       = 101;   # readdir_at(path, buf, max, &cursor) → count / <0 (agnos 1.56.50)
 }
 
 # ── Pointer band (agnos 1.56.42, `#98 ptrscan`) ─────────────────────
@@ -174,6 +180,38 @@ enum SysNrAgnos {
 # rejects both cases with -1 rather than a short write.
 fn sys_ptrscan(buf, max): i64 {
     return syscall(SYS_PTRSCAN, buf, max);
+}
+
+# ── Process-enumeration band (agnos 1.56.47, `#99 proclist`) ────────
+#
+# Snapshot of the live process table. Returns the NUMBER OF RECORDS written, or -1 on a
+# bad user range or `max < 1`. `buf` must hold `max * 64` bytes in the caller's own range.
+#
+# Record (64 B, little-endian), one per live slot:
+#   +0   u64 pid
+#   +8   u64 state       1 = ready · 2 = running · 3 = claiming (0 = dead is skipped)
+#   +16  u64 ppid        0 = init
+#   +24  u8  name[32]    NUL-terminated basename, recorded by the ELF loader
+#   +56  u64 reserved    always 0 today
+#
+# ⭐ WHY IT EXISTS. Before this, AGNOS had NO enumeration primitive of any kind — the
+# ring-3 surface offered getpid/spawn/waitpid/kill and nothing that could answer "what is
+# running?", and there is no procfs. A system monitor was therefore impossible on AGNOS:
+# chakshu rendered a column header and zero rows.
+#
+# ⚠ A SNAPSHOT, NOT A HANDLE. The kernel walks the table under preempt_disable so the set
+# cannot change mid-walk, but a pid may exit before the caller acts on it. That race is
+# inherent to any ps(1) and belongs to the caller — re-probe before signalling.
+#
+# ⚠ THE RESERVED FIELD IS NOT SPARE SPACE. Per-process rss and cpu time are not tracked by
+# the kernel yet; when they are, they land at +56 and the record size does NOT change.
+# Consumers should zero-check it rather than assuming it stays 0 forever.
+#
+# ⚠ GUARD THE CALL SITE. A kernel older than 1.56.47 has no `#99` arm. Treat a negative
+# return as "this kernel cannot enumerate" and degrade, rather than reporting an empty
+# system — the two are different facts and a monitor must not conflate them.
+fn sys_proclist(buf, max): i64 {
+    return syscall(SYS_PROCLIST, buf, max);
 }
 
 # ── Local-IPC channel band (agnos 1.56.40, `#97 chan_op`) ───────────
@@ -355,10 +393,14 @@ enum SysNrAgnosNet {
     SYS_UDP_SEND = 52;     # udp_send(dst_ip, (sport<<16)|dport, buf, len[=a4]) → bytes / 0 / -1
     SYS_UDP_RECV = 53;     # udp_recv(listener_id, buf, maxlen, addr_out[=a4]) → bytes / 0=none / -1
     SYS_UDP_UNBIND = 54;   # udp_unbind(listener_id) → 0 / -1
-    SYS_ICMP_ECHO = 55;    # icmp_echo(dst_ip) → RTT ms (≥0) / -1; BLOCKS ~3s
+    SYS_ICMP_ECHO = 55;    # icmp_echo(dst_ip) → RTT ms (≥0) / -1; BLOCKS ~3s (fixed kernel bound)
+    SYS_ICMP_ECHO_EX = 100; # icmp_echo_ex(dst_ip, timeout_ms) → RTT ms (≥0) / -1 (agnos 1.56.48)
     SYS_SOCK_LISTEN = 56;  # sock_listen(port) → listen_id 0..7 / -1; merges bind+listen, non-blocking (1.45.5)
     SYS_SOCK_ACCEPT = 57;  # sock_accept(listen_id) → conn_id / -1 (WOULD_BLOCK / bad id); non-blocking (1.45.5)
-    SYS_NET_CONFIG = 61;   # net_config(field) → packed IPv4 / 0 unset / -1 bad field (agnos 1.45.16)
+    # net_config(field) → packed IPv4 (0..3) / counter (4..7) / -1 bad field.
+    #   0=ip 1=netmask 2=gateway 3=dns_server                      (agnos 1.45.16)
+    #   4=icmp_tx 5=icmp_rx 6=icmp_replies_sent 7=icmp_timeouts    (agnos 1.56.48)
+    SYS_NET_CONFIG = 61;
 }
 
 # ================================================================
@@ -771,6 +813,35 @@ fn sys_blk_close(h): i64                 { return syscall(SYS_BLK_CLOSE, h); }
 # ext2, -2 not found, -4 not a dir).
 fn sys_readdir(path, buf, max): i64      { return syscall(SYS_READDIR, path, buf, max); }
 
+# ---- agnos RESUMABLE directory listing (#101, agnos 1.56.50; kernel `ext2_readdir_at_sys`).
+# `#81` always starts at the top of the directory and stops at `max`, so a directory with more
+# entries than the caller's buffer is silently truncated — crab's pane cap was exactly that ceiling.
+# This carries a CURSOR, so the same directory can be read in batches.
+#
+# readdir_at(path, buf, max, cursor) — `cursor` points at ONE i64 the kernel reads AND writes:
+#   in   0 to start at the top of the directory
+#   out  the byte offset to resume from, or -1 when the directory is exhausted
+# → entry count (>=0), or <0 (-1 bad ptr/not ext2, -2 not found, -4 not a dir, -5 misaligned cursor).
+#
+# ⚠ THE CURSOR IS A BYTE OFFSET INTO THE DIRECTORY FILE — POSIX `telldir`'s cookie, and the only
+# value that survives ext2 directories being a chain of variable-length records. It is NOT an entry
+# index; do not compute one from it.
+# ⚠ Callers loop `while (cur != -1)`. Passing -1 back in returns 0 and changes nothing, so a loop
+# that overruns by one is harmless rather than an infinite restart from the top.
+# ⛔ THE CURSOR MUST BE 4-BYTE ALIGNED and inside the directory, or the kernel returns -5. ext2
+# records are 4-byte aligned; an offset inside a record would parse a header out of a filename.
+#
+# ⛔ DO NOT IMPLEMENT THIS BY GIVING `sys_readdir` A 4th ARGUMENT. That is what agnos refused to do
+# kernel-side, for the cyrius fact measured on 6.5.35 and recorded against #100: the compiler pops
+# only as many registers as the call site passes, so unused syscall argument registers carry stale
+# values. Widening #81 would hand the kernel a garbage POINTER from every existing three-argument
+# call site — and unlike #55's timeout, the kernel WRITES through this one. Two wrappers, two arities.
+#
+# ⚠ GUARDING: a kernel older than 1.56.50 has no #101 arm and the dispatcher returns -1. Treat a
+# negative return as "this kernel cannot resume a listing" and fall back to `sys_readdir`, rather
+# than rendering an empty directory. "No entries" and "this kernel cannot page" are different facts.
+fn sys_readdir_at(path, buf, max, cursor): i64 { return syscall(SYS_READDIR_AT, path, buf, max, cursor); }
+
 # ---- agnos GPU-compute band (#82-83; kernel leg agnos 1.54.30 cut / 1.54.33 hardened). The ring-3
 # seam onto the 1.54.x GPU arc: agnos drives the AMD Cezanne iGPU (gfx90c) directly from the kernel
 # — no amdgpu, no ROCm — PSP firmware load → CP/MEC → GPUVM → PM4 → hand-assembled gfx90c shaders.
@@ -1166,6 +1237,27 @@ fn sys_udp_unbind(listener_id): i64 { return syscall(SYS_UDP_UNBIND, listener_id
 # BLOCKS ~3s. dst_ip is the kernel ip4() form (resolve via dig first).
 fn sys_icmp_echo(dst_ip): i64 { return syscall(SYS_ICMP_ECHO, dst_ip); }
 
+# icmp_echo_ex(dst_ip, timeout_ms) — #55 with a caller-chosen deadline (agnos 1.56.48).
+# Returns the round-trip time in MILLISECONDS (>= 0), or -1 on timeout / NIC down.
+# `timeout_ms <= 0` selects the kernel default (~3 s), so it degrades exactly to #55;
+# the kernel clamps to 60 s. Resolution is agnos's 100 Hz tick, so the bound rounds DOWN
+# to whole ticks with a floor of 1 — a sub-10 ms request waits one tick, not zero.
+#
+# ⛔ DO NOT "SIMPLIFY" THIS BY GIVING sys_icmp_echo A SECOND ARGUMENT. Two wrappers,
+# two arities, deliberately. This compiler pops only as many registers as a call site
+# passes, so an unused syscall argument register carries whatever the previous code left
+# there — not zero. agnos therefore minted a separate number rather than widening #55,
+# because reading a2 in the #55 arm would hand every already-shipped one-argument caller
+# a garbage timeout: sometimes huge, sometimes milliseconds, never reproducible.
+# Widening a live syscall's arity is not backward compatible on that ABI.
+#
+# Guarding: a kernel older than 1.56.48 has no #100 arm, so the call falls through the
+# dispatch chain and the caller reads the fall-through value as data. Consumers that may
+# meet an older kernel should probe (e.g. sys_net_icmp_tx() >= 0) before relying on it.
+fn sys_icmp_echo_ex(dst_ip, timeout_ms): i64 {
+    return syscall(SYS_ICMP_ECHO_EX, dst_ip, timeout_ms);
+}
+
 # winsize() — live framebuffer character grid (#60). Returns (cols<<16)|rows,
 # or -1. No args, non-blocking, IF=0-safe. Consumed by agnsh / darshana tty
 # sizing / kii / the desktop terminal grid. (agnos 1.45.13)
@@ -1188,6 +1280,28 @@ fn sys_net_netmask(): i64 { return syscall(SYS_NET_CONFIG, 1); }
 fn sys_net_gateway(): i64 { return syscall(SYS_NET_CONFIG, 2); }
 # Packed IPv4 of the DHCP-leased DNS resolver, else the gateway (net_config field 3).
 fn sys_net_dns_server(): i64 { return syscall(SYS_NET_CONFIG, 3); }
+
+# --- ICMP counters, net_config fields 4..7 (agnos 1.56.48) -------------------
+# ⚠ THESE ARE COUNTERS, NOT CONFIG, and the difference bites. Fields 0..3 above are
+# packed IPv4 where `0` means "unset, fall back". Fields 4..7 are free-running
+# monotonic counts where `0` legitimately means "nothing has happened yet" — a caller
+# applying the `<= 0 → fall back` rule to these will misread a healthy idle kernel.
+# Only `-1` means "this kernel does not know" (unknown field, i.e. older than 1.56.48).
+#
+# They exist because a ring-3 prober that gets nothing back cannot otherwise separate
+# "we never transmitted" from "we transmitted and nothing answered": tx>0 with rx==0 is
+# a network problem, tx==0 is a local one. Written by the kernel without a lock
+# (net_handle_icmp runs from the timer ISR), so a torn read costs one count —
+# diagnostics only, never control flow.
+
+# Echo requests this kernel has sent (icmp_ping / icmp_echo / icmp_echo_ex).
+fn sys_net_icmp_tx(): i64 { return syscall(SYS_NET_CONFIG, 4); }
+# Echo replies that matched our identifier AND sequence.
+fn sys_net_icmp_rx(): i64 { return syscall(SYS_NET_CONFIG, 5); }
+# Inbound echo requests this kernel answered (i.e. something pinged us).
+fn sys_net_icmp_replies_sent(): i64 { return syscall(SYS_NET_CONFIG, 6); }
+# Echo waits that expired without a matching reply.
+fn sys_net_icmp_timeouts(): i64 { return syscall(SYS_NET_CONFIG, 7); }
 
 # Lazily zero the conn table (defensive — globals are zero-init, but the
 # explicit pass mirrors lib/chrono.cyr's _chrono_init_mdays idiom and is

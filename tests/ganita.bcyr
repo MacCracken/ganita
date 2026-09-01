@@ -5,8 +5,35 @@
 # For sub-1us ops use batch_size >= 1000 to amortize clock_gettime overhead
 # (~240 ns per start/stop pair on x86_64 Linux). See lib/bench.cyr header for
 # the full overhead-vs-batching guidance.
+#
+# Carries its own includes so the f32 tier is in scope (auto-prepend is skipped
+# once a file has includes), mirroring tests/ganita.tcyr's list.
+include "lib/syscalls.cyr"
+include "lib/string.cyr"
+include "lib/alloc.cyr"
+include "lib/fmt.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/math.cyr"
+include "lib/bench.cyr"
+
+include "src/math_f32.cyr"
 
 fn bench_noop(): i64 { return 0; }
+
+# The 1.1.x shape of the arithmetic that TIER 0 replaced, kept here ONLY as the
+# benchmark baseline: widen both operands to f64, do the op, narrow back. For a
+# single op it is correctly rounded, so this measures cost, not accuracy.
+fn bench_f32_mul_widened(a, b): i64 {
+    return f32_from(f64_mul(f32_to(a), f32_to(b)));
+}
+
+fn bench_f32_lerp_widened(a, b, t): i64 {
+    var af = f32_to(a);
+    var bf = f32_to(b);
+    var tf = f32_to(t);
+    return f32_from(f64_add(af, f64_mul(f64_sub(bf, af), tf)));
+}
 
 fn main(): i64 {
     alloc_init();
@@ -16,6 +43,39 @@ fn main(): i64 {
     while (i < 1000000) { bench_noop(); i = i + 1; }
     bench_batch_stop(b, 1000000);
     bench_report(b);
+
+    # --- f32 TIER 0 (1.2.0): native single precision vs the widened baseline ---
+    var x = f32_from(f64_div(f64_from(1), f64_from(3)));
+    var y = f32_from(f64_div(f64_from(7), f64_from(9)));
+    var t = f32_from(f64_div(f64_from(1), f64_from(7)));
+
+    var b2 = bench_new("f32_mul (native)");
+    bench_batch_start(b2);
+    i = 0;
+    while (i < 1000000) { ganita_f32_mul(x, y); i = i + 1; }
+    bench_batch_stop(b2, 1000000);
+    bench_report(b2);
+
+    var b3 = bench_new("f32_mul (widened baseline)");
+    bench_batch_start(b3);
+    i = 0;
+    while (i < 1000000) { bench_f32_mul_widened(x, y); i = i + 1; }
+    bench_batch_stop(b3, 1000000);
+    bench_report(b3);
+
+    var b4 = bench_new("f32_lerp (native)");
+    bench_batch_start(b4);
+    i = 0;
+    while (i < 1000000) { ganita_f32_lerp(x, y, t); i = i + 1; }
+    bench_batch_stop(b4, 1000000);
+    bench_report(b4);
+
+    var b5 = bench_new("f32_lerp (widened baseline)");
+    bench_batch_start(b5);
+    i = 0;
+    while (i < 1000000) { bench_f32_lerp_widened(x, y, t); i = i + 1; }
+    bench_batch_stop(b5, 1000000);
+    bench_report(b5);
     return 0;
 }
 

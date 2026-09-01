@@ -3,6 +3,8 @@
 
 include "lib/syscalls.cyr"
 
+# `[build].test` entry stub — a no-op that exits 0. The real suite is
+# tests/ganita.tcyr, which `cyrius test` auto-discovers alongside this.
 fn main() {
     return 0;
 }

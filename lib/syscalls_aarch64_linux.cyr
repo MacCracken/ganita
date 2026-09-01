@@ -108,7 +108,11 @@ enum SysNr {
     # it — the same ordering trap already documented on flock/poll and epoll_wait.
     SYS_FCHOWNAT = 1054;    # private alias → ESYSXLAT 1054→54 (a64) / →468 (Darwin)
     SYS_PIPE2 = 59;         # → sys_pipe (flags=0)
-    SYS_PPOLL = 73;         # → sys_pause (NULL fds, NULL timeout)
+    # v6.5.36 — PRIVATE ALIAS. 73 is aarch64's NATIVE ppoll, but ESYSXLAT's x86-compat
+    # row rewrites 73 (x86 flock) → 32, so a native 73 was *matched as an x86 number* and
+    # sys_pause() issued flock(2). Both candidates are owned — 73 is eaten by the shim and
+    # the x86 ppoll number (271) is not a usable escape — so this takes the >=1000 band.
+    SYS_PPOLL = 1073;       # private alias → ESYSXLAT 1073→73 (a64). → sys_pause (NULL fds, NULL timeout)
 
     # Directory + cwd
     SYS_GETCWD = 17;
@@ -181,7 +185,9 @@ enum SysNr {
     # Signals + sync primitives
     SYS_RT_SIGPROCMASK = 135;
     SYS_FUTEX = 98;
-    SYS_SIGNALFD4 = 74;
+    # v6.5.36 — PRIVATE ALIAS, same collision as SYS_PPOLL above: ESYSXLAT rewrites
+    # 74 (x86 fsync) → 82, so a native 74 made sys_signalfd() issue fsync(2).
+    SYS_SIGNALFD4 = 1074;   # private alias → ESYSXLAT 1074→74 (a64)
 
     # Epoll
     SYS_EPOLL_CREATE1 = 20;

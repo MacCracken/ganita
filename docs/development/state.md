@@ -2,9 +2,14 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-08-19.
+> Last refreshed: 2026-09-01.
 
 ## Version
+
+**1.2.0** — the f32 arithmetic tier (`ganita_f32_add` / `_sub` / `_mul` / `_div`) in
+native single precision, `ganita_f32_lerp` de-widened onto it, and every public fn
+documented so `cyrius audit` exits 0. Toolchain pin 6.5.29 → **6.5.36**. 243 assertions
+(was 227).
 
 **1.1.4** — `ganita_f64_pow`'s domain. It was `exp(y·ln base)` and nothing
 else, so every base ≤ 0 returned NaN: `pow(0,2)` and `pow(-2,3)` are ordinary
@@ -42,11 +47,15 @@ initial carve out of cyrius stdlib (2026-06-10, cyrius v6.1.26).
 
 ## Toolchain
 
-- **Cyrius pin**: `6.5.29` (`cyrius.cyml [package].cyrius`, since 1.1.4).
-  `cyrius version` reports `manifest-pin: 6.5.29` with no drift line.
+- **Cyrius pin**: `6.5.36` (`cyrius.cyml [package].cyrius`, since 1.2.0).
+  `cyrius version` reports `manifest-pin: 6.5.36` with no drift line, and the
+  `./lib/ shadows version-pinned ...` warning 1.1.4 shipped with is gone —
+  `cyrius lib sync --full` re-copied all 108 files from the 6.5.36 snapshot.
 - **`lib/` matches the pin exactly**: 108 files, 0 differ. Verify by comparing
   the trees, not by trusting `cyrius lib sync --full`'s exit code.
-- ⛔ **6.5.29 is not published as a GitHub release yet.** CI hands the pin to
+- ✅ **The 1.1.4 CI blocker is retired.** 6.5.36 is published, so the install step
+  resolves. The paragraph below is kept as the record of what 1.1.4 shipped into.
+- ⛔ **(1.1.4, historical) 6.5.29 was not published as a GitHub release.** CI hands the pin to
   `scripts/install.sh`, which downloads
   `cyrius-<pin>-x86_64-linux.tar.gz`; that asset 404s today, so **CI fails at
   the install step until the release ships**. 1.1.4 was verified against the
@@ -84,7 +93,7 @@ functions prefixed `ganita_`. Regenerated from the tree 2026-08-19:
 - `src/_compat.cyr` — 53 back-compat aliases (legacy names → `ganita_*`).
   Single-pass order: matrix → linalg → math_advanced → math_f32 → `_compat`
   last, since its aliases reference every `ganita_*` symbol.
-- `dist/ganita.cyr` — regenerated via `cyrius distlib` at 1.1.4 on released
+- `dist/ganita.cyr` — regenerated via `cyrius distlib` at 1.2.0 on released
   6.5.28. This is the artifact folded into
   `cyrius/lib/ganita.cyr`.
 - `dist/ganita.deps` — 7 stdlib leaves: `syscalls string alloc fmt vec str math`.

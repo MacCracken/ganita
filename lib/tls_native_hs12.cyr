@@ -1588,8 +1588,29 @@ fn tls_native_set_ca_bundle(ctx, pem_bundle, bundle_len, is_der): i64 {
 # /etc/ssl/certs/ca-certificates.crt, RHEL/Fedora /etc/pki/..., macOS/Arch
 # /etc/ssl/cert.pem). Returns TLS_OK, TLS_ERR_IO if no bundle is readable, or a
 # parse error.
+# v6.5.36 — the bundle is read and allocated ONCE per process, not per call.
+#
+# ⛔ WHAT WAS WRONG: this did `alloc(1048576)` on EVERY call and cached nothing, and
+# `lib/tls.cyr:316` (`_tls_native_alloc`) calls it on EVERY native-backend connect. On this
+# no-free bump allocator that is **exactly 1,048,576 bytes of permanently-retained heap per
+# TLS connection** — measured on a real AGNOS kernel at 6.5.35, and present unchanged in
+# every snapshot back to 6.2.23. A long-lived client leaked a megabyte per connect.
+#
+# The bundle is a file on disk that does not change under a running process, so the read and
+# the buffer are both cacheable. Only the *parse into this ctx* has to repeat, because the
+# anchors are installed into the caller's ctx.
+#
+# ⚠ THE FAILURE IS CACHED TOO, DELIBERATELY. `_tn_ca_len == -1` means "we looked and there is
+# no readable bundle", which is a different state from "not looked yet" (0). Without that, a
+# machine with no trust store re-walks all four candidate paths on every single connect —
+# four failed opens per connect, forever.
+var _tn_ca_buf = 0;      # cached bundle bytes
+var _tn_ca_len = 0;      # 0 = not loaded · >0 = bytes · -1 = looked, none readable
+
 fn tls_native_set_ca_system(ctx): i64 {
     if (ctx == 0) { return TLS_ERR_INVALID_PARAM; }
+    if (_tn_ca_len == (0 - 1)) { return TLS_ERR_IO; }
+    if (_tn_ca_len > 0) { return tls_native_set_ca_bundle(ctx, _tn_ca_buf, _tn_ca_len, 0); }
     var cap = 1048576;                          # 1 MiB; system bundles are ~250 KB
     var buf = alloc(cap);
     if (buf == 0) { return TLS_ERR_OOM; }
@@ -1605,7 +1626,7 @@ fn tls_native_set_ca_system(ctx): i64 {
     if (fd < 0) { fd = file_open("/etc/ssl/certs/ca-certificates.crt", 0, 0); }   # Debian/Ubuntu
     if (fd < 0) { fd = file_open("/etc/pki/tls/certs/ca-bundle.crt", 0, 0); }     # RHEL/Fedora
     if (fd < 0) { fd = file_open("/etc/ssl/ca-bundle.pem", 0, 0); }               # openSUSE
-    if (fd < 0) { return TLS_ERR_IO; }
+    if (fd < 0) { _tn_ca_len = 0 - 1; return TLS_ERR_IO; }
     var total = 0;
     var rdone = 0;
     while (rdone == 0) {
@@ -1615,7 +1636,9 @@ fn tls_native_set_ca_system(ctx): i64 {
         if (total >= cap) { rdone = 1; }
     }
     sys_close(fd);
-    if (total <= 0) { return TLS_ERR_IO; }
+    if (total <= 0) { _tn_ca_len = 0 - 1; return TLS_ERR_IO; }
+    _tn_ca_buf = buf;
+    _tn_ca_len = total;
     return tls_native_set_ca_bundle(ctx, buf, total, 0);
 }
 

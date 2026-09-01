@@ -1,0 +1,75 @@
+# ganita_mat_least_squares: unchecked internal Q allocation -> SIGSEGV.
+#
+# Build and run from the ganita repo root:
+#   cyrius build docs/development/issues/repros/2026-08-23-least-squares-unchecked-q-alloc.cyr /tmp/lsq
+#   /tmp/lsq; echo "exit=$?"        # -> 139 (SIGSEGV)
+#
+# Includes src/ directly rather than lib/ganita.cyr so it exercises the working
+# source (the bundled lib/ in this repo is 1.1.1; src/ is 1.1.4). Include order
+# mirrors tests/ganita.tcyr and the [lib].modules list.
+#
+# The design below is 5793 x 3 -- 17,379 elements, 0.05% of
+# GANITA_MAT_MAX_ELEMS (33,554,430), so ganita_mat_new accepts the CALLER's
+# matrix without complaint. The Q that ganita_mat_least_squares forms internally
+# is 5793 x 5793 = 33,558,849 elements, just OVER the cap, so its mat_new
+# returns 0 -- and the return is never checked. 5793 is the exact first failing
+# m for n = 3: 33554430 / 5793 = 5792.
+
+include "lib/syscalls.cyr"
+include "lib/string.cyr"
+include "lib/alloc.cyr"
+include "lib/fmt.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/math.cyr"
+
+include "src/matrix.cyr"
+include "src/linalg.cyr"
+
+fn main(): i64 {
+    alloc_init();
+
+    var m = 5793;
+    var n = 3;
+
+    # The caller's own matrix: well inside every documented limit.
+    var a = ganita_mat_new(m, n);
+    if (a == 0) {
+        println("caller matrix REJECTED -- unexpected, the cap should accept 5793x3");
+        return 2;
+    }
+    println("caller matrix allocated OK (5793 x 3 = 17379 elems, cap is 33554430)");
+
+    # Vandermonde: column j is x^j.
+    var i = 0;
+    while (i < m) {
+        var x = f64_from(i);
+        var p = f64_from(1);
+        var j = 0;
+        while (j < n) {
+            ganita_mat_set(a, i, j, p);
+            p = f64_mul(p, x);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    var b = alloc(m * 8);
+    i = 0;
+    while (i < m) {
+        store64(b + i * 8, f64_from(i));
+        i = i + 1;
+    }
+    var out = alloc(n * 8);
+
+    println("calling ganita_mat_least_squares (forms a 5793 x 5793 Q internally)...");
+    var rc = ganita_mat_least_squares(a, b, out);
+
+    # Not reached on an affected build.
+    println("returned without faulting");
+    fmt_int(rc);
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

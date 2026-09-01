@@ -35,7 +35,11 @@ enum SysNr {
     SYS_MMAP = 9;
     SYS_BRK = 12;
     SYS_RT_SIGPROCMASK = 14;
-    SYS_IOCTL = 16;
+    # v6.5.36 — 29, NOT the x86 16. ESYSXLAT's Mach-O arm carries a `29 → 54` row
+    # (Darwin's ioctl) and NO row for 16, so the old value emitted an unrouted 16 and
+    # issued whatever Darwin syscall 16 is. Latent because nothing in the macOS stdlib
+    # called it until sys_ioctl was wrapped; found while wrapping it.
+    SYS_IOCTL = 29;
     SYS_ACCESS = 21;
     SYS_PIPE = 22;
     SYS_DUP = 32;

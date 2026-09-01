@@ -4,6 +4,89 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-09-01 — the f32 arithmetic tier that 1.1.0 said could not be written
+
+Adds `ganita_f32_add` / `_sub` / `_mul` / `_div` in **native single precision**, and
+rewrites `ganita_f32_lerp` to use them. Minor, not patch: four new public functions.
+243 assertions (was 227); `cyrius audit` exits 0 for the first time (docs were the
+blocker — see below).
+
+### Added
+
+- **TIER 0 — `ganita_f32_add`, `ganita_f32_sub`, `ganita_f32_mul`, `ganita_f32_div`.**
+  Real `addss` / `subss` / `mulss` / `divss`: **one rounding, in f32, per operation.**
+
+  1.1.0 shipped tiers 1-3 and recorded that this tier was impossible. The module
+  header said so, `ganita_f32_lerp`'s comment said so, and the closing note on
+  [the filing](https://github.com/MacCracken/cyrius) listed it as a remaining
+  cyrius-side gap: *"there is no callable `f32_add`/`f32_sub`/`f32_mul`, so no f32
+  tier can be written in native single-precision arithmetic today."*
+
+  **The reasoning had one wrong clause.** It is true that `f32_add(...)` is not a
+  builtin and that cyrius reaches f32 arithmetic only through the operators on an
+  `F32_TYID`-typed value. The wrong part was the conclusion drawn from *"and these
+  params arrive as untyped i64 bit patterns"* — a parameter can simply **be typed**:
+
+  ```
+  fn ganita_f32_mul(a: f32, b: f32): i64 {
+      var s: f32 = a * b;
+      return s;
+  }
+  ```
+
+  The typed params put the incoming patterns in xmm lanes as singles, the `var s: f32`
+  binding emits the single-precision op, and returning `s` as `i64` hands the pattern
+  back. Callers pass and receive exactly the same bit patterns as the rest of the tier —
+  no signature change to anything that already existed.
+
+  Only the **return** type is still barred (`fn f(): f32` is rejected with *"fn return
+  type must be struct or i8/i16/i32/i64/Result/Option/Tagged/cstring/f64/f64v2/f64v4"*),
+  and that costs nothing here because the bit pattern is the interchange form anyway.
+  That one remains a genuine cyrius-side gap, as does the `sqrtss` intrinsic.
+
+### Fixed
+
+- **`ganita_f32_lerp` no longer widens.** It computed `a + (b - a) * t` as a single f64
+  expression rounded once at the end; it now rounds three times, in single, exactly as
+  the same expression does in Rust or C. **Results can differ from 1.1.x by 1 ULP — the
+  new ones are the single-precision answers.** A new assertion pins
+  `lerp(a,b,t) == add(a, mul(sub(b,a), t))` rounding for rounding, which the widened
+  form did not guarantee.
+
+### Fixed (docs)
+
+- **`cyrius audit` now exits 0.** It was failing on `70 undocumented public fns` —
+  every one of `_compat.cyr`'s 53 deprecated aliases, 15 of `math_f32.cyr`'s own tier
+  (including three the change above had just added), and both `main` entry points.
+  All 70 now carry a doc line, so the gate is green rather than permanently red, and
+  a genuinely new undocumented function will be visible instead of lost in the count.
+
+### Changed (toolchain)
+
+- **Cyrius pin `6.5.29` → `6.5.36`**, with `cyrius lib sync --full` (108 files). This
+  clears the drift warning *and* the `./lib/ shadows version-pinned .../6.5.29/lib — 7
+  bundled lib(s) differ` warning that 1.1.4 shipped with. It also retires 1.1.4's
+  blocker: that release pinned a version whose GitHub tarball did not exist, so CI
+  failed at the install step. 6.5.36 is published.
+
+### Notes on what this is NOT
+
+- **It is not a speedup, and the benchmark says so.** `tests/ganita.bcyr` now measures
+  the native tier against the 1.1.x widen-compute-narrow shape at 1M iterations:
+  `f32_mul` 3 ns vs 3 ns, `f32_lerp` 5 ns vs 4 ns — indistinguishable, and on the
+  `lerp` row the widened shape came out marginally *ahead* on one run, which is the
+  spread rather than a result. The `cvtss2sd`/`cvtsd2ss` pair is free at this
+  granularity. **The tier is about semantics, not cost — do not sell it as a speedup.**
+- **For a SINGLE operation the old shape was already correct.** f64 carries 53 mantissa
+  bits against f32's 24, more than 2·24+2, so widen-compute-narrow is correctly rounded
+  for one `+ - * /` and double rounding cannot bite. The difference appears when a
+  consumer **chains** operations and an f64 intermediate keeps precision f32 does not
+  have. `add(add(2^24, 1), 1)` is 2^24 natively and 2^24+2 through an f64 accumulator;
+  that pair is the test that pins these as native.
+- `ganita_f32_sqrt` still widens — `sqrtss` needs a new cyrius intrinsic, which is a
+  compiler change. It is correctly rounded, per the same 53-bit argument.
+
+
 ## [1.1.4] — 2026-08-19 — `f64_pow` domain
 
 ### Changed (toolchain)
