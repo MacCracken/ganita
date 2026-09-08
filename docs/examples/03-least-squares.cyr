@@ -1,0 +1,118 @@
+# 03 — least squares: fitting a polynomial to data
+#
+#   cyrius build docs/examples/03-least-squares.cyr /tmp/ex03 && /tmp/ex03
+#
+# ganita_mat_least_squares minimises ||Ax - b||^2 for an over-determined system.
+# The usual shape is a curve fit: A is the design matrix (one row per sample,
+# one column per basis function), b is the observations, and x comes back as the
+# coefficients.
+#
+# ⚠ SIZE. Through 1.2.1 this routine went through ganita_mat_qr, whose contract
+# is an explicit m x m orthogonal Q — so an ordinary 5793 x 3 design (17,379
+# elements, 0.05% of the element cap) made it ask for a 33,558,849-element Q,
+# just over the cap, and SIGSEGV'd. Since 1.2.2 the Householder reflectors are
+# applied to b directly and no Q is formed at all, so cost is O(m*n) and the
+# only limit on the number of samples is memory. The 20,000-sample fit at the
+# bottom of this file could not run at ANY cap before.
+
+include "lib/syscalls.cyr"
+include "lib/string.cyr"
+include "lib/alloc.cyr"
+include "lib/fmt.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/math.cyr"
+
+include "src/matrix.cyr"
+include "src/linalg.cyr"
+
+# Fit y = c0 + c1*x + c2*x^2 over `m` samples of the known quadratic
+# y = 2 + 3x - 4x^2, sampled at x = i/m so the design stays well conditioned.
+# The target lies EXACTLY in the column space, so the least-squares answer is
+# the exact one and any drift is the solver's, not the model's.
+fn fit_quadratic(m, label): i64 {
+    println(label);
+
+    var a = ganita_mat_new(m, 3);
+    if (a == 0) { println("  design matrix refused — past the element cap"); return 1; }
+    var b = alloc(m * 8);
+    if (b == 0) { println("  observation vector refused"); return 1; }
+
+    var i = 0;
+    while (i < m) {
+        var x = f64_div(f64_from(i), f64_from(m));
+        ganita_mat_set(a, i, 0, f64_from(1));
+        ganita_mat_set(a, i, 1, x);
+        ganita_mat_set(a, i, 2, f64_mul(x, x));
+        store64(b + i * 8, f64_add(f64_from(2),
+            f64_sub(f64_mul(f64_from(3), x), f64_mul(f64_from(4), f64_mul(x, x)))));
+        i = i + 1;
+    }
+
+    var out = alloc(24);
+    if (out == 0) { println("  coefficient vector refused"); return 1; }
+    # -1 means a working allocation failed. 0 is success. Check it: the whole
+    # point of the 1.2.2 rewrite is that this function now REPORTS rather than
+    # faults.
+    var rc = ganita_mat_least_squares(a, b, out);
+    if (rc != 0) { println("  least_squares failed (allocation)"); return 1; }
+
+    syscall(1, 1, "  c0 = ", 7); fmt_float(load64(out), 9);
+    syscall(1, 1, "   c1 = ", 8); fmt_float(load64(out + 8), 9);
+    syscall(1, 1, "   c2 = ", 8); fmt_float(load64(out + 16), 9);
+    println("");
+    println("  want    2.000000000        3.000000000        -4.000000000");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    # --- the small, hand-checkable case ----------------------------------
+    # Three points on the line y = x + 1, fitted with the basis {1, x}. The
+    # system is over-determined (3 equations, 2 unknowns) but CONSISTENT, so the
+    # least-squares solution is the exact one: c0 = 1, c1 = 1.
+    println("Line fit through (0,1), (1,2), (2,3) with basis {1, x}:");
+    var a = ganita_mat_new(3, 2);
+    if (a == 0) { println("mat_new refused"); return 1; }
+    var b = alloc(24);
+    if (b == 0) { println("alloc refused"); return 1; }
+    var i = 0;
+    while (i < 3) {
+        ganita_mat_set(a, i, 0, f64_from(1));
+        ganita_mat_set(a, i, 1, f64_from(i));
+        store64(b + i * 8, f64_from(i + 1));
+        i = i + 1;
+    }
+    var x = alloc(16);
+    if (x == 0) { println("alloc refused"); return 1; }
+    if (ganita_mat_least_squares(a, b, x) != 0) { println("least_squares failed"); return 1; }
+    syscall(1, 1, "  intercept = ", 14); fmt_float(load64(x), 9);
+    syscall(1, 1, "   slope = ", 11); fmt_float(load64(x + 8), 9);
+    println("   (want 1, 1)");
+
+    # --- an INCONSISTENT system: the residual is the point ----------------
+    # (0,1), (1,2), (2,4) is not collinear. There is no exact solution, so this
+    # returns the line that minimises the sum of squared residuals: y = 1.5x +
+    # 5/6. This is the case least squares actually exists for.
+    println("");
+    println("Line fit through (0,1), (1,2), (2,4) — NOT collinear:");
+    store64(b + 16, f64_from(4));
+    if (ganita_mat_least_squares(a, b, x) != 0) { println("least_squares failed"); return 1; }
+    syscall(1, 1, "  intercept = ", 14); fmt_float(load64(x), 9);
+    syscall(1, 1, "   slope = ", 11); fmt_float(load64(x + 8), 9);
+    println("   (want 0.833333333, 1.5)");
+
+    # --- scale --------------------------------------------------------------
+    println("");
+    fit_quadratic(1000, "Quadratic fit, 1,000 samples:");
+    println("");
+    fit_quadratic(5793, "Quadratic fit, 5,793 samples — the exact size that SIGSEGV'd before 1.2.2:");
+    println("");
+    fit_quadratic(20000, "Quadratic fit, 20,000 samples — impossible before 1.2.2 at any cap:");
+
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

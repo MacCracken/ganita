@@ -95,7 +95,7 @@ jobs:
         run: |
           set -euo pipefail
           fail=0
-          for f in src/*.cyr tests/*.tcyr tests/*.bcyr tests/*.fcyr; do
+          for f in src/*.cyr tests/*.tcyr tests/*.bcyr tests/*.fcyr docs/examples/*.cyr; do
             [ -e "$f" ] || continue
             if ! out=$(cyrius fmt "$f" --check 2>&1); then
               echo "::error file=$f::not canonically formatted — run 'cyrius fmt $f'"
@@ -171,8 +171,22 @@ jobs:
 
       # A floor that ratchets, not a target. Raise it whenever real coverage
       # lands; never lower it to make a red build green.
-      - name: Reference coverage floor
-        run: cyrius coverage --min 80
+      #
+      # ⚠ `cyrius coverage` credits a function whose name appears as a raw
+      # SUBSTRING anywhere in the scanned text, COMMENTS INCLUDED. Every
+      # _compat alias name is a substring of the canonical name it forwards to,
+      # and appending one comment line naming an uncalled function moved this
+      # figure from 80% to 82% at 1.2.2 (see docs/audit/2026-09-07-v1.2.3-audit.md).
+      # It is kept as a ratchet because it sees things a regex does not — but it
+      # is NOT the only gate, because it is a number a comment can move.
+      - name: Reference coverage floor (tool)
+        run: cyrius coverage --min 85
+
+      # The same floor counted on word boundaries with comments stripped. This
+      # is the number to plan against; the tool's is the number to ratchet.
+      # Both must pass. Raise this whenever real coverage lands.
+      - name: Reference coverage floor (word-boundary)
+        run: ./scripts/coverage-honest.sh 54
 
       # --- Distribution: ganita's actual product is dist/, not build/ ---------
 
@@ -195,3 +209,28 @@ jobs:
       # must build with --no-deps.
       - name: Distribution — bundle compiles as a downstream consumer
         run: ./scripts/consumer-check.sh "${RUNNER_TEMP}/consumer-check"
+
+      # Documentation that is VERIFIED rather than asserted. Every file in
+      # docs/examples/ is a real program against the real API, so an example
+      # that stopped being true fails the gate instead of quietly becoming a
+      # lie. Added at 1.2.3 with the examples themselves.
+      - name: Examples build and run
+        run: |
+          set -euo pipefail
+          n=0
+          for f in docs/examples/*.cyr; do
+            [ -e "$f" ] || continue
+            out="${RUNNER_TEMP}/$(basename "$f" .cyr)"
+            log=$(cyrius build "$f" "$out" 2>&1) || {
+              echo "::error file=$f::example failed to build"; printf '%s\n' "$log"; exit 1; }
+            if printf '%s\n' "$log" | grep -q '^warning:'; then
+              echo "::error file=$f::example emitted compiler warnings"
+              printf '%s\n' "$log" | grep '^warning:'; exit 1
+            fi
+            set +e; "$out" > /dev/null 2>&1; rc=$?; set -e
+            test "$rc" -eq 0 || { echo "::error file=$f::example exited $rc, expected 0"; exit 1; }
+            echo "ok  $f"
+            n=$((n + 1))
+          done
+          test "$n" -gt 0 || { echo "::error::no examples found — docs/examples/*.cyr is empty"; exit 1; }
+          echo "$n example(s) build clean and exit 0"

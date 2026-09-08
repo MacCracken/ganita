@@ -1,8 +1,17 @@
-# ganita — smoke entry. Includes the stdlib prereqs + the full bundle (matrix +
-# linalg + math_advanced + back-compat aliases) so `cyrius build` proves they
-# parse, link, and assemble together as a consumer would use `lib/ganita.cyr`,
-# then exercises a matrix op + an advanced-math op + an alias.
-# Deep correctness lives in cyrius's matrix/linalg/math .tcyr suite (post-fold).
+# ganita — smoke entry. Includes the stdlib prereqs + THE FULL BUNDLE, in
+# [lib].modules order, so `cyrius build` proves every module parses, links and
+# assembles together exactly as a consumer would use `lib/ganita.cyr`, then
+# exercises one op from each tier plus an alias.
+#
+# ⚠ src/math_f32.cyr was MISSING from this list through 1.2.2, which meant the
+# "full-bundle" claim was false: the build gate and `cyrius vet` never saw 27 of
+# the library's public functions, and neither did the zero-compiler-warnings
+# check they enforce. It was also the one ordering that mattered — math_f32
+# forwards pow/atan2/hypot/cbrt into math_advanced — so a link error there would
+# have surfaced only in the test harness.
+#
+# Deep correctness lives in tests/ganita.tcyr and, post-fold, in cyrius's
+# matrix/linalg/math .tcyr suite.
 
 include "lib/syscalls.cyr"
 include "lib/string.cyr"
@@ -15,6 +24,7 @@ include "lib/math.cyr"
 include "src/matrix.cyr"
 include "src/linalg.cyr"
 include "src/math_advanced.cyr"
+include "src/math_f32.cyr"
 include "src/_compat.cyr"
 
 # Binary entry point: smoke-exercises the matrix / linalg / advanced-math surface.
@@ -30,6 +40,11 @@ fn main(): i64 {
     # advanced math: binomial(5,2) = 10 (canonical + alias parity)
     if (ganita_binomial(5, 2) != 10) { return 3; }
     if (binomial(5, 2) != 10) { return 4; }    # back-compat alias
+
+    # f32 tier: 1.5 + 2.25 = 3.75, exact in single precision.
+    if (ganita_f32_add(f32_from(f64_div(f64_from(3), f64_from(2))),
+        f32_from(f64_div(f64_from(9), f64_from(4))))
+      != f32_from(f64_div(f64_from(15), f64_from(4)))) { return 5; }
 
     return 42;
 }

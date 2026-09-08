@@ -552,34 +552,136 @@ assert_eq(t_dclose(load64(BIGX + 16), t_d(0 - 4)), 1, "least_squares m=5793: c2 
 # answer, which is what pins the reflector-on-b path as equivalent to forming Q.
 
 test_group("linalg: allocation failure is reported, never written through (1.2.2)");
-# Every internal mat_new / alloc is checked as of 1.2.2. What these pin is the
-# reachable half: failures a caller hits with matrices that are THEMSELVES well
-# inside the cap, because the working factor is derived and larger. That is the
-# exact shape of the naad report, and none of it was detectable before — the
-# functions faulted instead of returning.
-# mat_mul: both operands legal, the PRODUCT is not (8000x1 * 1x8000 = 64M elems).
+# 1.2.2 checked every internal allocation. 1.2.3 then added the shape and range
+# PRECONDITIONS, and those fire first — which makes most of the cap-driven
+# allocation failures structurally unreachable, because the only inputs that
+# produced them are exactly the inputs now rejected. That is the better outcome,
+# and it is what these assertions record. The allocation checks all remain, and
+# still guard genuine out-of-memory; there is simply no longer a legal argument
+# that reaches them through the element cap.
+# mat_mul is the one that is still reachable: both operands legal, the PRODUCT
+# past the cap (8000x1 * 1x8000 = 64M elements).
 var MMA = ganita_mat_new(8000, 1);
 var MMB = ganita_mat_new(1, 8000);
 assert_eq(MMA != 0, 1, "mat_mul guard: the 8000x1 operand is itself legal");
 assert_eq(MMB != 0, 1, "mat_mul guard: the 1x8000 operand is itself legal");
 assert_eq(ganita_mat_mul(MMA, MMB), 0, "mat_mul -> null when the product exceeds the cap");
-# det / inv take n from the ROW count, so a tall non-square asks for an n x n factor.
-var TALL = ganita_mat_new(6000, 2);
-assert_eq(TALL != 0, 1, "det/inv guard: the 6000x2 input is itself legal");
-assert_eq(t_f64_is_nan(ganita_mat_det(TALL)), 1,
-  "det -> NaN, NOT 0.0, when the n x n LU factor cannot be allocated");
-assert_eq(ganita_mat_inv(TALL), 0, "inv -> null when the n x n LU factor cannot be allocated");
-# rank / condition / pseudo_inv build cols x cols factors, so a WIDE input does it.
-var WIDE = ganita_mat_new(2, 6000);
-assert_eq(WIDE != 0, 1, "svd-family guard: the 2x6000 input is itself legal");
-assert_eq(ganita_mat_rank(WIDE, t_tol()), 0 - 1,
-  "rank -> -1 when the cols x cols factor cannot be allocated (a rank is never negative)");
-assert_eq(t_f64_is_nan(ganita_mat_condition(WIDE)), 1,
-  "condition -> NaN, distinct from its -1.0 singular answer");
-assert_eq(ganita_mat_pseudo_inv(WIDE), 0, "pseudo_inv -> null when the SVD factors cannot be allocated");
-# An empty range is mat_new's null, propagated rather than written through.
-assert_eq(ganita_mat_submatrix(mg, 0, 0, 0, 0), 0, "submatrix of an empty range -> null");
-assert_eq(ganita_mat_submatrix(mg, 0, 0, 2, 2) != 0, 1, "submatrix of a real range still builds");
+
+test_group("hardening: shape and range preconditions (1.2.3)");
+# ⭐ Every assertion here covers a path that, before 1.2.3, READ OR WROTE OUT OF
+# BOUNDS and then reported success. Each was reproduced by the P(-1) sweep with a
+# program that either printed a neighbouring allocation's contents as data or
+# died with SIGSEGV. The inputs are all matrices ganita_mat_new accepted.
+var H23 = ganita_mat_new(2, 3);
+var H32 = ganita_mat_new(3, 2);
+var H22 = ganita_mat_new(2, 2);
+assert_eq(H23 != 0 && H32 != 0 && H22 != 0, 1, "hardening: the fixtures are themselves legal matrices");
+
+# mat_add / mat_sub took their shape from A alone and read B for rows(a)*cols(a)
+# words whatever B's real size was.
+assert_eq(ganita_mat_add(H23, H22), 0, "mat_add -> null on a shape mismatch (was an OOB read of B)");
+assert_eq(ganita_mat_sub(H23, H22), 0, "mat_sub -> null on a shape mismatch (was an OOB read of B)");
+assert_eq(ganita_mat_add(H23, H23) != 0, 1, "mat_add still builds when the shapes agree");
+# mat_mul derived its inner dimension from cols(A) and never read rows(B).
+assert_eq(ganita_mat_mul(H23, H23), 0, "mat_mul -> null when rows(B) != cols(A) (was an OOB read of B)");
+assert_eq(ganita_mat_mul(H23, H32) != 0, 1, "mat_mul still builds when the inner dimensions agree");
+# Null operands used to be dereferenced immediately.
+assert_eq(ganita_mat_add(0, H22), 0, "mat_add -> null for a null operand");
+assert_eq(ganita_mat_mul(H22, 0), 0, "mat_mul -> null for a null operand");
+assert_eq(ganita_mat_transpose(0), 0, "mat_transpose -> null for a null operand");
+assert_eq(ganita_mat_copy(0), 0, "mat_copy -> null for a null operand");
+
+# set_row / set_col WRITE, so an out-of-range index was an OOB write: index ==
+# rows landed on the next allocation's {rows, cols} header, and a negative index
+# walked back into the target's own header.
+assert_eq(ganita_mat_set_row(H23, 2, t_arr3(t_d(1), t_d(2), t_d(3))), 0 - 2,
+  "set_row -> -2 for r == rows (was a write onto the NEXT matrix's header)");
+assert_eq(ganita_mat_set_row(H23, 0 - 1, t_arr3(t_d(1), t_d(2), t_d(3))), 0 - 2,
+  "set_row -> -2 for a negative index (was a write into its OWN header)");
+assert_eq(ganita_mat_set_col(H23, 3, t_arr2(t_d(1), t_d(2))), 0 - 2, "set_col -> -2 for c == cols");
+assert_eq(ganita_mat_set_row(H23, 1, t_arr3(t_d(1), t_d(2), t_d(3))), 0, "set_row still works in range");
+assert_eq(t_dclose(ganita_mat_get(H23, 1, 2), t_d(3)), 1, "set_row wrote the right element");
+# row / col read, and were unchecked in the same way.
+assert_eq(ganita_mat_row(H23, 2), 0, "mat_row -> null for r == rows");
+assert_eq(ganita_mat_col(H23, 0 - 1), 0, "mat_col -> null for a negative index");
+assert_eq(ganita_mat_row(H23, 1) != 0, 1, "mat_row still works in range");
+
+# submatrix validated only the SIGN of the extent, never the window against the
+# source, so a window past the end copied a neighbouring allocation.
+assert_eq(ganita_mat_submatrix(H23, 0, 0, 3, 3), 0, "submatrix -> null for a window past the source");
+assert_eq(ganita_mat_submatrix(H23, 0 - 1, 0, 2, 2), 0, "submatrix -> null for a negative origin");
+assert_eq(ganita_mat_submatrix(H23, 0, 0, 0, 0), 0, "submatrix -> null for an empty range");
+assert_eq(ganita_mat_submatrix(H23, 0, 0, 2, 2) != 0, 1, "submatrix still works for a window inside the source");
+
+# trace / lu / det / inv / cholesky took n from the ROW count and read n*n
+# elements out of a store holding only rows*cols.
+assert_eq(t_f64_is_nan(ganita_mat_trace(H32)), 1, "trace -> NaN for a non-square (was an OOB diagonal walk)");
+assert_eq(t_dclose(ganita_mat_trace(ganita_mat_identity(3)), t_d(3)), 1, "trace still works on a square matrix");
+assert_eq(ganita_mat_lu(H32, ganita_mat_new(3, 3), alloc(24)), 0, "mat_lu -> 0 for a non-square input");
+assert_eq(t_f64_is_nan(ganita_mat_det(H32)), 1, "det -> NaN for a non-square input");
+assert_eq(ganita_mat_inv(H32), 0, "inv -> null for a non-square input");
+assert_eq(ganita_mat_cholesky(H32, ganita_mat_new(3, 3)), 0, "cholesky -> 0 for a non-square input");
+
+# gaussian_elim indexes column n on an n-row matrix; an n x n argument wrote one
+# element past the store on every row and still returned 1.
+assert_eq(ganita_mat_gaussian_elim(H22), 0, "gaussian_elim -> 0 for an n x n argument (was an OOB write)");
+
+# least_squares back-substitutes from row cols-1, so a wide design read past qtb
+# and R and returned 0 with out_x full of NaN.
+assert_eq(ganita_mat_least_squares(H23, t_arr2(t_d(1), t_d(2)), alloc(24)), 0 - 2,
+  "least_squares -> -2 for an under-determined system (was OOB, then success with NaN)");
+
+# The SVD family documents m >= n and never enforced it; pseudo_inv returned
+# something that was not the Moore-Penrose pseudoinverse at all for a wide input.
+assert_eq(ganita_mat_svd(H23, ganita_mat_new(2, 3), alloc(24), ganita_mat_new(3, 3)), 0 - 2,
+  "svd -> -2 for a wide matrix");
+assert_eq(ganita_mat_rank(H23, t_tol()), 0 - 2, "rank -> -2 for a wide matrix");
+assert_eq(t_f64_is_nan(ganita_mat_condition(H23)), 1, "condition -> NaN for a wide matrix");
+assert_eq(ganita_mat_pseudo_inv(H23), 0, "pseudo_inv -> null for a wide matrix");
+assert_eq(ganita_mat_rank(H32, f64_neg(t_tol())), 0 - 2, "rank -> -2 for a negative tolerance");
+# eigen_sym requires a square input and an n x n out_vecs.
+assert_eq(ganita_mat_eigen_sym(H23, alloc(24), ganita_mat_new(3, 3)), 0 - 2,
+  "eigen_sym -> -2 for a non-square input (was a write past its working copy)");
+assert_eq(ganita_mat_eigen_sym(H22, alloc(16), ganita_mat_new(3, 3)), 0 - 2,
+  "eigen_sym -> -2 when out_vecs is not n x n");
+
+test_group("hardening: NaN fails CLOSED, and semi-definite is not definite (1.2.3)");
+# ⭐ mat_eq is the comparison tool this suite uses to check the decompositions.
+# Every f64 comparison is false against a NaN, so `if (diff > tol) return 0;`
+# never fired and the loop fell through to `return 1`: an all-NaN matrix
+# compared EQUAL to the identity, and a solver that returned NaN would have been
+# certified correct by its own suite. That is why this one is starred.
+var NANM = ganita_mat_new(2, 2);
+var NANV = f64_div(t_d(0), t_d(0));
+ganita_mat_set(NANM, 0, 0, NANV); ganita_mat_set(NANM, 0, 1, NANV);
+ganita_mat_set(NANM, 1, 0, NANV); ganita_mat_set(NANM, 1, 1, NANV);
+assert_eq(t_f64_is_nan(ganita_mat_get(NANM, 0, 0)), 1, "the NaN fixture really holds NaN");
+assert_eq(ganita_mat_eq(NANM, I2, t_tol()), 0, "mat_eq: an all-NaN matrix is NOT equal to the identity");
+assert_eq(ganita_mat_eq(NANM, NANM, t_tol()), 0, "mat_eq: NaN is not even equal to itself");
+assert_eq(ganita_mat_is_symmetric(NANM, t_tol()), 0, "is_symmetric: an all-NaN matrix is NOT symmetric");
+assert_eq(ganita_mat_eq(I2, I2, t_tol()), 1, "mat_eq still reports genuinely equal matrices as equal");
+assert_eq(ganita_mat_eq(0, I2, t_tol()), 0, "mat_eq -> 0 for a null operand");
+
+# Cholesky's pivot guard was `diag < 0`, strictly less than, so a pivot of
+# exactly zero passed: [1 2; 2 4] is symmetric with det 0 and eigenvalues 0 and
+# 5 — positive SEMI-definite, which is not positive-definite — and it returned 1
+# with a zero on L's diagonal, after which cholesky_solve divided by that zero
+# and returned success having written NaN.
+var SEMI = t_m2(t_d(1), t_d(2), t_d(2), t_d(4));
+var SEMIL = ganita_mat_new(2, 2);
+assert_eq(ganita_mat_cholesky(SEMI, SEMIL), 0,
+  "cholesky -> 0 for a positive-SEMI-definite matrix (semi-definite is not definite)");
+var ZEROM = ganita_mat_new(2, 2);
+assert_eq(ganita_mat_cholesky(ZEROM, ganita_mat_new(2, 2)), 0, "cholesky -> 0 for the zero matrix");
+assert_eq(ganita_mat_cholesky(NANM, ganita_mat_new(2, 2)), 0, "cholesky -> 0 for a NaN diagonal");
+# The genuinely definite case is untouched, and so is the strictly-indefinite one.
+var PD = t_m2(t_d(4), t_d(1), t_d(1), t_d(3));
+var PDL = ganita_mat_new(2, 2);
+assert_eq(ganita_mat_cholesky(PD, PDL), 1, "cholesky still succeeds on a positive-definite matrix");
+assert_eq(ganita_mat_eq(ganita_mat_mul(PDL, ganita_mat_transpose(PDL)), PD, t_tol()), 1,
+  "cholesky: L * L^T = A for the definite case");
+assert_eq(ganita_mat_cholesky(t_m2(t_d(1), t_d(3), t_d(3), t_d(1)), ganita_mat_new(2, 2)), 0,
+  "cholesky -> 0 for a strictly indefinite matrix (the pre-1.2.3 guard caught this one)");
 
 test_group("linalg: symmetric eigendecomposition (Jacobi)");
 # [[2,1],[1,2]] has eigenvalues 3 and 1, eigenvectors (1,1)/sqrt2 and (1,-1)/sqrt2.
@@ -654,6 +756,70 @@ assert_eq(t_dclose(ganita_mat_condition(SING), t_d(0 - 1)), 1,
   "condition of a singular matrix = -1 (documented sentinel)");
 # cond = sigma_max / sigma_min, and it is >= 1 for anything well-formed.
 assert_eq(f64_ge(ganita_mat_condition(A2), t_d(1)), 1, "condition >= 1 for a non-singular matrix");
+
+test_group("hardening: math domains and overflow (1.2.3)");
+# ⭐ asinh was only correct for x >= 0. It is an ODD function, so |asinh(-x)|
+# must equal asinh(x) — but ln(x + sqrt(x*x+1)) at a negative x subtracts two
+# nearly equal quantities and the significant digits cancel. Below about -2^26
+# the sum rounded to 0 and the answer was -inf; below -1.34e154 the x*x
+# overflowed first and the answer came back +inf, wrong in SIGN as well.
+# Oddness is the assertion that discriminates, and it is checked bit-for-bit
+# across all three regimes of the implementation.
+assert_eq(ganita_f64_asinh(f64_neg(t_d(1))), f64_neg(ganita_f64_asinh(t_d(1))),
+  "asinh is odd at x = 1 (bit-exact)");
+assert_eq(ganita_f64_asinh(f64_neg(t_d(10))), f64_neg(ganita_f64_asinh(t_d(10))),
+  "asinh is odd at x = 10 (the cancellation regime)");
+var ABIG = f64_mul(t_d(1000000000), t_d(1000000000));
+assert_eq(ganita_f64_asinh(f64_neg(ABIG)), f64_neg(ganita_f64_asinh(ABIG)),
+  "asinh is odd at x = 1e18 (was +inf, wrong in sign)");
+var ATINY = f64_div(t_d(1), t_d(1000000000000000000));
+assert_eq(ganita_f64_asinh(f64_neg(ATINY)), f64_neg(ganita_f64_asinh(ATINY)),
+  "asinh is odd at x = 1e-18 (the underflow regime)");
+# Values, not just symmetry: asinh(1) = ln(1 + sqrt 2), asinh(1e18) ~ 42.1396788545.
+assert_eq(t_dclose(ganita_f64_asinh(t_d(1)), f64_ln(f64_add(t_d(1), f64_sqrt(t_d(2))))), 1,
+  "asinh(1) = ln(1 + sqrt 2)");
+assert_eq(t_dclose(ganita_f64_asinh(ABIG), f64_add(f64_ln(ABIG), f64_ln(t_d(2)))), 1,
+  "asinh(1e18) = ln(x) + ln 2 and is FINITE (was +inf)");
+# asinh(tiny) = tiny. The general form computes ln(1 + tiny) as ln(1.0) = 0
+# exactly, so everything below ~1e-17 came back as a hard zero.
+assert_eq(ganita_f64_asinh(ATINY), ATINY, "asinh(1e-18) = 1e-18, not 0.0");
+assert_eq(ganita_f64_asinh(t_d(0)), t_d(0), "asinh(0) = 0");
+
+# ⭐ binomial's own comment claimed it used "symmetry + iterative multiply to
+# avoid overflow". Symmetry halves the multiplies; it does nothing about the
+# size of the answer. `result * (n - i)` wrapped i64 silently from n = 62 up and
+# returned plausible-looking wrong counts, sometimes negative.
+assert_eq(ganita_binomial(52, 5), 2598960, "binomial(52,5) = 2598960 (a poker hand)");
+assert_eq(ganita_binomial(61, 30), 232714176627630544, "binomial(61,30) is EXACT at the boundary");
+assert_eq(ganita_binomial(62, 31), 0 - 1,
+  "binomial(62,31) -> -1: the intermediate does not fit, so it refuses rather than wrapping");
+assert_eq(ganita_binomial(5, 2), 10, "binomial(5,2) = 10 unchanged");
+assert_eq(ganita_binomial(2, 5), 0, "binomial(k > n) = 0 unchanged");
+# The overflow test also bounds the loop: binomial(2^62, 2^61) used to run
+# min(k, n-k) = 2.3e18 times, about 560 years (CWE-834). It now returns at once.
+assert_eq(ganita_binomial(4611686018427387904, 2305843009213693952), 0 - 1,
+  "binomial(2^62, 2^61) -> -1 immediately (was an unbounded loop)");
+# Negative arguments used to skip the loop body and return 1.
+assert_eq(ganita_binomial(0 - 3, 2), 0 - 1, "binomial with a negative n -> -1 (was 1)");
+assert_eq(ganita_binomial(3, 0 - 2), 0 - 1, "binomial with a negative k -> -1 (was 1)");
+assert_eq(ganita_fibonacci(0 - 5), 0 - 1, "fibonacci(-5) -> -1 (was 1)");
+assert_eq(ganita_fibonacci(10), 55, "fibonacci(10) = 55 unchanged");
+
+# ⭐ f32 sine and cosine returned their ARGUMENT for |x| >= 2^63, because the
+# underlying f64 routine reduces only within the i64 range. sin is bounded to
+# [-1, 1] by definition, so returning 2^70 is not an approximation but a
+# category error — and roughly a quarter of the finite f32 exponent range sits
+# above 2^63.
+var BIGX = t_d(1);
+var bk = 0;
+while (bk < 70) { BIGX = f64_mul(BIGX, t_d(2)); bk = bk + 1; }
+var BIGF = f32_from(BIGX);
+assert_eq(t_is_nan(ganita_f32_sin(BIGF)), 1, "f32_sin(2^70) -> NaN (was the argument, 2^70)");
+assert_eq(t_is_nan(ganita_f32_cos(BIGF)), 1, "f32_cos(2^70) -> NaN (was the argument, 2^70)");
+# The ordinary range is untouched.
+assert_eq(t_dclose(f32_to(ganita_f32_sin(t_f32(0))), t_d(0)), 1, "f32_sin(0) = 0 unchanged");
+assert_eq(f64_lt(f64_abs(f32_to(ganita_f32_sin(t_f32(1)))), t_d(1)) , 1,
+  "f32_sin(1) is in range, as every in-range result must be");
 
 test_group("linalg/math: f64 pow domain (1.1.4)");
 # pow is exp(y * ln base); ln is undefined at and below zero, so every base <= 0

@@ -4,6 +4,198 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.3] — 2026-09-07 — P(-1) hardening sweep
+
+A full audit / refactor / hardening / optimization / security pass per the AGNOS
+first-party P(-1) process. Seven independent audit lenses over `src/`, each
+adversarially verified by a second pass whose default posture was *refuted*, and
+**every finding reproduced by a program that was built and run**: 90 confirmed,
+0 refuted outright, 6 downgraded, 3 upgraded. The full report, including
+everything deliberately NOT fixed and why, is
+[`docs/audit/2026-09-07-v1.2.3-audit.md`](docs/audit/2026-09-07-v1.2.3-audit.md).
+
+**260 → 322 assertions.** No public signature changed. Two return codes moved
+(below), and roughly twenty functions that used to accept an illegal argument now
+reject it.
+
+### Fixed — the out-of-bounds class
+
+ganita's defect profile turned out to be one sentence repeated across the API:
+**a function derives its loop bounds from one argument and never looks at the
+others.** In every case both arguments were matrices `ganita_mat_new` had
+accepted. At small sizes the result was a well-formed matrix containing a
+neighbouring allocation's bytes reinterpreted as f64 — no null, no error code,
+nothing to notice. At large sizes, SIGSEGV. That combination does not fail in
+testing and does fail in production.
+
+- **`ganita_mat_mul`** took its inner dimension from `cols(A)` and never read
+  `rows(B)`. Now `0` when they disagree.
+- **`ganita_mat_add` / `_sub`** took their shape from A and read B for
+  `rows(a)*cols(a)` words regardless of B's real size. Now `0` on a mismatch.
+- **`ganita_mat_set_row` / `_set_col`** accepted any index — an out-of-bounds
+  **write**: `r == rows` landed on the next allocation's `{rows, cols}` header,
+  and a negative index walked back into the target's own. Now `-2`.
+- **`ganita_mat_row` / `_col`** likewise, for reads. Now `0`.
+- **`ganita_mat_submatrix`** checked the *sign* of the extent but never the window
+  against the source. Now `0` for a window past the end or a negative origin.
+- **`ganita_mat_trace` / `_lu` / `_det` / `_inv` / `_cholesky`** took `n` from the
+  **row** count and indexed an `n × n` region of a store holding `rows*cols`. All
+  now require square input.
+- **`ganita_mat_gaussian_elim`** indexes column `n`; an `n × n` argument — the
+  shape a caller most plausibly reaches for, since every other solver here takes
+  one — wrote one element past the store on every row and returned `1`. Now
+  requires `n × (n+1)`.
+- **`ganita_mat_least_squares`** back-substitutes from row `cols-1`, so a wide
+  design read past `qtb` and `R` and returned **0 (success) with `out_x` full of
+  NaN**. Now `-2` for `m < n`.
+- **`ganita_mat_eigen_sym`** wrote `rows - cols` elements past its working copy for
+  a non-square input. Now `-2`.
+- **`ganita_mat_svd` / `_rank` / `_condition` / `_pseudo_inv`** documented
+  `m >= n` and enforced nothing. All now enforce it.
+- Null arguments were dereferenced throughout. Gated everywhere.
+
+Adding these preconditions makes most of 1.2.2's cap-driven allocation failures
+*structurally unreachable* — the only inputs that produced them are exactly the
+inputs now rejected. The allocation checks remain and still guard genuine OOM.
+
+### Fixed — correctness
+
+- ⭐ **`ganita_mat_eq` reported NaN as EQUAL, and it is the test suite's own
+  oracle.** Every f64 comparison is false against a NaN, so `if (diff > tol)
+  return 0;` never fired and the loop fell through to `return 1`: an all-NaN matrix
+  compared **equal to the identity**. A solver that returned NaN would have been
+  certified correct by the suite that exists to catch it. `ganita_mat_is_symmetric`
+  had the same shape. Both now fail closed.
+- ⭐ **`ganita_mat_cholesky` accepted positive-*semi*-definite input.** The guard
+  was `diag < 0`, strictly less than, so a zero pivot passed, `sqrt(0)` went onto
+  L's diagonal, and every later off-diagonal divided by it. `[1 2; 2 4]` returned
+  `1`, produced `L = [1 0; 2 0]`, and `cholesky_solve` then returned **0 (success)
+  having written NaN into every slot**. Now `<= 0`, NaN rejected explicitly, and
+  `cholesky_solve` additionally refuses a factor with a zero diagonal.
+- ⭐ **`ganita_f64_asinh` was only correct for `x >= 0`.** asinh is odd, but
+  `ln(x + sqrt(x²+1))` at negative `x` cancels catastrophically. Below `-2^26` it
+  returned `-inf`; below `-1.34e154` the `x*x` overflowed first and it returned
+  **`+inf` — wrong in sign as well as magnitude**. It also returned exactly `0.0`
+  for `|x| <= 1e-17`. Now computed on `|x|` and re-signed, with small- and
+  large-argument regimes; oddness holds **bit-exactly** in all three.
+- ⭐ **`ganita_binomial` wrapped i64 silently from `n = 62`**, while its own comment
+  claimed to "avoid overflow". Now returns `-1` rather than a plausible wrong
+  count; `binomial(61,30)` is exact. The same test bounds the loop —
+  `binomial(2^62, 2^61)` used to iterate 2.3 × 10¹⁸ times, about **560 years**
+  (CWE-834). `binomial` and `ganita_fibonacci` also rejected negative arguments,
+  which used to return `1`.
+- ⭐ **`ganita_f32_sin` / `_cos` returned their argument for `|x| >= 2^63`** —
+  roughly a quarter of the finite f32 exponent range. Sine is bounded to `[-1,1]`
+  by definition, so that is a category error, not an approximation. Now NaN.
+- **`ganita_mat_svd` discarded a non-convergent eigendecomposition** and reported
+  success on singular values from a matrix that was never diagonalised.
+- **`ganita_mat_rank`** rejects a negative or NaN tolerance.
+
+### Changed — one failure vocabulary
+
+Stated once at the top of `linalg.cyr` and recorded in
+[ADR 0001](docs/adr/0001-failure-vocabulary.md): null for matrix/array returns;
+negative for status returns (`-1` allocation, `-2` contract violation, `-3`
+non-convergence); **NaN** for f64 returns, because `det`'s `0.0` and
+`condition`'s `-1.0` are real answers about the matrix. `ganita_mat_lu` is the
+documented exception — its successes are `+1`/`-1`, so it has no negative to
+spend.
+
+⚠ **`ganita_mat_eigen_sym`'s non-convergence code moved `-1` → `-3`.** Safe to do
+now: the `-2` allocation code was itself only introduced at 1.2.2, the idiom
+everywhere is `>= 0` rather than a specific code, and the `dist/` fold had not yet
+been refolded downstream.
+
+### Optimized
+
+- ⚡ **`ganita_mat_eigen_sym` is O(n³), was O(n⁴).** It rescanned the whole upper
+  triangle before **every** rotation. A per-row maximum index makes the global
+  search one O(n) pass, with rows `p` and `q` recomputed after a rotation and
+  every other row repaired from its two changed entries. Ties break identically,
+  so the **pivot sequence is unchanged** — verified by running both
+  implementations in one process on identical matrices: same rotation count,
+  **bit-identical eigenvalues**, at every size.
+
+  | n | 1.2.2 | 1.2.3 | |
+  |---|---|---|---|
+  | 8 | 109 µs | 118 µs | 0.9× — bookkeeping exceeds the scan below n ≈ 20 |
+  | 40 | 25.4 ms | 13.7 ms | 1.9× |
+  | 120 | 1.55 s | 0.36 s | 4.3× |
+  | 200 | 11.53 s | 1.76 s | **6.5×** |
+
+  `rank`, `condition` and `pseudo_inv` all route through it, so the win is not
+  confined to callers who wanted eigenvalues.
+
+### Fixed — contracts and hygiene
+
+- **`ganita_mat_dot`'s doc blessed a shape it cannot read** — "Nx1 matrices or
+  flat arrays", while the body reads the pointer directly, so an `N×1` matrix had
+  its 16-byte header read as data. Doc corrected.
+- **`src/main.cyr` omitted `src/math_f32.cyr`** while calling itself the full
+  bundle, so the build gate and `cyrius vet` never saw 27 public functions. `vet`
+  now reports 12 deps, was 11.
+- **`GANITA_MAT_MAX_ELEMS`'s derivation comment was false** — it claimed to track
+  `ALLOC_MAX`, which cyrius v6.4.51 raised from 256 MiB to **2 GiB**. That drift is
+  why `least_squares`' internal Q hit the cap at `m = 5793` rather than 16383. The
+  cap was **not** raised (see the audit for why, including what happened when the
+  sweep tried); the comment now says it is a policy limit, not a derivation.
+- **`ganita_mat_eq`'s doc told callers to pass `LINALG_EPS`**, which reads `0`
+  until some decomposition lazily initialises it — so the same call answered
+  differently depending on history.
+- **`ganita_mat_get` / `_set` are now documented as unchecked by design**, with the
+  consequences named (CWE-125, CWE-787, and `r*cols + c` can itself wrap).
+
+### ⚠ The coverage figure was inflated and CI gated on it
+
+`cyrius coverage` credits a function whose name appears as a raw **substring**
+anywhere in the scanned text, **comments included**. Every `_compat` alias name is
+a substring of the canonical name it forwards to. Reproduced: appending **one
+comment line** naming an uncalled function moved the reported figure from
+**80 % to 82 %** — and `ci.yml` gated on `--min 80` with zero margin. The honest
+word-boundary count at 1.2.2 was **72/135 (53 %)**, and `_compat.cyr` was **4/53**,
+not the published 40/53.
+
+`scripts/coverage-honest.sh` now counts on word boundaries with comments
+stripped, and CI gates on **both** numbers — the tool's as a ratchet, the honest
+one as the figure to plan against. Neither was lowered to make a build green.
+
+### Added
+
+- **Five runnable examples** in [`docs/examples/`](docs/examples/), built and run
+  by CI on every push, so documentation that stops being true fails the gate
+  instead of quietly becoming a lie. Writing them found two of the findings above
+  independently.
+- `SECURITY.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md` — required by the
+  first-party layout, all absent.
+- `scripts/bench-history.sh` and the first `bench-history.csv` rows, with the
+  regime/floor discipline that keeps pre- and post-6.5.19 instrument readings from
+  being averaged together — which matters here, where f32 rows report 2–5 ns
+  against a ~1.3 µs measured timer floor.
+- Three `eigen_sym` sizes in `tests/ganita.bcyr`, so a regression to O(n⁴) shows up
+  as the largest size pulling away.
+- [ADR 0001](docs/adr/0001-failure-vocabulary.md), the audit report, and five issue
+  filings for what was deliberately deferred.
+
+### Documentation
+
+`README.md` claimed **"Status: 1.0.0"** and omitted the entire 27-function f32
+tier, so its documented consumption path pointed at a fold that SIGSEGVs on the
+case 1.2.2 fixed. `docs/guides/getting-started.md` told readers to add features by
+editing `src/main.cyr`, a 38-line smoke test. `docs/development/roadmap.md` was
+untouched `cyrius init` scaffold (`M1 — _Title_ (v0.2.0)`) at version 1.2.2. All
+three rewritten; the roadmap now carries real M0–M4 milestones, a v1.0-freeze
+checklist, and an explicit out-of-scope list.
+
+### Deferred, with reasons — see the audit
+
+`LINALG_EPS`'s absolute tolerance (HIGH — the library contradicts itself about
+whether a scaled matrix is singular); SVD via `AᵀA` squaring the condition number;
+QR skipping reflectors on small-magnitude matrices; f64 transcendental accuracy;
+f32 NaN/infinity semantics; the remaining performance items; and raising
+`GANITA_MAT_MAX_ELEMS`. Each is filed in
+[`docs/development/issues/`](docs/development/issues/) with its reproduction.
+
+
 ## [1.2.2] — 2026-09-07 — the least-squares SIGSEGV, and every unchecked allocation behind it
 
 Closes both open filings in `docs/development/issues/`. One was a **High**-severity

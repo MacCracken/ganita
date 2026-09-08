@@ -77,8 +77,49 @@ fn bench_least_squares(m, reps, handle): i64 {
     return 0;
 }
 
-# Bench entry point — harness floor, f32 native vs widened for mul and lerp, then
-# least-squares scaling.
+var BSEED = 12345;
+
+# Build an n x n symmetric matrix from a deterministic LCG. Same content every
+# run, so the eigen benchmark below measures the code and not the data.
+fn bench_sym_matrix(n): i64 {
+    BSEED = 12345;
+    var m = ganita_mat_new(n, n);
+    if (m == 0) { return 0; }
+    var i = 0;
+    while (i < n) {
+        var j = i;
+        while (j < n) {
+            BSEED = (BSEED * 1103515245 + 12345) & 0x7FFFFFFF;
+            var v = f64_div(f64_from(BSEED % 2000 - 1000), f64_from(97));
+            ganita_mat_set(m, i, j, v);
+            ganita_mat_set(m, j, i, v);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+# Time `reps` symmetric eigendecompositions of an n x n matrix.
+fn bench_eigen(n, reps, handle): i64 {
+    var m = bench_sym_matrix(n);
+    if (m == 0) { return 0 - 1; }
+    var vals = alloc(n * 8);
+    var vecs = ganita_mat_new(n, n);
+    if (vals == 0 || vecs == 0) { return 0 - 1; }
+    bench_batch_start(handle);
+    var i = 0;
+    while (i < reps) {
+        ganita_mat_eigen_sym(m, vals, vecs);
+        i = i + 1;
+    }
+    bench_batch_stop(handle, reps);
+    bench_report(handle);
+    return 0;
+}
+
+# Bench entry point — harness floor, f32 native vs widened for mul and lerp,
+# least-squares scaling, then the Jacobi eigensolver.
 fn main(): i64 {
     alloc_init();
     var b = bench_new("noop");
@@ -130,6 +171,18 @@ fn main(): i64 {
     bench_least_squares(1000, 20, bench_new("least_squares m=1000 n=3"));
     bench_least_squares(5793, 20, bench_new("least_squares m=5793 n=3 (was SIGSEGV)"));
     bench_least_squares(20000, 20, bench_new("least_squares m=20000 n=3 (was N/A)"));
+
+    # --- symmetric eigendecomposition (1.2.3): O(n^3), was O(n^4) ---------
+    # The pivot search is indexed rather than exhaustive as of 1.2.3, and these
+    # three sizes are here to keep it that way: the ratio between them should
+    # track n^3, and a return to n^4 shows up as the largest size pulling away.
+    # Measured on the 1.2.2 -> 1.2.3 change, same host, same matrices, with the
+    # eigenvalues verified bit-identical: n=40 25.4ms -> 13.7ms, n=120 1.55s ->
+    # 0.36s, n=200 11.53s -> 1.76s. Below about n=20 the index bookkeeping costs
+    # slightly more than the scan it replaces, which is the honest trade.
+    bench_eigen(20, 20, bench_new("eigen_sym n=20"));
+    bench_eigen(40, 10, bench_new("eigen_sym n=40"));
+    bench_eigen(80, 3, bench_new("eigen_sym n=80"));
     return 0;
 }
 

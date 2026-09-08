@@ -1,0 +1,171 @@
+# 05 — the single-precision tier, and the bit-pattern contract it keeps
+#
+#   cyrius build docs/examples/05-f32-tier.cyr /tmp/ex05 && /tmp/ex05
+#
+# THE REPRESENTATION. An f32 here is its IEEE-754 **single** bit pattern in the
+# LOW 32 bits of an i64, high 32 clear — the same convention cyrius's f32_from /
+# f32_to use. Every ganita_f32_* function takes and returns that form. It is not
+# an f64 that happens to be small; printing one with fmt_float requires f32_to
+# first, and the examples below always do.
+#
+# WHY THE TIER EXISTS. Every shape-level helper used to be f64-only, so f32 work
+# paid a widen-op-narrow round trip for operations that are one integer
+# instruction: f32_abs was f32_from(f64_abs(f32_to(x))) — three ops for a bit
+# clear. Requested by the ranga image-processing port, whose pixel loops are f32
+# throughout.
+
+include "lib/syscalls.cyr"
+include "lib/string.cyr"
+include "lib/alloc.cyr"
+include "lib/fmt.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/math.cyr"
+
+include "src/math_advanced.cyr"
+include "src/math_f32.cyr"
+
+# One-byte scratch for hex32, allocated in main. The compiler is single pass, so
+# this must be declared before the function that reads it.
+var HEXBUF = 0;
+
+# Print the low 32 bits of `v` as 0xXXXXXXXX. The raw pattern is the thing under
+# discussion in this file, so it is worth seeing directly.
+fn hex32(v): i64 {
+    syscall(1, 1, "0x", 2);
+    var shift = 28;
+    while (shift >= 0) {
+        var nib = (v >> shift) & 0xF;
+        var ch = 48 + nib;                    # '0'..'9'
+        if (nib > 9) { ch = 55 + nib; }       # 'A'..'F' — 65 + (nib - 10)
+        store8(HEXBUF, ch);
+        syscall(1, 1, HEXBUF, 1);
+        shift = shift - 4;
+    }
+    return 0;
+}
+
+# Print "  <f32 as decimal>  (<hex pattern>)".
+fn show_f32(v): i64 {
+    fmt_float(f32_to(v), 6);
+    syscall(1, 1, "  (", 3);
+    hex32(v);
+    syscall(1, 1, ")", 1);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    HEXBUF = alloc(8);
+    if (HEXBUF == 0) { println("alloc refused"); return 1; }
+
+    # --- TIER 0: arithmetic, in NATIVE single precision --------------------
+    # These are real addss / subss / mulss / divss: ONE rounding, in f32, per
+    # operation. They are not widen-compute-narrow.
+    println("Tier 0 — native single-precision arithmetic");
+    var third = f32_from(f64_div(f64_from(1), f64_from(3)));
+    var seven9 = f32_from(f64_div(f64_from(7), f64_from(9)));
+    syscall(1, 1, "  1/3 = ", 8); show_f32(third); println("");
+    syscall(1, 1, "  7/9 = ", 8); show_f32(seven9); println("");
+    syscall(1, 1, "  1/3 * 7/9 = ", 14); show_f32(ganita_f32_mul(third, seven9)); println("");
+
+    # ⭐ THE TEST THAT DISCRIMINATES. For a SINGLE +, -, * or /, widen-compute-
+    # narrow is correctly rounded — f64's 53 bits exceed 2*24+2, so double
+    # rounding cannot bite, and a one-op helper would be indistinguishable. It
+    # stops being true the moment you CHAIN: an f64 accumulator keeps precision
+    # f32 does not have. 2^24 + 1 is not representable in single, so the
+    # correctly-rounded f32 answer is 2^24 (ties-to-even) — while the widened
+    # form would give 2^24 + 1.
+    println("");
+    println("  2^24 + 1 in single precision (the native-vs-widened discriminator):");
+    var big = f32_from(f64_from(16777216));
+    var one = f32_from(f64_from(1));
+    syscall(1, 1, "    ganita_f32_add(2^24, 1) = ", 30);
+    fmt_float(f32_to(ganita_f32_add(big, one)), 1);
+    println("   (16777216 — ties-to-even, NOT 16777217)");
+    syscall(1, 1, "    widened f64 would give    ", 30);
+    fmt_float(f64_add(f32_to(big), f32_to(one)), 1);
+    println("   (16777217 — the precision f32 does not have)");
+
+    # --- the sign-magnitude trap -------------------------------------------
+    # ⚠ IEEE-754 IS SIGN-MAGNITUDE, NOT TWO'S COMPLEMENT. Raw patterns order
+    # correctly only among NON-NEGATIVE values. For two negatives the order
+    # REVERSES (-2.0 has a larger magnitude field than -1.0), and a negative
+    # always has bit 31 set so it compares HIGH against every positive.
+    #
+    # This is precisely the trap, because pixel data is non-negative: a naive
+    # unsigned compare passes every plausible test and is wrong the first time a
+    # consumer subtracts. ganita_f32_min/max/clamp apply the standard monotone
+    # transform (_f32_key) so one signed compare is correct across the range.
+    println("");
+    println("Sign-magnitude: why min/max are not a bare unsigned compare");
+    var n1 = f32_from(f64_from(0 - 1));
+    var n2 = f32_from(f64_from(0 - 2));
+    syscall(1, 1, "  -1.0 pattern ", 15); hex32(n1);
+    syscall(1, 1, "   -2.0 pattern ", 16); hex32(n2); println("");
+    syscall(1, 1, "  raw unsigned: -2.0 > -1.0?  ", 30);
+    fmt_int(n2 > n1);
+    println("   (1 = yes, and that is WRONG)");
+    syscall(1, 1, "  ganita_f32_min(-1, -2)   = ", 29);
+    show_f32(ganita_f32_min(n1, n2));
+    println("   (-2, correct)");
+    syscall(1, 1, "  ganita_f32_max(-1, 2)    = ", 29);
+    show_f32(ganita_f32_max(n1, f32_from(f64_from(2))));
+    println("   (2, correct — a negative must not compare high)");
+
+    # --- shape ops are pure bit work ----------------------------------------
+    println("");
+    println("Tier 1 — shape (abs/neg/sign are bit operations, no widening)");
+    syscall(1, 1, "  abs(-2.5)   = ", 16); show_f32(ganita_f32_abs(f32_from(f64_div(f64_from(0 - 5), f64_from(2))))); println("");
+    syscall(1, 1, "  neg(2.5)    = ", 16); show_f32(ganita_f32_neg(f32_from(f64_div(f64_from(5), f64_from(2))))); println("");
+    # sign returns an f32 PATTERN (-1.0f / 0.0f / +1.0f), not the integer -1/0/1
+    # — it lives in the f32 tier, so it speaks the tier's representation.
+    syscall(1, 1, "  sign(-2.5)  = ", 16); show_f32(ganita_f32_sign(f32_from(f64_div(f64_from(0 - 5), f64_from(2)))));
+    println("   (-1.0f as a pattern, not the integer -1)");
+
+    # round is half-to-EVEN, unlike C's roundf, which is half-away-from-zero.
+    # A porting hazard worth seeing rather than reading about.
+    println("");
+    println("  round is half-to-EVEN, NOT half-away-from-zero like C's roundf:");
+    syscall(1, 1, "    round(0.5) = ", 19); fmt_float(f32_to(ganita_f32_round(f32_from(f64_div(f64_from(1), f64_from(2))))), 1);
+    println("   (0, not 1)");
+    syscall(1, 1, "    round(1.5) = ", 19); fmt_float(f32_to(ganita_f32_round(f32_from(f64_div(f64_from(3), f64_from(2))))), 1);
+    println("   (2)");
+    syscall(1, 1, "    round(2.5) = ", 19); fmt_float(f32_to(ganita_f32_round(f32_from(f64_div(f64_from(5), f64_from(2))))), 1);
+    println("   (2, not 3 — this is the one that surprises)");
+
+    # --- sqrt is correctly rounded, not approximated -------------------------
+    println("");
+    syscall(1, 1, "sqrt(2) = ", 10); show_f32(ganita_f32_sqrt(f32_from(f64_from(2))));
+    println("   (0x3FB504F3 — the correctly-rounded single, not an approximation)");
+
+    # --- lerp rounds in single, three times ----------------------------------
+    # Through 1.1.x this computed a + (b - a) * t as one f64 expression rounded
+    # once at the end. It now rounds three times, in single, exactly as the same
+    # expression does in Rust or C — so results can differ from 1.1.x by 1 ULP,
+    # and the new ones are the single-precision answers.
+    println("");
+    var a = f32_from(f64_from(1));
+    var b = f32_from(f64_from(2));
+    var t = f32_from(f64_div(f64_from(1), f64_from(7)));
+    var direct = ganita_f32_lerp(a, b, t);
+    var composed = ganita_f32_add(a, ganita_f32_mul(ganita_f32_sub(b, a), t));
+    syscall(1, 1, "lerp(1, 2, 1/7)          = ", 27); show_f32(direct); println("");
+    syscall(1, 1, "add(a, mul(sub(b,a), t)) = ", 27); show_f32(composed); println("");
+    syscall(1, 1, "bit-identical: ", 15); fmt_int(direct == composed);
+    println("   (1 — lerp rounds where the composed form rounds, not once at the end)");
+
+    # --- results stay clean 32-bit patterns -----------------------------------
+    # The contract that propagates: every return has its high 32 bits clear. A
+    # function that leaked a dirty high half would poison every later compare.
+    println("");
+    var dirty = ganita_f32_add(third, seven9);
+    syscall(1, 1, "high 32 bits of a result are clear: ", 36);
+    fmt_int((dirty >> 32) == 0);
+    println("   (1 = the representation contract holds)");
+
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

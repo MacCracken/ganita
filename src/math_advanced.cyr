@@ -172,10 +172,39 @@ fn ganita_f64_atan2(y, x): i64 {
 #   atanh: |x| < 1.     At ±1 the ln diverges; outside domain it
 #                       propagates NaN via ln of a negative.
 
-# asinh(x) = ln(x + √(x² + 1))
+# asinh(x) = ln(x + √(x² + 1)), computed on |x| and re-signed.
+#
+# ⚠ THE NAIVE FORM IS ONLY CORRECT FOR x >= 0, and through 1.2.2 that is what
+# shipped. asinh is odd, so |asinh(-x)| must equal asinh(x) — but evaluating
+# `ln(x + sqrt(x*x + 1))` directly at a negative x subtracts two nearly equal
+# quantities (for x = -10 the sum is 0.0499, from operands near 10), so the
+# significant digits cancel and what is left is rounding noise. Below about
+# -2^26 the sum rounds to exactly 0 and the result is -inf; below -1.34e154 the
+# x*x overflows to +inf first and the answer comes back +inf, wrong in sign as
+# well as magnitude. Computing on |x| and negating avoids every cancellation.
+#
+# Three regimes, and the outer two exist because the middle one breaks:
+#   |x| < 1e-8      -> x. The series is x - x^3/6 + ..., and x^3/6 is below half
+#                      a ulp of x there, so x IS the correctly-rounded answer.
+#                      The general form computes ln(1 + tiny) as ln(1.0) = 0
+#                      EXACTLY, so it returned 0.0 for every |x| <= 1e-17.
+#   |x| > 2^26      -> ln(|x|) + ln 2, since sqrt(x^2+1) -> |x| to well within
+#                      an ulp there and x*x would otherwise overflow.
+#   otherwise       -> the direct form, which is accurate on the positive side.
 fn ganita_f64_asinh(x): i64 {
-    var x2_plus_1 = f64_add(f64_mul(x, x), F64_ONE);
-    return f64_ln(f64_add(x, f64_sqrt(x2_plus_1)));
+    var a = f64_abs(x);
+    var r = f64_from(0);
+    if (f64_lt(a, f64_div(f64_from(1), f64_from(100000000))) == 1) {
+        r = a;
+    } else {
+        if (f64_gt(a, f64_from(67108864)) == 1) {
+            r = f64_add(f64_ln(a), f64_ln(f64_from(2)));
+        } else {
+            r = f64_ln(f64_add(a, f64_sqrt(f64_add(f64_mul(a, a), F64_ONE))));
+        }
+    }
+    if ((x >> 63) & 1 == 1) { return f64_neg(r); }
+    return r;
 }
 
 # acosh(x) = ln(x + √(x² − 1)), x ≥ 1
@@ -198,6 +227,10 @@ fn ganita_f64_hypot(x, y): i64 {
 
 # Fibonacci number (iterative). Returns -1 if n > 92 (overflow).
 fn ganita_fibonacci(n): i64 {
+    # A negative index has no value here; through 1.2.2 it fell past the n == 0
+    # test, skipped the `while (i <= n)` body entirely, and returned b = 1 —
+    # fibonacci(-5) = 1, with no diagnostic.
+    if (n < 0) { return 0 - 1; }
     if (n == 0) { return 0; }
     if (n > 92) { return 0 - 1; }
     var a = 0;
@@ -212,14 +245,36 @@ fn ganita_fibonacci(n): i64 {
     return b;
 }
 
-# Binomial coefficient C(n, k). Uses symmetry + iterative multiply to avoid overflow.
+# Binomial coefficient C(n, k), exact in i64. Returns 0 when k > n, and -1 for a
+# negative argument or when the true value does not fit in i64.
+#
+# ⚠ "Uses symmetry + iterative multiply to avoid overflow" — what the comment
+# said through 1.2.2 — was FALSE, and it is the kind of false that a caller acts
+# on. The symmetry step halves the number of multiplies; it does nothing about
+# the size of the answer. C(62,31) is 465,428,353,255,261,088, which fits, but
+# `result * (n - i)` on the way there does not: the product wrapped i64 silently
+# and the function returned a plausible-looking wrong count, sometimes negative.
+# From n = 62 upward the results were unreliable with no signal of any kind.
+#
+# The pre-multiply overflow test also bounds the loop. CWE-834 (uncontrolled
+# iteration) was reachable before: binomial(2^62, 2^61) has min(k, n-k) = 2^61,
+# so the loop ran 2.3 quintillion times — roughly 560 years — with nothing to
+# stop it. Now `result` exceeds the limit within the first few iterations and it
+# returns -1 immediately.
 fn ganita_binomial(n, k): i64 {
+    if (n < 0 || k < 0) { return 0 - 1; }
     if (k > n) { return 0; }
     if (k > n - k) { k = n - k; }
     var result = 1;
     var i = 0;
     while (i < k) {
-        result = result * (n - i) / (i + 1);
+        var factor = n - i;
+        # result * factor would wrap. Tested by division, which cannot itself
+        # overflow; factor is >= 1 here because i < k <= n - k <= n.
+        if (result > 0x7FFFFFFFFFFFFFFF / factor) { return 0 - 1; }
+        # Exact at every step: the running product of j consecutive integers is
+        # always divisible by j!, so this division has no remainder.
+        result = result * factor / (i + 1);
         i = i + 1;
     }
     return result;

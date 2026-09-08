@@ -2,9 +2,25 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-09-07.
+> Last refreshed: 2026-09-07 (P(-1) sweep).
 
 ## Version
+
+**1.2.3** — **P(-1) hardening sweep.** Seven audit lenses over `src/`, each
+adversarially verified, every finding reproduced by a program that was built and
+run: **90 confirmed**, 0 refuted. The profile was uniform — *a function derives
+its loop bounds from one argument and never looks at the others* — and it
+produced out-of-bounds reads and writes across roughly twenty functions, all on
+matrices `ganita_mat_new` had accepted. Closed the class. Also: `mat_eq`
+reported NaN as **equal**, and it is the suite's own oracle; `cholesky` accepted
+semi-definite input and then produced NaN through `cholesky_solve` while
+reporting success; `asinh` was wrong in **sign** for large negative x; `binomial`
+wrapped i64 from n=62 and could loop for 560 years; `f32_sin`/`_cos` returned
+their argument above 2^63. `eigen_sym` is now **O(n³), was O(n⁴)** — 6.5× at
+n=200 with bit-identical eigenvalues. One failure vocabulary
+([ADR 0001](../adr/0001-failure-vocabulary.md)); `eigen_sym`'s non-convergence
+code moved -1 → -3. 322 assertions (was 260). Full report:
+[`docs/audit/2026-09-07-v1.2.3-audit.md`](../audit/2026-09-07-v1.2.3-audit.md).
 
 **1.2.2** — the two open filings, closed. **`ganita_mat_least_squares` no longer
 forms an `m × m` Q**: it reached the solution through `ganita_mat_qr`, whose
@@ -130,16 +146,15 @@ operands whose product is not.
 
 | Module | Lines | Public fns | Canonical prefix |
 |--------|-------|-----------|------------------|
-| `src/linalg.cyr`        | 1126 | 26 | `ganita_mat_*` (extends matrix) |
-| `src/matrix.cyr`        | 208 | 14 | `ganita_mat_*` |
-| `src/math_advanced.cyr` | 226 | 13 | `ganita_f64_*` / `ganita_fibonacci` / `ganita_binomial` |
-| `src/math_f32.cyr`      | 200 | 27 | `ganita_f32_*` |
+| `src/linalg.cyr`        | 1404 | 26 | `ganita_mat_*` (extends matrix) |
+| `src/matrix.cyr`        | 268 | 14 | `ganita_mat_*` |
+| `src/math_advanced.cyr` | 281 | 13 | `ganita_f64_*` / `ganita_fibonacci` / `ganita_binomial` |
+| `src/math_f32.cyr`      | 239 | 27 | `ganita_f32_*` |
 
 - `src/_compat.cyr` — 53 back-compat aliases (legacy names → `ganita_*`).
   Single-pass order: matrix → linalg → math_advanced → math_f32 → `_compat`
   last, since its aliases reference every `ganita_*` symbol.
-- `dist/ganita.cyr` — 1,870 lines, regenerated via `cyrius distlib` at 1.2.2 on
-  6.6.0. This is the artifact folded into `cyrius/lib/ganita.cyr`. Regeneration
+- `dist/ganita.cyr` — regenerated via `cyrius distlib` at 1.2.3 on 6.6.0. This is the artifact folded into `cyrius/lib/ganita.cyr`. Regeneration
   is idempotent.
 - `dist/ganita.deps` — 10 stdlib leaves: `syscalls string alloc fmt vec str math
   io assert bench`. Verified sufficient by `scripts/consumer-check.sh` (`str` is
@@ -150,8 +165,9 @@ operands whose product is not.
 - `tests/ganita.tcyr` — matrix dims + identity + **CWE-190 dimension guard** +
   binomial/fibonacci + `f64_tanh` saturation + alias parity + **the full f32
   tier** (1.1.2) + **the full linalg surface** (1.1.3) + **the least-squares
-  regression and the allocation-failure contract** (1.2.2). **260 assertions,
-  green** on 6.6.0.
+  regression and the allocation-failure contract** (1.2.2) + **the shape/range
+  preconditions, NaN-fails-closed, and the math domain fixes** (1.2.3).
+  **322 assertions, green** on 6.6.0.
 
   The linalg block asserts **properties**, not transcribed outputs — `A·A⁻¹ = I`,
   `Qᵀ·Q = I`, `L·Lᵀ = A`, `U·Σ·Vᵀ = A`, `Σλ = trace`, `Πλ = det`, `Πσ = |det|`,
@@ -191,17 +207,44 @@ operands whose product is not.
 
 ### Coverage
 
-`cyrius coverage` — **109/135 fns (80%)**, 7/7 files referenced (22/131 and 4/7
-before 1.1.2). A floor, not a correctness proof, but the two carved tiers are
-now fully exercised in-repo:
+⚠ **`cyrius coverage` over-reports, and the CI gate used to sit on it.** The tool
+credits a function whose name appears as a raw **substring** anywhere in the
+scanned text, **comments included**. Every `_compat.cyr` alias name is a proper
+substring of the canonical name it forwards to, so exercising `ganita_mat_sub`
+silently credits `mat_sub` and `ganita_mat_submatrix` credits both. Reproduced
+during the 1.2.3 sweep: appending **one comment line** naming `ganita_mat_print(`
+— called nowhere in the repo — moved the reported total from 109/135 (80 %) to
+111/135 (82 %). At 1.2.2 `ci.yml` gated on `--min 80` against a reported 80:
+**zero margin, held up by the artifact.**
+
+Two figures are now tracked, and CI gates on **both**:
+
+| | 1.2.2 | 1.2.3 | gate |
+|---|---|---|---|
+| `cyrius coverage` (substring) | 109/135 (80 %) | **115/135 (85 %)** | `--min 85` |
+| `scripts/coverage-honest.sh` (word boundary, comments stripped) | 72/135 (**53 %**) | **77/142 (54 %)** | `54` |
+
+The honest count is the one to plan against. The tool's is kept as a ratchet
+because it sees things a regex does not — but it is not the only gate, because it
+is a number a comment can move.
+
+Per module, honest count at 1.2.3 (the denominator now includes the private
+helpers added by the sweep):
 
 | Module | Referenced |
 |---|---|
-| `linalg.cyr`        | **26/26** |
-| `math_f32.cyr`      | **27/27** |
-| `matrix.cyr`        | 10/14 |
-| `_compat.cyr`       | 40/53 |
-| `math_advanced.cyr` | 4/13 |
+| `math_f32.cyr`      | 27/29 |
+| `linalg.cyr`        | 26/29 |
+| `matrix.cyr`        | 12/14 |
+| `math_advanced.cyr` | 5/15 |
+| `_compat.cyr`       | **5/53** |
+
+**`_compat.cyr` was published as 40/53 and is really 5/53.** Anyone planning the
+alias removal against "75 % exercised" was planning against nothing. All 53 were
+re-verified by hand during the sweep to forward verbatim with matching arity and
+argument order, so the risk is low — but it is untested, not tested.
+`math_advanced.cyr` at 5/15 remains the largest genuinely dark public surface,
+and it is exactly the module whose defects have historically been *silent*.
 
 ## CI
 
@@ -226,17 +269,41 @@ sweep. Three properties worth remembering when editing it:
   auto-prepends everything in `[deps].stdlib`, so a consumer missing a declared
   leaf still compiles and the check passes vacuously.
 
-Gates: pin-drift · version consistency · `lib/` vs snapshot · format (src and
-tests) · lint · vet · build with 0 warnings · smoke exits 42 · test · fuzz ·
-bench · `coverage --min 80` · `distlib --all --check` · regeneration leaves no
-tree diff · consumer-check.
+Gates (20 steps as of 1.2.3): pin-drift · version consistency · `lib/` vs
+snapshot · format (src, tests **and examples**) · lint · vet · build with 0
+warnings · smoke exits 42 · test · fuzz · bench · `coverage --min 85` ·
+**`coverage-honest.sh 54`** · `distlib --all --check` · regeneration leaves no
+tree diff · consumer-check · **examples build and run**.
+
+Two of those are new at 1.2.3 and both exist because a gate was measuring the
+wrong thing:
+
+- **`coverage-honest.sh`** — `cyrius coverage` counts substrings including
+  comments, so one comment line moved the old `--min 80` gate from 80 % to 82 %.
+  Both figures are now gated; see Coverage above.
+- **Examples build and run** — five real programs against the real API. Without
+  it, an example that stopped being true would just sit there being wrong.
 
 ## Open filings
 
-**None.** `docs/development/issues/` holds only `archived/` and `repros/` as of
-1.2.2. The last two closed together: the `ganita_mat_least_squares` null write
-(fixed here — see the Version note) and `fmt_float`'s dropped carry (fixed upstream
-at cyrius 6.5.30, arrived with 1.2.1's re-vendor, no ganita change). The repro
+**Five**, all opened by the 1.2.3 P(-1) sweep, all reproduced, all deliberately
+deferred rather than rushed into a hardening patch. Reasons are in each file and
+summarised in [the audit](../audit/2026-09-07-v1.2.3-audit.md).
+
+| Severity | Filing | Why deferred |
+|---|---|---|
+| **HIGH** | [`linalg-eps-absolute-tolerance`](issues/2026-09-07-linalg-eps-absolute-tolerance.md) | Changes what "singular" MEANS across 11 functions; needs its own release and a decision on whether the tolerance becomes a parameter |
+| MEDIUM | [`svd-via-ata-squares-condition`](issues/2026-09-07-svd-via-ata-squares-condition.md) | A replacement algorithm (one-sided Jacobi), not a repair |
+| MEDIUM | [`f64-transcendental-accuracy`](issues/2026-09-07-f64-transcendental-accuracy.md) | Series expansions and scaled reformulations — numerics work, not hardening |
+| MEDIUM | [`f32-nan-inf-edges`](issues/2026-09-07-f32-nan-inf-edges.md) | Contract *decisions* about NaN/inf semantics, plus new public API |
+| MEDIUM | [`performance-backlog`](issues/2026-09-07-performance-backlog.md) | Measured, ranked; includes raising `GANITA_MAT_MAX_ELEMS` |
+
+The LINALG_EPS one is the one to read. An absolute 1e-12 makes the library
+**contradict itself**: scale a well-conditioned matrix down by 1e-6 and `det`,
+`inv` and `condition` call it singular while `rank` calls it full rank.
+
+Closed at 1.2.2 and kept as history: the `ganita_mat_least_squares` null write and
+`fmt_float`'s dropped carry (fixed upstream at cyrius 6.5.30). The repro
 `repros/2026-08-23-least-squares-unchecked-q-alloc.cyr` stays as a regression
 witness: exit 139 on 1.1.4 … 1.2.1, exit 0 from 1.2.2.
 

@@ -9,12 +9,31 @@
 
 # Maximum element count (rows*cols) for a dense matrix. The backing store is
 # `16 + rows*cols*8` bytes, and stdlib `alloc` rejects any single request over
-# ALLOC_MAX (0x10000000 = 256 MB), so the largest allocatable matrix holds
-# (ALLOC_MAX - 16) / 8 = 33_554_430 elements. Capping rows*cols at this value
-# (checked via a division that can't itself overflow) guarantees the size
-# expression never wraps i64 — the CWE-190 that a wrapped, undersized `alloc`
-# followed by a full-length `rows*cols` zero-fill would turn into a heap
-# overflow. Kept in step with alloc.cyr's ALLOC_MAX.
+# ALLOC_MAX, so the largest allocatable matrix holds (ALLOC_MAX - 16) / 8
+# elements. Capping rows*cols at this value (checked via a division that can't
+# itself overflow) guarantees the size expression never wraps i64 — the CWE-190
+# that a wrapped, undersized `alloc` followed by a full-length `rows*cols`
+# zero-fill would turn into a heap overflow.
+#
+# ⚠ THIS IS NO LONGER (ALLOC_MAX - 16) / 8, AND THAT IS DELIBERATE AS OF 1.2.3.
+# The value 33,554,430 was derived from ALLOC_MAX = 0x10000000 (256 MiB). cyrius
+# v6.4.51 raised ALLOC_MAX to 0x80000000 (2 GiB); this constant did not follow,
+# and until 1.2.3 the comment here still claimed it was "kept in step", which was
+# simply false. The drift had a consequence: it is why ganita_mat_least_squares'
+# internal m x m Q hit the cap at m = 5793 rather than m = 16383 — the SIGSEGV
+# 1.2.2 fixed.
+#
+# The cap was NOT raised to the re-derived 268,435,454, because that is a
+# capability change wearing a hardening change's clothes:
+#   - one such matrix is 2 GiB, i.e. the ENTIRE ALLOC_MAX, so allocating it
+#     succeeds only by leaving nothing for the working factors every
+#     decomposition here needs;
+#   - ganita_mat_eigen_sym is O(n^4) per sweep, so matrices within an order of
+#     magnitude of the cap are already computationally out of reach;
+#   - and it silently multiplies by 8 the memory a single call can demand of
+#     every existing consumer.
+# The number below is a deliberate policy limit, not a derivation. Raising it is
+# tracked separately — see docs/audit/2026-09-07-v1.2.3-audit.md.
 var GANITA_MAT_MAX_ELEMS = 33554430;
 
 # Create a zero-filled rows x cols matrix. Returns 0 (null) for non-positive
@@ -42,13 +61,24 @@ fn ganita_mat_rows(m): i64 { return load64(m); }
 # Get number of columns
 fn ganita_mat_cols(m): i64 { return load64(m + 8); }
 
-# Get element at (row, col) — returns f64 bit pattern
+# Get element at (row, col) — returns f64 bit pattern.
+#
+# ⚠ UNCHECKED BY DESIGN, and the only function pair here that is. This computes
+# `m + 16 + (r*cols + c)*8` and dereferences it with no bounds test, because it
+# sits inside every inner loop in linalg.cyr and a per-element branch there is
+# measurable where a per-call one is not. Two consequences a caller owns:
+# an out-of-range (r, c) is an out-of-bounds read (CWE-125), and for very large
+# r the product `r * cols + c` can itself wrap i64 (CWE-190) and land anywhere.
+# Validate `0 <= r < rows` and `0 <= c < cols` yourself before indexing from
+# untrusted input. See SECURITY.md.
 fn ganita_mat_get(m, r, c): i64 {
     var cols = load64(m + 8);
     return load64(m + 16 + (r * cols + c) * 8);
 }
 
-# Set element at (row, col) — value is f64 bit pattern
+# Set element at (row, col) — value is f64 bit pattern.
+# ⚠ UNCHECKED BY DESIGN — see ganita_mat_get above. Out of range is an
+# out-of-bounds WRITE (CWE-787), which is strictly worse than the read.
 fn ganita_mat_set(m, r, c, val): i64 {
     var cols = load64(m + 8);
     store64(m + 16 + (r * cols + c) * 8, val);
@@ -81,11 +111,17 @@ fn ganita_mat_from(rows, cols, data): i64 {
     return m;
 }
 
-# Matrix addition: C = A + B (returns new matrix, or 0 if the result cannot be
-# allocated — propagates ganita_mat_new's null).
+# Matrix addition: C = A + B (returns new matrix).
+# Returns 0 for a null operand, for a SHAPE MISMATCH, or if the result cannot be
+# allocated. Through 1.2.2 the shape came from A alone and B was never inspected,
+# so a mismatched B was read for rows(a)*cols(a) words regardless of its real
+# size — a well-formed, correctly-shaped result full of a neighbouring object's
+# bytes reinterpreted as f64, or a SIGSEGV at scale.
 fn ganita_mat_add(a, b): i64 {
+    if (a == 0 || b == 0) { return 0; }
     var rows = ganita_mat_rows(a);
     var cols = ganita_mat_cols(a);
+    if ((ganita_mat_rows(b) != rows) || (ganita_mat_cols(b) != cols)) { return 0; }
     var c = ganita_mat_new(rows, cols);
     if (c == 0) { return 0; }
     var i = 0;
@@ -98,11 +134,14 @@ fn ganita_mat_add(a, b): i64 {
     return c;
 }
 
-# Matrix subtraction: C = A - B (returns new matrix, or 0 if the result cannot
-# be allocated — propagates ganita_mat_new's null).
+# Matrix subtraction: C = A - B (returns new matrix).
+# Returns 0 for a null operand, for a shape mismatch, or on allocation failure.
+# Same out-of-bounds read as ganita_mat_add through 1.2.2.
 fn ganita_mat_sub(a, b): i64 {
+    if (a == 0 || b == 0) { return 0; }
     var rows = ganita_mat_rows(a);
     var cols = ganita_mat_cols(a);
+    if ((ganita_mat_rows(b) != rows) || (ganita_mat_cols(b) != cols)) { return 0; }
     var c = ganita_mat_new(rows, cols);
     if (c == 0) { return 0; }
     var i = 0;
@@ -118,6 +157,7 @@ fn ganita_mat_sub(a, b): i64 {
 # Scalar multiply: C = A * scalar (returns new matrix, or 0 if the result cannot
 # be allocated — propagates ganita_mat_new's null).
 fn ganita_mat_scale(a, scalar): i64 {
+    if (a == 0) { return 0; }
     var rows = ganita_mat_rows(a);
     var cols = ganita_mat_cols(a);
     var c = ganita_mat_new(rows, cols);
@@ -131,12 +171,23 @@ fn ganita_mat_scale(a, scalar): i64 {
 }
 
 # Matrix multiply: C = A * B (returns new matrix, A is m×k, B is k×n → C is m×n).
-# Returns 0 if C cannot be allocated — note m×n can exceed the cap even when
-# both operands are well inside it: an N×1 times a 1×N is 2N elements of input
-# for an N² result.
+#
+# Returns 0 for a null operand, when rows(B) != cols(A), or when C cannot be
+# allocated — note m×n can exceed the cap even when both operands are well
+# inside it: an N×1 times a 1×N is 2N elements of input for an N² result.
+#
+# The inner-dimension gate is new at 1.2.3. Through 1.2.2 the inner dimension k
+# came from cols(A) alone and rows(B) was never read, so the accumulation loop
+# walked B for k steps whatever B's real height was: silently folding a
+# neighbouring allocation into every element at small sizes, and SIGSEGV at
+# large ones. The check is one load and one compare per CALL, outside the
+# O(m*n*k) triple loop — it does not belong inside ganita_mat_get, which this
+# loop invokes twice per multiply-accumulate.
 fn ganita_mat_mul(a, b): i64 {
+    if (a == 0 || b == 0) { return 0; }
     var m = ganita_mat_rows(a);
     var k = ganita_mat_cols(a);
+    if (ganita_mat_rows(b) != k) { return 0; }
     var n = ganita_mat_cols(b);
     var c = ganita_mat_new(m, n);
     if (c == 0) { return 0; }
@@ -161,6 +212,7 @@ fn ganita_mat_mul(a, b): i64 {
 # Transpose: returns new matrix, or 0 if it cannot be allocated (propagates
 # ganita_mat_new's null).
 fn ganita_mat_transpose(a): i64 {
+    if (a == 0) { return 0; }
     var rows = ganita_mat_rows(a);
     var cols = ganita_mat_cols(a);
     var t = ganita_mat_new(cols, rows);
@@ -177,7 +229,14 @@ fn ganita_mat_transpose(a): i64 {
     return t;
 }
 
-# Dot product of two column vectors (Nx1 matrices or flat arrays of length N)
+# Dot product of two FLAT f64 arrays of length n — the form ganita_mat_row and
+# ganita_mat_col return.
+#
+# ⚠ NOT for matrices. Through 1.2.2 this doc said "Nx1 matrices or flat arrays",
+# but the body reads `load64(a + i*8)` from the pointer directly: handed an Nx1
+# matrix it reads the 16-byte {rows, cols} header as the first two elements and
+# every value shifted by two slots, returning a plausible wrong answer with no
+# diagnostic. Pass `m + 16` if you have a matrix, or use ganita_mat_col.
 fn ganita_mat_dot(a, b, n): i64 {
     var sum = f64_from(0);
     var i = 0;

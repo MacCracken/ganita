@@ -1,0 +1,150 @@
+# 01 — matrix basics: construction, access, arithmetic
+#
+#   cyrius build docs/examples/01-matrix-basics.cyr /tmp/ex01 && /tmp/ex01
+#
+# Every example carries its own include list, because cyrius skips the manifest
+# auto-prepend once a file has any include of its own. Order follows
+# [lib].modules: the compiler is single pass and linalg calls into matrix.
+#
+# The one habit worth taking from this file: ganita_mat_new RETURNS NULL rather
+# than aborting — for a non-positive dimension, for an element count past
+# GANITA_MAT_MAX_ELEMS, and for a plain allocation failure. Every constructor
+# below is checked. That is not defensive padding; it is the documented contract,
+# and ganita 1.2.2 fixed a SIGSEGV that existed only because one internal caller
+# skipped it.
+
+include "lib/syscalls.cyr"
+include "lib/string.cyr"
+include "lib/alloc.cyr"
+include "lib/fmt.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/math.cyr"
+
+include "src/matrix.cyr"
+include "src/linalg.cyr"
+
+# Print a matrix row by row with 4 decimals. ganita_mat_print exists but renders
+# hundredths as `v/100` integers; this is friendlier for a worked example.
+fn show(label, m): i64 {
+    println(label);
+    if (m == 0) {
+        println("  <null — allocation refused>");
+        return 0;
+    }
+    var rows = ganita_mat_rows(m);
+    var cols = ganita_mat_cols(m);
+    var i = 0;
+    while (i < rows) {
+        syscall(1, 1, "  [", 3);
+        var j = 0;
+        while (j < cols) {
+            syscall(1, 1, " ", 1);
+            fmt_float(ganita_mat_get(m, i, j), 4);
+            j = j + 1;
+        }
+        syscall(1, 1, " ]\n", 3);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    # --- construction ---------------------------------------------------
+    # A 2x3 matrix, zero-filled. Row-major, backed by one heap block laid out
+    # as { rows: i64, cols: i64, data: f64[rows*cols] }.
+    var a = ganita_mat_new(2, 3);
+    if (a == 0) { println("mat_new refused 2x3"); return 1; }
+    ganita_mat_set(a, 0, 0, f64_from(1)); ganita_mat_set(a, 0, 1, f64_from(2));
+    ganita_mat_set(a, 0, 2, f64_from(3));
+    ganita_mat_set(a, 1, 0, f64_from(4)); ganita_mat_set(a, 1, 1, f64_from(5));
+    ganita_mat_set(a, 1, 2, f64_from(6));
+    show("A (2x3):", a);
+
+    # ganita_mat_from builds the same thing from a flat row-major array.
+    var data = alloc(48);
+    if (data == 0) { println("alloc refused"); return 1; }
+    var k = 0;
+    while (k < 6) { store64(data + k * 8, f64_from(k + 1)); k = k + 1; }
+    var a2 = ganita_mat_from(2, 3, data);
+    if (a2 == 0) { println("mat_from refused"); return 1; }
+    syscall(1, 1, "mat_from == A: ", 15);
+    fmt_int(ganita_mat_eq(a, a2, f64_from(0)));
+    println("  (1 = identical)");
+
+    # --- the guard ------------------------------------------------------
+    # Dimensions are the library's real attack surface. mat_new checks that
+    # rows*cols stays under GANITA_MAT_MAX_ELEMS via a division that cannot
+    # itself overflow, so `16 + rows*cols*8` can never wrap i64 into a small
+    # alloc followed by a full-length zero fill.
+    println("");
+    println("Guarded constructors return 0, they do not abort:");
+    syscall(1, 1, "  mat_new(0, 5)          -> ", 28); fmt_int(ganita_mat_new(0, 5)); println("");
+    syscall(1, 1, "  mat_new(-1, 5)         -> ", 28); fmt_int(ganita_mat_new(0 - 1, 5)); println("");
+    syscall(1, 1, "  mat_new(33554431, 1)   -> ", 28); fmt_int(ganita_mat_new(33554431, 1)); println("");
+    syscall(1, 1, "  cap GANITA_MAT_MAX_ELEMS = ", 29); fmt_int(GANITA_MAT_MAX_ELEMS); println("");
+
+    # --- arithmetic -----------------------------------------------------
+    println("");
+    var i3 = ganita_mat_identity(3);
+    if (i3 == 0) { println("identity refused"); return 1; }
+    show("I3:", i3);
+
+    var at = ganita_mat_transpose(a);
+    if (at == 0) { println("transpose refused"); return 1; }
+    show("A^T (3x2):", at);
+
+    # A * I3 = A. Note mat_mul's result can exceed the cap even when both
+    # operands are well inside it — an Nx1 times a 1xN is 2N elements of input
+    # for an N^2 result — so its return is checked like any other.
+    var ai = ganita_mat_mul(a, i3);
+    if (ai == 0) { println("mul refused"); return 1; }
+    syscall(1, 1, "A * I3 == A: ", 13);
+    fmt_int(ganita_mat_eq(ai, a, f64_from(0)));
+    println("  (1 = identical, exact — multiplying by I adds no error)");
+
+    var sum = ganita_mat_add(a, a);
+    if (sum == 0) { println("add refused"); return 1; }
+    var scaled = ganita_mat_scale(a, f64_from(2));
+    if (scaled == 0) { println("scale refused"); return 1; }
+    syscall(1, 1, "A + A == 2A: ", 13);
+    fmt_int(ganita_mat_eq(sum, scaled, f64_from(0)));
+    println("");
+
+    # --- norms and predicates -------------------------------------------
+    println("");
+    syscall(1, 1, "trace(I3)        = ", 19); fmt_float(ganita_mat_trace(i3), 4); println("");
+    syscall(1, 1, "frobenius(A)     = ", 19); fmt_float(ganita_mat_frobenius(a), 4);
+    println("   (sqrt(1+4+9+16+25+36) = sqrt(91))");
+    # ⚠ ganita_mat_max_norm is the INFINITY norm — the largest absolute ROW SUM,
+    # not the largest absolute element. 4+5+6 = 15, not 6. The name reads the
+    # other way round, so the doc comment and the test both say so explicitly.
+    syscall(1, 1, "max_norm(A)      = ", 19); fmt_float(ganita_mat_max_norm(a), 4);
+    println("  <- ||A||_inf = max row sum = 4+5+6, NOT max element");
+    syscall(1, 1, "is_symmetric(I3) = ", 19); fmt_int(ganita_mat_is_symmetric(i3, f64_from(0))); println("");
+
+    # --- views -----------------------------------------------------------
+    # mat_row / mat_col hand back a flat heap array, NOT a matrix, and return 0
+    # if it cannot be allocated. mat_submatrix takes a half-open range and
+    # returns mat_new's null for an empty or inverted one.
+    println("");
+    var r0 = ganita_mat_row(a, 0);
+    if (r0 == 0) { println("row refused"); return 1; }
+    syscall(1, 1, "row 0 of A: ", 12);
+    fmt_float(load64(r0), 1); syscall(1, 1, " ", 1);
+    fmt_float(load64(r0 + 8), 1); syscall(1, 1, " ", 1);
+    fmt_float(load64(r0 + 16), 1); println("");
+
+    var sub = ganita_mat_submatrix(a, 0, 0, 2, 2);
+    show("A[0:2, 0:2]:", sub);
+    syscall(1, 1, "empty range A[0:0, 0:0] -> ", 27);
+    fmt_int(ganita_mat_submatrix(a, 0, 0, 0, 0));
+    println("   (null, propagated rather than written through)");
+
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

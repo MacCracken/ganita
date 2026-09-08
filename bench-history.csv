@@ -1,0 +1,12 @@
+timestamp,commit,branch,suite,benchmark,estimate_ns,stat,avg_ns,min_ns,max_ns,iters,regime,floor_ns
+2026-09-08T04:21:33Z,b025153,main,tests/ganita.bcyr,"noop",2,avg,2,2,2,1000000,net,1338.0000
+2026-09-08T04:21:33Z,b025153,main,tests/ganita.bcyr,"f32_mul (native)",4,avg,4,4,4,1000000,net,1338.0000
+2026-09-08T04:21:33Z,b025153,main,tests/ganita.bcyr,"f32_mul (widened baseline)",3,avg,3,3,3,1000000,net,1338.0000
+2026-09-08T04:21:33Z,b025153,main,tests/ganita.bcyr,"f32_lerp (native)",5,avg,5,5,5,1000000,net,1338.0000
+2026-09-08T04:21:33Z,b025153,main,tests/ganita.bcyr,"f32_lerp (widened baseline)",5,avg,5,5,5,1000000,net,1338.0000
+2026-09-08T04:21:33Z,b025153,main,tests/ganita.bcyr,"least_squares m=1000 n=3",205350.0000,avg,205350.0000,205350.0000,205350.0000,20,net,1338.0000
+2026-09-08T04:21:33Z,b025153,main,tests/ganita.bcyr,"least_squares m=5793 n=3 (was SIGSEGV)",1161000.0000,avg,1161000.0000,1161000.0000,1161000.0000,20,net,1338.0000
+2026-09-08T04:21:33Z,b025153,main,tests/ganita.bcyr,"least_squares m=20000 n=3 (was N/A)",3890000.0000,avg,3890000.0000,3890000.0000,3890000.0000,20,net,1338.0000
+2026-09-08T04:21:33Z,b025153,main,tests/ganita.bcyr,"eigen_sym n=20",1544000.0000,avg,1544000.0000,1544000.0000,1544000.0000,20,net,1338.0000
+2026-09-08T04:21:33Z,b025153,main,tests/ganita.bcyr,"eigen_sym n=40",13387000.0000,avg,13387000.0000,13387000.0000,13387000.0000,10,net,1338.0000
+2026-09-08T04:21:33Z,b025153,main,tests/ganita.bcyr,"eigen_sym n=80",110738000.0000,avg,110738000.0000,110738000.0000,110738000.0000,3,net,1338.0000
