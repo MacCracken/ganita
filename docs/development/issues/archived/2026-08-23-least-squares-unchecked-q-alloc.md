@@ -1,12 +1,48 @@
 # `ganita_mat_least_squares` never checks its own `mat_new`, and forms an `m × m` Q it does not need
 
+> ✅ **RESOLVED in ganita 1.2.2** (2026-09-07). Both defects are closed, and the
+> sweep the report asked for was done in the same pass.
+>
+> - **The square Q is gone.** `ganita_mat_least_squares` no longer calls
+>   `ganita_mat_qr`. The Householder reflectors are applied to `b` in the same
+>   sweep that reduces A to R, which *is* `Q^T·b` — so peak memory is O(m·n),
+>   not O(m²), and the ~5792 ceiling is gone entirely rather than reported. The
+>   repro exits **0**; a degree-2 fit over **100,000** samples, impossible before
+>   at any cap, now costs about 4 MB and returns the exact coefficients.
+> - **Not thin MGS.** The report preferred thin modified Gram-Schmidt (as ported
+>   by hisab 1.4.0). Householder-applied-to-`b` reaches the same O(m·n) bound and
+>   was chosen instead because it is unconditionally stable where MGS is not, and
+>   because it is the same arithmetic ganita already shipped — only the
+>   accumulation of Q and its transpose are removed. Results are strictly more
+>   accurate, the reflectors now reaching `b` directly rather than through a
+>   materialised Q.
+> - **Every internal allocation is checked.** Not just the three named here:
+>   `mat_add`/`sub`/`scale`/`mul`/`transpose`/`copy`/`neg`/`row`/`col`/`submatrix`,
+>   `lu_solve`, `det`, `inv`, `cholesky_solve`, `qr`, `eigen_sym`, `svd`,
+>   `pseudo_inv`, `rank` and `condition`. Failure is reported in each function's
+>   own vocabulary — null for the matrix- and array-returning ones, `-1` for the
+>   status ones (`-2` for `eigen_sym`, whose `-1` was taken), and **NaN for `det`
+>   and `condition`**, because `0.0` and `-1.0` are real answers those two already
+>   give about the matrix and must not be overloaded to mean "the run failed".
+> - **Pinned by tests.** 17 new assertions: the 5793×3 fit that used to SIGSEGV
+>   now solves to its exact coefficients, plus the reachable allocation failures —
+>   the ones a caller hits with matrices that are themselves well inside the cap
+>   because the working factor is derived and larger. Mutation-verified: restoring
+>   the m×m Q kills the suite with the report's own SIGSEGV, and removing any one
+>   null check does the same.
+>
+> `ganita_mat_qr` keeps its explicit m×m `out_q` — that is its documented
+> contract and a caller who wants Q must still budget for it. What changed is
+> that solving no longer goes through it.
+
+
 **Filed by**: naad (2.1.3 P-1 hardening sweep — a public DSP function was
 SIGSEGV-ing on ordinary input)
 **Against**: ganita `src/linalg.cyr:624-628` — `ganita_mat_least_squares`
 **Date**: 2026-08-23
 **Version**: ganita **1.1.4** (repo HEAD `fcbb9da`, and the copy vendored in
 cyrius 6.5.35's stdlib snapshot — both identical)
-**Repro**: [`repros/2026-08-23-least-squares-unchecked-q-alloc.cyr`](repros/2026-08-23-least-squares-unchecked-q-alloc.cyr)
+**Repro**: [`repros/2026-08-23-least-squares-unchecked-q-alloc.cyr`](../repros/2026-08-23-least-squares-unchecked-q-alloc.cyr)
 — exits **139 (SIGSEGV)**, verified
 **Severity**: **High** — a null-pointer write reachable from a public API with
 valid, in-contract arguments. No caller-side workaround exists other than not

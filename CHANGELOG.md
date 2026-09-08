@@ -4,6 +4,112 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.2] — 2026-09-07 — the least-squares SIGSEGV, and every unchecked allocation behind it
+
+Closes both open filings in `docs/development/issues/`. One was a **High**-severity
+null-pointer write reachable from a public API with in-contract arguments; the other
+turned out to be already fixed by 1.2.1's toolchain bump. 260 assertions (was 243).
+
+### Fixed
+
+- **`ganita_mat_least_squares` no longer forms an `m × m` Q — the SIGSEGV is gone,
+  and so is the ceiling.** Filed by naad's 2.1.3 hardening sweep after a public DSP
+  function faulted on ordinary input.
+
+  A degree-2 fit over 5793 samples is a `5793 × 3` design: 17,379 elements, **0.05 %**
+  of `GANITA_MAT_MAX_ELEMS`, which `ganita_mat_new` accepts without complaint. But the
+  function reached the solution through `ganita_mat_qr`, whose contract is an *explicit
+  `m × m` orthogonal Q* — and `5793² = 33,558,849` is just **over** the cap. `mat_new`
+  returned `0`, nothing checked it, and `ganita_mat_qr`'s Q-initialisation loop stored
+  through the null. Nothing in the signature, the doc comment or the guard's own error
+  surface said that `m` was bounded at ≈ 5792, and it was bounded there by a square
+  matrix the algorithm never needed.
+
+  ⚠ **The 1.0.4 CWE-190 guard is not the bug — the unchecked caller is.** Giving a
+  constructor a failure return converts every unchecked call site from "allocates and
+  works" to "nulls and faults". That is what happened, and it is why the sweep below
+  matters more than this one function.
+
+  The reflectors are now applied to `b` in the same sweep that reduces A to R, which
+  **is** `Q^T·b`: `R = H_{n-1}···H_0·A`, so `Q^T = H_{n-1}···H_0`, and each `H` is its
+  own inverse. Peak memory is **O(m·n)** instead of **O(m²)** — an `m × n` working copy
+  plus two length-`m` vectors. The 5793 case needs **231 KB** where it needed 268 MB,
+  and a degree-2 fit over **100,000 samples** — impossible before at any cap — costs
+  4 MB and returns its coefficients exactly.
+
+  **Not thin Gram-Schmidt.** The report preferred thin MGS, as ported by hisab 1.4.0.
+  Householder-applied-to-`b` reaches the same O(m·n) bound and is kept instead because
+  it is unconditionally stable where MGS is not, and because it is the *same arithmetic
+  1.1.4 through 1.2.1 already shipped* — only the accumulation of Q and its transpose
+  are gone. Results are strictly more accurate: the reflectors now reach `b` directly
+  rather than through a materialised Q.
+
+  `ganita_mat_qr` is unchanged and keeps its explicit `m × m` `out_q`. That is its
+  documented contract, and a caller who wants Q must still budget for it. What changed
+  is that *solving* no longer goes through it.
+
+- **Every internal allocation in `matrix.cyr` and `linalg.cyr` is now checked** — the
+  sweep the report asked for, and the durable half of the fix. Twenty functions:
+  `mat_add` · `mat_sub` · `mat_scale` · `mat_mul` · `mat_transpose` · `mat_copy` ·
+  `mat_neg` · `mat_row` · `mat_col` · `mat_submatrix` · `mat_lu_solve` · `mat_det` ·
+  `mat_inv` · `mat_cholesky_solve` · `mat_qr` · `mat_least_squares` · `mat_eigen_sym` ·
+  `mat_svd` · `mat_pseudo_inv` · `mat_rank` · `mat_condition`.
+
+  Failure is reported in **each function's own vocabulary**, which is the part worth
+  reading before upgrading:
+
+  | Return shape | On allocation failure | Functions |
+  |---|---|---|
+  | matrix | `0` (null), as `ganita_mat_new` already did | `copy` `neg` `submatrix` `add` `sub` `scale` `mul` `transpose` `inv` `pseudo_inv` |
+  | flat array | `0` | `row` `col` |
+  | status | `-1` | `lu_solve` `cholesky_solve` `qr` `least_squares` `svd` |
+  | status, `-1` taken | `-2` | `eigen_sym` (`-1` still means max-iterations) |
+  | count | `-1` | `rank` — a rank is never negative |
+  | **f64** | **NaN** | `det` `condition` |
+
+  The f64 row is the one that is not merely bookkeeping. `det` already returns `0.0`
+  for a singular matrix and `condition` already returns `-1.0` for one — both are real
+  answers *about the matrix*. Overloading either to also mean "the run failed" would
+  report a perfectly invertible matrix as singular. NaN says the thing that is true.
+
+  Several of these failures are reachable with matrices that are themselves well inside
+  the cap, because the working factor is *derived and larger* — the same shape as the
+  original report. `det` and `inv` take `n` from the **row** count, so a tall non-square
+  asks for an `n × n` factor; `rank`, `condition` and `pseudo_inv` build `cols × cols`
+  factors, so a wide input does it; and `mat_mul` can be handed two legal operands whose
+  product is not (`8000×1 · 1×8000` is 64 M elements).
+
+- **`fmt_float`'s dropped carry — closed, fixed upstream.** ganita filed it from the
+  1.1.3 linalg pass, where every near-integer solver result printed wrong while being
+  numerically correct. cyrius fixed it at **6.5.30** with the exact change proposed
+  (compute the fraction first, fold the carry into `whole`), and it reached ganita at
+  1.2.1 with the 6.6.0 re-vendor. Verified against 6.6.0: every row of the filing's
+  table now prints its expected value, and `10 - 1e-7` prints `10.000000` — the case
+  that proves the carry propagates through a change in integer digit count. No ganita
+  change was needed.
+
+### Added
+
+- **17 assertions** (243 → **260**), in two groups.
+
+  The regression itself: the `5793 × 3` fit that used to SIGSEGV now solves, and is
+  asserted on the *fitted coefficients* rather than on not-crashing — the design samples
+  `2 + 3x - 4x²`, which lies exactly in the column space, so the least-squares answer is
+  the exact one at any `m`. **Mutation-verified**: restoring the `m × m` Q kills the
+  suite with the report's own SIGSEGV.
+
+  And the reachable allocation failures, one per return shape above, each paired with an
+  assertion that the *input* was legal — which is the whole point of the filing.
+  Mutation-verified: removing any single null check kills the suite with a SIGSEGV.
+
+### Changed
+
+- Both filings moved to `docs/development/issues/archived/` with resolution banners.
+  `docs/development/issues/` is now empty of open items.
+  `repros/2026-08-23-least-squares-unchecked-q-alloc.cyr` stays as a regression witness —
+  it exits 139 on 1.1.4 … 1.2.1 and 0 from 1.2.2 on.
+
+
 ### Fixed
 
 - **`cyrius bench` runs with zero warnings again.** Every run printed
@@ -291,7 +397,7 @@ decomposition: a correct `cholesky_solve` result of `3.0` printed as `2.1000000`
 and a correct `least_squares` result of `1.0` printed as `0.1000000`, both of
 which read as solver bugs. This is cyrius stdlib (`lib/fmt.cyr`), vendored, so
 it is **filed rather than changed**:
-[2026-08-19](docs/development/issues/2026-08-19-fmt-float-missing-carry-on-round-up.md).
+[2026-08-19](docs/development/issues/archived/2026-08-19-fmt-float-missing-carry-on-round-up.md).
 The suite is unaffected — it asserts numerically, never on printed text.
 
 ### Verified on released 6.5.28

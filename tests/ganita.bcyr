@@ -7,9 +7,9 @@
 # the full overhead-vs-batching guidance.
 #
 # Carries its own includes so the f32 tier is in scope (auto-prepend is skipped
-# once a file has includes), mirroring tests/ganita.tcyr's list. math_advanced
-# comes first because the f32 pow/atan2/hypot/cbrt forward to its ganita_f64_*
-# implementations and the compiler is single-pass.
+# once a file has includes), mirroring tests/ganita.tcyr's list. Order follows
+# [lib].modules: the compiler is single-pass, linalg calls into matrix, and the
+# f32 pow/atan2/hypot/cbrt forward to math_advanced's ganita_f64_* fns.
 include "lib/syscalls.cyr"
 include "lib/string.cyr"
 include "lib/alloc.cyr"
@@ -19,6 +19,8 @@ include "lib/str.cyr"
 include "lib/math.cyr"
 include "lib/bench.cyr"
 
+include "src/matrix.cyr"
+include "src/linalg.cyr"
 include "src/math_advanced.cyr"
 include "src/math_f32.cyr"
 
@@ -40,7 +42,43 @@ fn bench_f32_lerp_widened(a, b, t): i64 {
     return f32_from(f64_add(af, f64_mul(f64_sub(bf, af), tf)));
 }
 
-# Bench entry point — harness floor, then f32 native vs widened for mul and lerp.
+# Build the m x 3 Vandermonde for x = i/m and fill `out_b` with a quadratic that
+# lies in its column space. Same design the 1.2.2 least-squares assertions use.
+fn bench_quad_design(m, out_b): i64 {
+    var a = ganita_mat_new(m, 3);
+    if (a == 0) { return 0; }
+    var i = 0;
+    while (i < m) {
+        var x = f64_div(f64_from(i), f64_from(m));
+        ganita_mat_set(a, i, 0, f64_from(1));
+        ganita_mat_set(a, i, 1, x);
+        ganita_mat_set(a, i, 2, f64_mul(x, x));
+        store64(out_b + i * 8, f64_add(f64_from(2),
+            f64_sub(f64_mul(f64_from(3), x), f64_mul(f64_from(4), f64_mul(x, x)))));
+        i = i + 1;
+    }
+    return a;
+}
+
+# Time `reps` least-squares solves of an m x 3 design. Reports nothing itself —
+# the caller owns the bench handle so the label carries m.
+fn bench_least_squares(m, reps, handle): i64 {
+    var b = alloc(m * 8);
+    if (b == 0) { return 0 - 1; }
+    var a = bench_quad_design(m, b);
+    if (a == 0) { return 0 - 1; }
+    var out = alloc(24);
+    if (out == 0) { return 0 - 1; }
+    bench_batch_start(handle);
+    var i = 0;
+    while (i < reps) { ganita_mat_least_squares(a, b, out); i = i + 1; }
+    bench_batch_stop(handle, reps);
+    bench_report(handle);
+    return 0;
+}
+
+# Bench entry point — harness floor, f32 native vs widened for mul and lerp, then
+# least-squares scaling.
 fn main(): i64 {
     alloc_init();
     var b = bench_new("noop");
@@ -82,6 +120,16 @@ fn main(): i64 {
     while (i < 1000000) { bench_f32_lerp_widened(x, y, t); i = i + 1; }
     bench_batch_stop(b5, 1000000);
     bench_report(b5);
+
+    # --- least squares (1.2.2): the m x m Q is gone, so cost is O(m*n^2) ---
+    # These three sizes are the point of the fix rather than a micro-optimisation:
+    # m = 5793 is the exact size that SIGSEGV'd through 1.2.1 (its internal Q was
+    # one element over the cap), and m = 20000 could not run at ANY cap — a
+    # 20000^2 Q is 3.2 GB. Per-solve time should track m roughly linearly; a
+    # superlinear jump means something is allocating per row again.
+    bench_least_squares(1000, 20, bench_new("least_squares m=1000 n=3"));
+    bench_least_squares(5793, 20, bench_new("least_squares m=5793 n=3 (was SIGSEGV)"));
+    bench_least_squares(20000, 20, bench_new("least_squares m=20000 n=3 (was N/A)"));
     return 0;
 }
 

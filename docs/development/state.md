@@ -6,6 +6,20 @@
 
 ## Version
 
+**1.2.2** — the two open filings, closed. **`ganita_mat_least_squares` no longer
+forms an `m × m` Q**: it reached the solution through `ganita_mat_qr`, whose
+contract is an explicit square Q, so an ordinary `5793 × 3` design (0.05% of the
+element cap) asked for a 33,558,849-element Q just *over* it — `mat_new` returned
+0, nothing checked it, and qr stored through the null. **High severity: a null
+write reachable from a public API with in-contract arguments.** The reflectors are
+now applied to `b` in the same sweep that reduces A to R, which *is* `Q^T·b`, so
+peak memory is O(m·n) and the ≈5792 ceiling is gone rather than reported. Every
+internal allocation across `matrix.cyr` + `linalg.cyr` is now checked (20 fns),
+each reporting in its own vocabulary — **NaN for `det` and `condition`**, whose
+`0.0` and `-1.0` are real answers about the matrix. The `fmt_float` filing closed
+with no ganita change: cyrius fixed it at 6.5.30 and 1.2.1's re-vendor brought it
+in. 260 assertions (was 243).
+
 **1.2.1** — toolchain. Cyrius pin 6.5.36 → **6.6.0**, `lib/` re-vendored to an
 exact match (108 → **109** files, `hashseed.cyr` is new), `dist/` regenerated at
 1.2.1. **No `src/` change, no behavioural change** — the same 243 assertions,
@@ -102,20 +116,31 @@ initial carve out of cyrius stdlib (2026-06-10, cyrius v6.1.26).
 Linear-algebra & advanced-math modules carved from cyrius stdlib, public
 functions prefixed `ganita_`. Regenerated from the tree 2026-09-07:
 
+**Allocation-failure contract (1.2.2).** Every internal `ganita_mat_new` / `alloc`
+is checked, and each function reports in its own return vocabulary: **null** for
+the matrix- and array-returning fns, **-1** for the status ones (**-2** for
+`eigen_sym`, whose `-1` means max-iterations), **-1** for `rank`, and **NaN** for
+`det` and `condition` — `0.0` and `-1.0` are answers those two already give about
+the *matrix* and must not be overloaded to mean the run failed. Failures are
+reachable with inputs well inside the cap whenever the working factor is derived
+and larger: `det`/`inv` take n from the **row** count, `rank`/`condition`/
+`pseudo_inv` build `cols × cols` factors, and `mat_mul` can be handed two legal
+operands whose product is not.
+
+
 | Module | Lines | Public fns | Canonical prefix |
 |--------|-------|-----------|------------------|
-| `src/linalg.cyr`        | 957 | 26 | `ganita_mat_*` (extends matrix) |
-| `src/matrix.cyr`        | 197 | 14 | `ganita_mat_*` |
+| `src/linalg.cyr`        | 1126 | 26 | `ganita_mat_*` (extends matrix) |
+| `src/matrix.cyr`        | 208 | 14 | `ganita_mat_*` |
 | `src/math_advanced.cyr` | 226 | 13 | `ganita_f64_*` / `ganita_fibonacci` / `ganita_binomial` |
 | `src/math_f32.cyr`      | 200 | 27 | `ganita_f32_*` |
 
 - `src/_compat.cyr` — 53 back-compat aliases (legacy names → `ganita_*`).
   Single-pass order: matrix → linalg → math_advanced → math_f32 → `_compat`
   last, since its aliases reference every `ganita_*` symbol.
-- `dist/ganita.cyr` — 1,690 lines, regenerated via `cyrius distlib` at 1.2.1 on
+- `dist/ganita.cyr` — 1,870 lines, regenerated via `cyrius distlib` at 1.2.2 on
   6.6.0. This is the artifact folded into `cyrius/lib/ganita.cyr`. Regeneration
-  is idempotent; the only 1.2.0 → 1.2.1 delta is the version header, since `src/`
-  did not change.
+  is idempotent.
 - `dist/ganita.deps` — 10 stdlib leaves: `syscalls string alloc fmt vec str math
   io assert bench`. Verified sufficient by `scripts/consumer-check.sh` (`str` is
   over-declared but harmless).
@@ -124,7 +149,8 @@ functions prefixed `ganita_`. Regenerated from the tree 2026-09-07:
 
 - `tests/ganita.tcyr` — matrix dims + identity + **CWE-190 dimension guard** +
   binomial/fibonacci + `f64_tanh` saturation + alias parity + **the full f32
-  tier** (1.1.2) + **the full linalg surface** (1.1.3). **243 assertions,
+  tier** (1.1.2) + **the full linalg surface** (1.1.3) + **the least-squares
+  regression and the allocation-failure contract** (1.2.2). **260 assertions,
   green** on 6.6.0.
 
   The linalg block asserts **properties**, not transcribed outputs — `A·A⁻¹ = I`,
@@ -145,6 +171,14 @@ functions prefixed `ganita_`. Regenerated from the tree 2026-09-07:
   exactly 2, both negative-input, while every positive still passes. The suite
   also states the trap directly (`-1.0f` sorts *below* `-2.0f`; negatives sort
   *above* positives) so a reader sees why those cases discriminate.
+
+  **The 1.2.2 linalg additions are mutation-verified too.** The least-squares
+  assertion is on the *fitted coefficients* of a 5793-sample quadratic that lies
+  exactly in the column space, not on "did not crash" — restoring the `m × m` Q
+  kills the suite with the filed SIGSEGV, and removing any single null check from
+  the allocation sweep does the same. Each allocation-failure assertion is paired
+  with one that the **input** was legal, which is the whole content of the report:
+  the caller's matrix was never the problem.
 
   Also pinned: signed zeros and infinities through min/max/sign/abs/neg;
   high-32 hygiene (a dirty high half must not leak into a result);
@@ -197,23 +231,25 @@ tests) · lint · vet · build with 0 warnings · smoke exits 42 · test · fuzz
 bench · `coverage --min 80` · `distlib --all --check` · regeneration leaves no
 tree diff · consumer-check.
 
+## Open filings
+
+**None.** `docs/development/issues/` holds only `archived/` and `repros/` as of
+1.2.2. The last two closed together: the `ganita_mat_least_squares` null write
+(fixed here — see the Version note) and `fmt_float`'s dropped carry (fixed upstream
+at cyrius 6.5.30, arrived with 1.2.1's re-vendor, no ganita change). The repro
+`repros/2026-08-23-least-squares-unchecked-q-alloc.cyr` stays as a regression
+witness: exit 139 on 1.1.4 … 1.2.1, exit 0 from 1.2.2.
+
 ## Known gaps
 
 1. **`tests/ganita.fcyr` is still a `cyrius init` scaffold** — the fuzz harness
    does no fuzzing. It reports PASS, so the CI gate that runs it is vacuous until
    the harness is real. (`tests/ganita.bcyr` grew real f32 benchmarks at 1.2.0;
    only its `bench_noop` floor is scaffold.)
-2. **`fmt_float` drops the carry when a fraction rounds up to 1.0** —
-   `fmt_float(2.9999999, 6)` prints `2.1000000` (seven fraction digits). Display
-   only, but near-integer results are routine after a decomposition, so correct
-   answers read as wrong ones. cyrius stdlib, vendored. Filed:
-   [2026-08-19](issues/2026-08-19-fmt-float-missing-carry-on-round-up.md).
-   ganita's tests assert numerically, never on printed text, so they are
-   unaffected.
-3. **`math_advanced.cyr` is 4/13** — the remaining in-repo coverage gap now that
+2. **`math_advanced.cyr` is 4/13** — the remaining in-repo coverage gap now that
    the f32 and linalg tiers are done. Its deep coverage lives upstream in
    cyrius's `math` `.tcyr` suite.
-4. **`lib/ganita.cyr` is ganita's own fold vendored back into ganita's own
+3. **`lib/ganita.cyr` is ganita's own fold vendored back into ganita's own
    `lib/`** — new at this pin, because `lib sync --full` copies the whole
    snapshot and cyrius now carries the ganita fold. Nothing in `src/`,
    `tests/`, or `cyrius.cyml` includes it, so it is inert, but it defines the
@@ -222,7 +258,7 @@ tree diff · consumer-check.
    the durable fix is upstream, a `lib sync` self-exclusion. bayan carries the
    identical gap. At the 6.6.0 pin it holds ganita **1.2.0** — one release behind
    `src/`, so it is also stale, not merely redundant.
-5. **`README.md` is stale** — still describes the pre-1.1.0 surface.
+4. **`README.md` is stale** — still describes the pre-1.1.0 surface.
 
 ## Dependencies
 
@@ -237,8 +273,11 @@ No sibling `[deps.NAME]` entries, so `cyrius deps` writes no `cyrius.lock`.
 
 - **cyrius** — folds `dist/ganita.cyr` → `lib/ganita.cyr`. The 6.6.0 snapshot
   carries ganita **1.2.0**, so the `f64_pow` domain fix (1.1.4) and the native f32
-  arithmetic tier (1.2.0) are both in. 1.2.1 changes nothing but the version
-  header, so the refold is cosmetic and can ride the next real release.
+  arithmetic tier (1.2.0) are both in. ⛔ **The refold is now worth scheduling.**
+  1.2.1 was header-only, but the 1.2.0 fold ships the `mat_least_squares` null
+  write under the plain `mat_least_squares` alias — so a cyrius consumer who never
+  heard of ganita can SIGSEGV on an in-contract call, which is exactly how naad
+  found it.
 - **ranga** (image-processing port) — drove the 1.1.0 f32 tier.
 - Downstream repos using matrix/linalg/advanced-math migrate to `ganita_*` on
   re-pin (aliases bridge the window).

@@ -81,11 +81,13 @@ fn ganita_mat_from(rows, cols, data): i64 {
     return m;
 }
 
-# Matrix addition: C = A + B (returns new matrix)
+# Matrix addition: C = A + B (returns new matrix, or 0 if the result cannot be
+# allocated — propagates ganita_mat_new's null).
 fn ganita_mat_add(a, b): i64 {
     var rows = ganita_mat_rows(a);
     var cols = ganita_mat_cols(a);
     var c = ganita_mat_new(rows, cols);
+    if (c == 0) { return 0; }
     var i = 0;
     while (i < rows * cols) {
         var va = load64(a + 16 + i * 8);
@@ -96,11 +98,13 @@ fn ganita_mat_add(a, b): i64 {
     return c;
 }
 
-# Matrix subtraction: C = A - B (returns new matrix)
+# Matrix subtraction: C = A - B (returns new matrix, or 0 if the result cannot
+# be allocated — propagates ganita_mat_new's null).
 fn ganita_mat_sub(a, b): i64 {
     var rows = ganita_mat_rows(a);
     var cols = ganita_mat_cols(a);
     var c = ganita_mat_new(rows, cols);
+    if (c == 0) { return 0; }
     var i = 0;
     while (i < rows * cols) {
         var va = load64(a + 16 + i * 8);
@@ -111,11 +115,13 @@ fn ganita_mat_sub(a, b): i64 {
     return c;
 }
 
-# Scalar multiply: C = A * scalar (returns new matrix)
+# Scalar multiply: C = A * scalar (returns new matrix, or 0 if the result cannot
+# be allocated — propagates ganita_mat_new's null).
 fn ganita_mat_scale(a, scalar): i64 {
     var rows = ganita_mat_rows(a);
     var cols = ganita_mat_cols(a);
     var c = ganita_mat_new(rows, cols);
+    if (c == 0) { return 0; }
     var i = 0;
     while (i < rows * cols) {
         store64(c + 16 + i * 8, f64_mul(load64(a + 16 + i * 8), scalar));
@@ -124,12 +130,16 @@ fn ganita_mat_scale(a, scalar): i64 {
     return c;
 }
 
-# Matrix multiply: C = A * B (returns new matrix, A is m×k, B is k×n → C is m×n)
+# Matrix multiply: C = A * B (returns new matrix, A is m×k, B is k×n → C is m×n).
+# Returns 0 if C cannot be allocated — note m×n can exceed the cap even when
+# both operands are well inside it: an N×1 times a 1×N is 2N elements of input
+# for an N² result.
 fn ganita_mat_mul(a, b): i64 {
     var m = ganita_mat_rows(a);
     var k = ganita_mat_cols(a);
     var n = ganita_mat_cols(b);
     var c = ganita_mat_new(m, n);
+    if (c == 0) { return 0; }
     var i = 0;
     while (i < m) {
         var j = 0;
@@ -148,11 +158,13 @@ fn ganita_mat_mul(a, b): i64 {
     return c;
 }
 
-# Transpose: returns new matrix
+# Transpose: returns new matrix, or 0 if it cannot be allocated (propagates
+# ganita_mat_new's null).
 fn ganita_mat_transpose(a): i64 {
     var rows = ganita_mat_rows(a);
     var cols = ganita_mat_cols(a);
     var t = ganita_mat_new(cols, rows);
+    if (t == 0) { return 0; }
     var i = 0;
     while (i < rows) {
         var j = 0;

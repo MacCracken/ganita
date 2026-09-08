@@ -51,6 +51,25 @@ fn t_arr2(a, b): i64 { var q = alloc(16); store64(q, a); store64(q + 8, b); retu
 fn t_arr3(a, b, c): i64 {
     var q = alloc(24); store64(q, a); store64(q + 8, b); store64(q + 16, c); return q;
 }
+# Build the m x 3 Vandermonde for x = i/m and fill `out_b` with 2 + 3x - 4x^2.
+# That quadratic lies EXACTLY in the column space, so the least-squares answer
+# is the exact one and can be asserted tightly at any m. Returns the design
+# matrix, or 0 if it could not be allocated.
+fn t_quad_design(m, out_b): i64 {
+    var a = ganita_mat_new(m, 3);
+    if (a == 0) { return 0; }
+    var i = 0;
+    while (i < m) {
+        var x = f64_div(f64_from(i), f64_from(m));
+        ganita_mat_set(a, i, 0, f64_from(1));
+        ganita_mat_set(a, i, 1, x);
+        ganita_mat_set(a, i, 2, f64_mul(x, x));
+        store64(out_b + i * 8, f64_add(f64_from(2),
+            f64_sub(f64_mul(f64_from(3), x), f64_mul(f64_from(4), f64_mul(x, x)))));
+        i = i + 1;
+    }
+    return a;
+}
 
 # --- f32 test helpers ---------------------------------------------------
 # An f32 here is its IEEE-754 single bit pattern in the low 32 bits, the form
@@ -513,6 +532,54 @@ var LSX = alloc(16);
 assert_eq(ganita_mat_least_squares(LSA, t_arr3(t_d(1), t_d(2), t_d(3)), LSX), 0, "least_squares returns 0");
 assert_eq(t_dclose(load64(LSX), t_d(1)), 1, "least_squares x0 = 1");
 assert_eq(t_dclose(load64(LSX + 8), t_d(2)), 1, "least_squares x1 = 2");
+# ⭐ THE 5793 REGRESSION (filed by naad, 2026-08-23; fixed 1.2.2). Through 1.2.1
+# least_squares went through ganita_mat_qr, whose contract is an explicit m x m
+# Q — so this 5793 x 3 design (17,379 elements, 0.05% of the cap) made it ask
+# for a 5793^2 = 33,558,849-element Q, just OVER the cap. mat_new returned 0,
+# nothing checked it, and qr stored through the null: SIGSEGV on in-contract
+# arguments. m is now bounded only by memory, so the assertion that discriminates
+# is simply that a design past the old m ≈ 5792 ceiling SOLVES, and solves right.
+var BIGB = alloc(5793 * 8);
+var BIGA = t_quad_design(5793, BIGB);
+assert_eq(BIGA != 0, 1, "least_squares: a 5793x3 design allocates (0.05% of the cap)");
+var BIGX = alloc(24);
+assert_eq(ganita_mat_least_squares(BIGA, BIGB, BIGX), 0,
+  "least_squares at m=5793 returns 0 (was SIGSEGV — the m x m Q is gone)");
+assert_eq(t_dclose(load64(BIGX), t_d(2)), 1, "least_squares m=5793: c0 = 2");
+assert_eq(t_dclose(load64(BIGX + 8), t_d(3)), 1, "least_squares m=5793: c1 = 3");
+assert_eq(t_dclose(load64(BIGX + 16), t_d(0 - 4)), 1, "least_squares m=5793: c2 = -4");
+# The small consistent system above and the large one agree on the same shape of
+# answer, which is what pins the reflector-on-b path as equivalent to forming Q.
+
+test_group("linalg: allocation failure is reported, never written through (1.2.2)");
+# Every internal mat_new / alloc is checked as of 1.2.2. What these pin is the
+# reachable half: failures a caller hits with matrices that are THEMSELVES well
+# inside the cap, because the working factor is derived and larger. That is the
+# exact shape of the naad report, and none of it was detectable before — the
+# functions faulted instead of returning.
+# mat_mul: both operands legal, the PRODUCT is not (8000x1 * 1x8000 = 64M elems).
+var MMA = ganita_mat_new(8000, 1);
+var MMB = ganita_mat_new(1, 8000);
+assert_eq(MMA != 0, 1, "mat_mul guard: the 8000x1 operand is itself legal");
+assert_eq(MMB != 0, 1, "mat_mul guard: the 1x8000 operand is itself legal");
+assert_eq(ganita_mat_mul(MMA, MMB), 0, "mat_mul -> null when the product exceeds the cap");
+# det / inv take n from the ROW count, so a tall non-square asks for an n x n factor.
+var TALL = ganita_mat_new(6000, 2);
+assert_eq(TALL != 0, 1, "det/inv guard: the 6000x2 input is itself legal");
+assert_eq(t_f64_is_nan(ganita_mat_det(TALL)), 1,
+  "det -> NaN, NOT 0.0, when the n x n LU factor cannot be allocated");
+assert_eq(ganita_mat_inv(TALL), 0, "inv -> null when the n x n LU factor cannot be allocated");
+# rank / condition / pseudo_inv build cols x cols factors, so a WIDE input does it.
+var WIDE = ganita_mat_new(2, 6000);
+assert_eq(WIDE != 0, 1, "svd-family guard: the 2x6000 input is itself legal");
+assert_eq(ganita_mat_rank(WIDE, t_tol()), 0 - 1,
+  "rank -> -1 when the cols x cols factor cannot be allocated (a rank is never negative)");
+assert_eq(t_f64_is_nan(ganita_mat_condition(WIDE)), 1,
+  "condition -> NaN, distinct from its -1.0 singular answer");
+assert_eq(ganita_mat_pseudo_inv(WIDE), 0, "pseudo_inv -> null when the SVD factors cannot be allocated");
+# An empty range is mat_new's null, propagated rather than written through.
+assert_eq(ganita_mat_submatrix(mg, 0, 0, 0, 0), 0, "submatrix of an empty range -> null");
+assert_eq(ganita_mat_submatrix(mg, 0, 0, 2, 2) != 0, 1, "submatrix of a real range still builds");
 
 test_group("linalg: symmetric eigendecomposition (Jacobi)");
 # [[2,1],[1,2]] has eigenvalues 3 and 1, eigenvectors (1,1)/sqrt2 and (1,-1)/sqrt2.

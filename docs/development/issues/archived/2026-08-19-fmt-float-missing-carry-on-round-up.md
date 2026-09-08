@@ -1,5 +1,17 @@
 # `fmt_float` drops the carry when the fraction rounds up to 1.0
 
+> ✅ **RESOLVED UPSTREAM in cyrius 6.5.30**, and reached ganita at **1.2.1**
+> (2026-09-07) when the pin moved 6.5.36 → 6.6.0 and `lib/` was re-vendored.
+> The fix is the one proposed below, applied verbatim: the fraction is computed
+> BEFORE the integer part is emitted, and the carry is folded into `whole`
+> (`lib/fmt.cyr:301-308`, where the reasoning is now recorded in place, credited
+> to this filing). Verified against 6.6.0 — every row of the table below now
+> prints its expected value, `-2.9999999` included, and `10 - 1e-7` prints
+> `10.000000`, which is the case that proves the carry propagates through a
+> change in integer digit count. Closed at ganita 1.2.2 with nothing to change
+> in ganita itself.
+
+
 **Filed by**: ganita (1.1.3 linalg test pass — every near-integer result printed
 wrong while being numerically correct)
 **Against**: cyrius stdlib `lib/fmt.cyr` — vendored, so ganita cannot fix it

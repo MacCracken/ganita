@@ -27,11 +27,13 @@ fn _linalg_init_eps(): i64 {
 # Tier 3 — Matrix utilities (additions to matrix.cyr's feature set)
 # ================================================================
 
-# Deep copy of a matrix
+# Deep copy of a matrix. Returns 0 if the copy cannot be allocated (propagates
+# ganita_mat_new's null).
 fn ganita_mat_copy(m): i64 {
     var rows = ganita_mat_rows(m);
     var cols = ganita_mat_cols(m);
     var c = ganita_mat_new(rows, cols);
+    if (c == 0) { return 0; }
     var i = 0;
     var n = rows * cols;
     while (i < n) {
@@ -41,11 +43,13 @@ fn ganita_mat_copy(m): i64 {
     return c;
 }
 
-# Negate all elements
+# Negate all elements. Returns 0 if the result cannot be allocated (propagates
+# ganita_mat_new's null).
 fn ganita_mat_neg(m): i64 {
     var rows = ganita_mat_rows(m);
     var cols = ganita_mat_cols(m);
     var c = ganita_mat_new(rows, cols);
+    if (c == 0) { return 0; }
     var i = 0;
     var n = rows * cols;
     while (i < n) {
@@ -55,10 +59,12 @@ fn ganita_mat_neg(m): i64 {
     return c;
 }
 
-# Extract row r as a flat f64 array (heap-allocated, cols entries)
+# Extract row r as a flat f64 array (heap-allocated, cols entries).
+# Returns 0 if the array cannot be allocated.
 fn ganita_mat_row(m, r): i64 {
     var cols = ganita_mat_cols(m);
     var out = alloc(cols * 8);
+    if (out == 0) { return 0; }
     var j = 0;
     while (j < cols) {
         store64(out + j * 8, ganita_mat_get(m, r, j));
@@ -67,10 +73,12 @@ fn ganita_mat_row(m, r): i64 {
     return out;
 }
 
-# Extract column c as a flat f64 array (heap-allocated, rows entries)
+# Extract column c as a flat f64 array (heap-allocated, rows entries).
+# Returns 0 if the array cannot be allocated.
 fn ganita_mat_col(m, c): i64 {
     var rows = ganita_mat_rows(m);
     var out = alloc(rows * 8);
+    if (out == 0) { return 0; }
     var i = 0;
     while (i < rows) {
         store64(out + i * 8, ganita_mat_get(m, i, c));
@@ -101,11 +109,14 @@ fn ganita_mat_set_col(m, c, data): i64 {
     return 0;
 }
 
-# Extract submatrix [r0..r1, c0..c1) as new matrix
+# Extract submatrix [r0..r1, c0..c1) as new matrix. Returns 0 for an empty or
+# inverted range and if the result cannot be allocated (both are
+# ganita_mat_new's null).
 fn ganita_mat_submatrix(m, r0, c0, r1, c1): i64 {
     var nr = r1 - r0;
     var nc = c1 - c0;
     var s = ganita_mat_new(nr, nc);
+    if (s == 0) { return 0; }
     var i = 0;
     while (i < nr) {
         var j = 0;
@@ -278,12 +289,13 @@ fn ganita_mat_lu(m, out_lu, out_piv): i64 {
 # Solve Ax=b from LU factors (from ganita_mat_lu).
 # lu: packed L\U matrix. piv: pivot vector. b: flat f64 array of length n.
 # out_x: flat f64 array of length n (caller allocates). Receives solution.
-# Returns 0 on success.
+# Returns 0 on success, -1 if the forward-substitution scratch cannot be allocated.
 fn ganita_mat_lu_solve(lu, piv, b, out_x): i64 {
     var n = ganita_mat_rows(lu);
 
     # Forward substitution: Ly = Pb
     var y = alloc(n * 8);
+    if (y == 0) { return 0 - 1; }
     var i = 0;
     while (i < n) {
         var pi = load64(piv + i * 8);
@@ -313,10 +325,16 @@ fn ganita_mat_lu_solve(lu, piv, b, out_x): i64 {
 }
 
 # Determinant via LU. Convenience wrapper around ganita_mat_lu.
+# Returns 0.0 for a singular matrix and NaN if the n×n working factor cannot be
+# allocated — NOT 0.0, which would report a perfectly invertible matrix as
+# singular. n comes from the ROW count, so a wide non-square input asks for an
+# n² factor the caller's own matrix never implied.
 fn ganita_mat_det(m): i64 {
     var n = ganita_mat_rows(m);
     var lu = ganita_mat_new(n, n);
+    if (lu == 0) { return f64_div(f64_from(0), f64_from(0)); }
     var piv = alloc(n * 8);
+    if (piv == 0) { return f64_div(f64_from(0), f64_from(0)); }
     var sign = ganita_mat_lu(m, lu, piv);
     if (sign == 0) { return f64_from(0); }
     var det = f64_from(sign);
@@ -329,17 +347,22 @@ fn ganita_mat_det(m): i64 {
 }
 
 # Inverse via LU. Convenience wrapper — solves LU against identity columns.
-# Returns new n×n matrix, or 0 if singular.
+# Returns new n×n matrix, or 0 if singular or if any working allocation fails.
 fn ganita_mat_inv(m): i64 {
     var n = ganita_mat_rows(m);
     var lu = ganita_mat_new(n, n);
+    if (lu == 0) { return 0; }
     var piv = alloc(n * 8);
+    if (piv == 0) { return 0; }
     var sign = ganita_mat_lu(m, lu, piv);
     if (sign == 0) { return 0; }
 
     var inv = ganita_mat_new(n, n);
+    if (inv == 0) { return 0; }
     var col = alloc(n * 8);
+    if (col == 0) { return 0; }
     var x = alloc(n * 8);
+    if (x == 0) { return 0; }
     var k = 0;
     while (k < n) {
         # Build identity column k
@@ -397,11 +420,13 @@ fn ganita_mat_cholesky(m, out_l): i64 {
 
 # Solve Ax=b from Cholesky factor L (where A = LL^T).
 # l: lower triangular. b: flat f64 array. out_x: flat f64 array.
+# Returns 0 on success, -1 if the forward-substitution scratch cannot be allocated.
 fn ganita_mat_cholesky_solve(l, b, out_x): i64 {
     var n = ganita_mat_rows(l);
 
     # Forward: Ly = b
     var y = alloc(n * 8);
+    if (y == 0) { return 0 - 1; }
     var i = 0;
     while (i < n) {
         var sum = load64(b + i * 8);
@@ -432,7 +457,12 @@ fn ganita_mat_cholesky_solve(l, b, out_x): i64 {
 # QR decomposition via Householder reflections.
 # out_q: m×m matrix (caller allocates). Receives orthogonal Q.
 # out_r: m×n matrix (caller allocates). Receives upper triangular R.
-# Returns 0 on success.
+# Returns 0 on success, -1 if a working allocation fails.
+#
+# ⚠ The m×m out_q is this function's CONTRACT, and it bounds m at
+# sqrt(GANITA_MAT_MAX_ELEMS) ≈ 5792 for any caller that wants an explicit Q.
+# If you only need to SOLVE, ganita_mat_least_squares no longer comes through
+# here — it applies the reflectors to b directly and is O(m·n).
 fn ganita_mat_qr(m, out_q, out_r): i64 {
     var rows = ganita_mat_rows(m);
     var cols = ganita_mat_cols(m);
@@ -458,6 +488,7 @@ fn ganita_mat_qr(m, out_q, out_r): i64 {
     while (k < min) {
         # Extract column k below diagonal
         var v = alloc((rows - k) * 8);
+        if (v == 0) { return 0 - 1; }
         i = 0;
         while (i < rows - k) {
             store64(v + i * 8, ganita_mat_get(out_r, k + i, k));
@@ -544,6 +575,7 @@ fn ganita_mat_qr(m, out_q, out_r): i64 {
 
     # Q accumulated H_k...H_1 — transpose to get Q where A = QR
     var qt = ganita_mat_transpose(out_q);
+    if (qt == 0) { return 0 - 1; }
     i = 0;
     while (i < q_total) {
         store64(out_q + 16 + i * 8, load64(qt + 16 + i * 8));
@@ -617,30 +649,141 @@ fn ganita_mat_gaussian_elim(aug): i64 {
     return 1;
 }
 
-# Least-squares solve via QR: minimize ||Ax - b||^2.
+# Least-squares solve via Householder QR: minimize ||Ax - b||^2.
 # a: m×n matrix (m >= n). b: flat f64 array of length m.
 # out_x: flat f64 array of length n (caller allocates).
-# Returns 0 on success.
+# Returns 0 on success, -1 if a working allocation fails.
+#
+# ⚠ NO Q IS EVER FORMED. Through 1.2.1 this called ganita_mat_qr, whose
+# contract is an explicit m×m orthogonal Q — so a caller's perfectly ordinary
+# m×n design matrix made this function ask for an m² one. A degree-2 fit over
+# 5793 samples is a 5793×3 design (17,379 elements, 0.05% of
+# GANITA_MAT_MAX_ELEMS) and ganita_mat_new accepts it without complaint, but the
+# internal Q was 5793² = 33,558,849 elements, just over the cap. mat_new
+# returned 0, nothing checked it, and ganita_mat_qr's Q-initialisation loop
+# stored through the null: SIGSEGV from a public API on in-contract arguments,
+# with an undocumented ceiling of m ≈ 5792 that came from a matrix the algorithm
+# does not need. Filed by naad 2.1.3; see
+# docs/development/issues/archived/2026-08-23-least-squares-unchecked-q-alloc.md.
+#
+# The reflectors are now applied to `b` in the same sweep that reduces A to R,
+# which IS Q^T·b (R = H_{n-1}···H_0·A, so Q^T = H_{n-1}···H_0 and each H is its
+# own inverse). Peak memory is O(m·n) instead of O(m²): an m×n working copy plus
+# two length-m vectors. The 5793×3 case needs 231 KB where it used to need
+# 268 MB, and a degree-2 fit over 100,000 samples — outright impossible before,
+# at any cap — costs 4 MB.
+#
+# The upstream report proposed thin modified Gram-Schmidt (as ported by hisab
+# 1.4.0). Householder-applied-to-b reaches the same O(m·n) bound, and is kept
+# here instead because it is unconditionally stable where MGS is not, and
+# because it is the SAME arithmetic 1.1.4 through 1.2.1 already shipped — only
+# the accumulation of Q, and its transpose, are gone. Results are unchanged to
+# well inside the suite's 1e-9 tolerance, and are strictly more accurate: the
+# reflectors now reach b directly rather than through a materialised Q.
 fn ganita_mat_least_squares(a, b, out_x): i64 {
     var rows = ganita_mat_rows(a);
     var cols = ganita_mat_cols(a);
-    var q = ganita_mat_new(rows, rows);
-    var r = ganita_mat_new(rows, cols);
-    ganita_mat_qr(a, q, r);
+    _linalg_init_eps();
 
-    # x = R^-1 * Q^T * b (only top n rows of R matter)
-    # Compute Q^T * b
+    # Working copy of A, reduced to R in place.
+    var r = ganita_mat_copy(a);
+    if (r == 0) { return 0 - 1; }
+    # Q^T·b, accumulated reflector by reflector. Starts as a copy of b.
     var qtb = alloc(rows * 8);
+    if (qtb == 0) { return 0 - 1; }
+    # Reflector scratch, sized once for the longest column (k = 0).
+    var v = alloc(rows * 8);
+    if (v == 0) { return 0 - 1; }
+
     var i = 0;
     while (i < rows) {
-        var sum = f64_from(0);
-        var j = 0;
-        while (j < rows) {
-            sum = f64_add(sum, f64_mul(ganita_mat_get(q, j, i), load64(b + j * 8)));
-            j = j + 1;
-        }
-        store64(qtb + i * 8, sum);
+        store64(qtb + i * 8, load64(b + i * 8));
         i = i + 1;
+    }
+
+    var k = 0;
+    while (k < cols) {
+        var len = rows - k;
+
+        # Extract column k below the diagonal
+        i = 0;
+        while (i < len) {
+            store64(v + i * 8, ganita_mat_get(r, k + i, k));
+            i = i + 1;
+        }
+
+        # Compute norm of v
+        var norm = f64_from(0);
+        i = 0;
+        while (i < len) {
+            var vi = load64(v + i * 8);
+            norm = f64_add(norm, f64_mul(vi, vi));
+            i = i + 1;
+        }
+        norm = f64_sqrt(norm);
+
+        if (f64_gt(norm, LINALG_EPS) == 1) {
+            # Choose sign to avoid cancellation
+            var v0 = load64(v);
+            if (f64_gt(v0, f64_from(0)) == 1) {
+                store64(v, f64_add(v0, norm));
+            } else {
+                store64(v, f64_sub(v0, norm));
+            }
+
+            # Normalize v
+            var vnorm = f64_from(0);
+            i = 0;
+            while (i < len) {
+                var vi = load64(v + i * 8);
+                vnorm = f64_add(vnorm, f64_mul(vi, vi));
+                i = i + 1;
+            }
+            vnorm = f64_sqrt(vnorm);
+            if (f64_gt(vnorm, LINALG_EPS) == 1) {
+                i = 0;
+                while (i < len) {
+                    store64(v + i * 8, f64_div(load64(v + i * 8), vnorm));
+                    i = i + 1;
+                }
+            }
+
+            # Apply H = I - 2vv^T to R (columns k..cols)
+            var j = k;
+            while (j < cols) {
+                var dot = f64_from(0);
+                i = 0;
+                while (i < len) {
+                    dot = f64_add(dot, f64_mul(load64(v + i * 8), ganita_mat_get(r, k + i, j)));
+                    i = i + 1;
+                }
+                dot = f64_mul(f64_from(2), dot);
+                i = 0;
+                while (i < len) {
+                    var rij = ganita_mat_get(r, k + i, j);
+                    ganita_mat_set(r, k + i, j, f64_sub(rij, f64_mul(dot, load64(v + i * 8))));
+                    i = i + 1;
+                }
+                j = j + 1;
+            }
+
+            # Apply the SAME H to b. Sweeping every reflector across b in the
+            # order they hit A leaves Q^T·b behind, with no Q in between.
+            var dotb = f64_from(0);
+            i = 0;
+            while (i < len) {
+                dotb = f64_add(dotb, f64_mul(load64(v + i * 8), load64(qtb + (k + i) * 8)));
+                i = i + 1;
+            }
+            dotb = f64_mul(f64_from(2), dotb);
+            i = 0;
+            while (i < len) {
+                var bi = load64(qtb + (k + i) * 8);
+                store64(qtb + (k + i) * 8, f64_sub(bi, f64_mul(dotb, load64(v + i * 8))));
+                i = i + 1;
+            }
+        }
+        k = k + 1;
     }
 
     # Back-substitution on upper n×n of R
@@ -665,7 +808,8 @@ fn ganita_mat_least_squares(a, b, out_x): i64 {
 # Eigendecomposition for real symmetric matrices via Jacobi rotation.
 # out_vals: flat f64 array of length n (caller allocates via alloc(n*8)).
 # out_vecs: n×n matrix (caller allocates via ganita_mat_new). Columns are eigenvectors.
-# Returns number of iterations, or -1 if max iterations exceeded.
+# Returns number of iterations, -1 if max iterations exceeded, or -2 if the
+# working copy cannot be allocated. Any negative return is a failure.
 # Max 100*n^2 iterations. Converges when off-diagonal sum < LINALG_EPS.
 fn ganita_mat_eigen_sym(m, out_vals, out_vecs): i64 {
     _linalg_init_eps();
@@ -673,6 +817,7 @@ fn ganita_mat_eigen_sym(m, out_vals, out_vecs): i64 {
 
     # Copy m into working matrix A (will be diagonalized in place)
     var a = ganita_mat_copy(m);
+    if (a == 0) { return 0 - 2; }
 
     # Initialize out_vecs to identity (accumulates rotations)
     var i = 0;
@@ -790,7 +935,7 @@ fn ganita_mat_eigen_sym(m, out_vals, out_vecs): i64 {
 # out_u: m×n matrix (caller allocates).
 # out_sigma: flat f64 array of length n (singular values).
 # out_vt: n×n matrix (caller allocates, V transposed).
-# Returns 0 on success.
+# Returns 0 on success, -1 if any working allocation fails.
 fn ganita_mat_svd(m, out_u, out_sigma, out_vt): i64 {
     var rows = ganita_mat_rows(m);
     var cols = ganita_mat_cols(m);
@@ -798,12 +943,16 @@ fn ganita_mat_svd(m, out_u, out_sigma, out_vt): i64 {
 
     # Compute A^T * A (n×n symmetric)
     var mt = ganita_mat_transpose(m);
+    if (mt == 0) { return 0 - 1; }
     var ata = ganita_mat_mul(mt, m);
+    if (ata == 0) { return 0 - 1; }
 
     # Eigendecompose A^T*A → V, lambda
     var lambda = alloc(cols * 8);
+    if (lambda == 0) { return 0 - 1; }
     var v = ganita_mat_new(cols, cols);
-    ganita_mat_eigen_sym(ata, lambda, v);
+    if (v == 0) { return 0 - 1; }
+    if (ganita_mat_eigen_sym(ata, lambda, v) == 0 - 2) { return 0 - 1; }
 
     # Singular values = sqrt(eigenvalues), V^T = transpose of eigenvectors
     var i = 0;
@@ -846,6 +995,7 @@ fn ganita_mat_svd(m, out_u, out_sigma, out_vt): i64 {
 
     # V^T
     var vt_tmp = ganita_mat_transpose(v);
+    if (vt_tmp == 0) { return 0 - 1; }
     i = 0;
     var vt_total = cols * cols;
     while (i < vt_total) {
@@ -886,20 +1036,26 @@ fn ganita_mat_svd(m, out_u, out_sigma, out_vt): i64 {
 }
 
 # Moore-Penrose pseudoinverse via SVD.
-# Returns new n×m matrix (pseudoinverse of m×n input).
+# Returns new n×m matrix (pseudoinverse of m×n input), or 0 if any working
+# allocation fails. The n×n factors mean a wide input can exceed the cap even
+# when the input itself does not.
 fn ganita_mat_pseudo_inv(m): i64 {
     var rows = ganita_mat_rows(m);
     var cols = ganita_mat_cols(m);
     _linalg_init_eps();
 
     var u = ganita_mat_new(rows, cols);
+    if (u == 0) { return 0; }
     var sigma = alloc(cols * 8);
+    if (sigma == 0) { return 0; }
     var vt = ganita_mat_new(cols, cols);
-    ganita_mat_svd(m, u, sigma, vt);
+    if (vt == 0) { return 0; }
+    if (ganita_mat_svd(m, u, sigma, vt) != 0) { return 0; }
 
     # Pseudo-inverse = V * Sigma_inv * U^T
     # Build Sigma_inv diagonal matrix
     var sigma_inv = ganita_mat_new(cols, cols);
+    if (sigma_inv == 0) { return 0; }
     var i = 0;
     while (i < cols) {
         var sv = load64(sigma + i * 8);
@@ -911,21 +1067,29 @@ fn ganita_mat_pseudo_inv(m): i64 {
 
     # V = transpose of V^T
     var v = ganita_mat_transpose(vt);
+    if (v == 0) { return 0; }
     var ut = ganita_mat_transpose(u);
+    if (ut == 0) { return 0; }
 
     # V * Sigma_inv
     var vs = ganita_mat_mul(v, sigma_inv);
+    if (vs == 0) { return 0; }
     # (V * Sigma_inv) * U^T
     return ganita_mat_mul(vs, ut);
 }
 
 # Numerical rank: count of singular values above tolerance.
+# Returns -1 if any working allocation fails — a rank is never negative, so the
+# failure cannot be mistaken for the rank-0 answer.
 fn ganita_mat_rank(m, tol): i64 {
     var cols = ganita_mat_cols(m);
     var u = ganita_mat_new(ganita_mat_rows(m), cols);
+    if (u == 0) { return 0 - 1; }
     var sigma = alloc(cols * 8);
+    if (sigma == 0) { return 0 - 1; }
     var vt = ganita_mat_new(cols, cols);
-    ganita_mat_svd(m, u, sigma, vt);
+    if (vt == 0) { return 0 - 1; }
+    if (ganita_mat_svd(m, u, sigma, vt) != 0) { return 0 - 1; }
 
     var rank = 0;
     var i = 0;
@@ -939,15 +1103,20 @@ fn ganita_mat_rank(m, tol): i64 {
 }
 
 # Condition number: sigma_max / sigma_min.
-# Returns f64. Returns -1 if matrix is singular (sigma_min ≈ 0).
+# Returns f64. Returns -1.0 if matrix is singular (sigma_min ≈ 0), and NaN if any
+# working allocation fails — distinct from -1.0, which is a real answer about the
+# matrix rather than about the run.
 fn ganita_mat_condition(m): i64 {
     var cols = ganita_mat_cols(m);
     _linalg_init_eps();
 
     var u = ganita_mat_new(ganita_mat_rows(m), cols);
+    if (u == 0) { return f64_div(f64_from(0), f64_from(0)); }
     var sigma = alloc(cols * 8);
+    if (sigma == 0) { return f64_div(f64_from(0), f64_from(0)); }
     var vt = ganita_mat_new(cols, cols);
-    ganita_mat_svd(m, u, sigma, vt);
+    if (vt == 0) { return f64_div(f64_from(0), f64_from(0)); }
+    if (ganita_mat_svd(m, u, sigma, vt) != 0) { return f64_div(f64_from(0), f64_from(0)); }
 
     var smax = load64(sigma);
     var smin = load64(sigma + (cols - 1) * 8);

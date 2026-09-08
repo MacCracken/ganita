@@ -1,19 +1,26 @@
 # ganita_mat_least_squares: unchecked internal Q allocation -> SIGSEGV.
 #
+# ✅ FIXED IN 1.2.2 -- this file is now a regression witness, not a bug report.
+# It exits 139 (SIGSEGV) on 1.1.4 through 1.2.1 and 0 from 1.2.2 on, where
+# least_squares applies the Householder reflectors to b directly and forms no Q
+# at all. The same case is pinned inside the suite as an assertion on the fitted
+# coefficients (tests/ganita.tcyr, "linalg: least squares"); this stays because
+# an exit code is the clearest possible statement of what the defect WAS.
+#
 # Build and run from the ganita repo root:
 #   cyrius build docs/development/issues/repros/2026-08-23-least-squares-unchecked-q-alloc.cyr /tmp/lsq
-#   /tmp/lsq; echo "exit=$?"        # -> 139 (SIGSEGV)
+#   /tmp/lsq; echo "exit=$?"        # -> 139 before 1.2.2, 0 from 1.2.2
 #
 # Includes src/ directly rather than lib/ganita.cyr so it exercises the working
-# source (the bundled lib/ in this repo is 1.1.1; src/ is 1.1.4). Include order
-# mirrors tests/ganita.tcyr and the [lib].modules list.
+# source (the bundled lib/ in this repo trails src/ by a release or so). Include
+# order mirrors tests/ganita.tcyr and the [lib].modules list.
 #
 # The design below is 5793 x 3 -- 17,379 elements, 0.05% of
 # GANITA_MAT_MAX_ELEMS (33,554,430), so ganita_mat_new accepts the CALLER's
-# matrix without complaint. The Q that ganita_mat_least_squares forms internally
-# is 5793 x 5793 = 33,558,849 elements, just OVER the cap, so its mat_new
-# returns 0 -- and the return is never checked. 5793 is the exact first failing
-# m for n = 3: 33554430 / 5793 = 5792.
+# matrix without complaint. The Q that ganita_mat_least_squares used to form
+# internally is 5793 x 5793 = 33,558,849 elements, just OVER the cap, so its
+# mat_new returned 0 -- and the return was never checked. 5793 is the exact
+# first failing m for n = 3: 33554430 / 5793 = 5792.
 
 include "lib/syscalls.cyr"
 include "lib/string.cyr"
@@ -62,10 +69,10 @@ fn main(): i64 {
     }
     var out = alloc(n * 8);
 
-    println("calling ganita_mat_least_squares (forms a 5793 x 5793 Q internally)...");
+    println("calling ganita_mat_least_squares (formed a 5793 x 5793 Q before 1.2.2)...");
     var rc = ganita_mat_least_squares(a, b, out);
 
-    # Not reached on an affected build.
+    # Not reached on an affected build (1.1.4 .. 1.2.1).
     println("returned without faulting");
     fmt_int(rc);
     return 0;
