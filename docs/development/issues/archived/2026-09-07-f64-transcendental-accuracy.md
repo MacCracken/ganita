@@ -27,6 +27,16 @@
 >    longer calls an infinity an integer. **The underlying `f64_exp(±inf) = NaN`
 >    is a stdlib defect and is NOT fixed here** — ganita only guards around it.
 >
+>    ✅ **Filed upstream 2026-09-08**:
+>    `cyrius/docs/development/issues/2026-09-08-f64-exp-nan-for-infinite-argument.md`,
+>    with a repro that exits with the number of wrong answers — 4 today, 0 when
+>    fixed. Scope confirmed there as **exactly `f64_exp` and `f64_exp2`, both
+>    signs of infinity**: every other f64 builtin already matches C, and
+>    `f64_atan(±inf)` is bit-exactly ±π/2. Root cause is the range reduction
+>    computing `inf − inf`, in the x87 native path AND `_f64_exp_polyfill`, plus
+>    a second break where the `2^n` bit-pack reads `f64_to(inf) = i64::MIN` as an
+>    exponent. ganita's guards can come out when that lands and ganita re-pins.
+>
 > Also closed: `acos`, `acosh` and `atanh` now return NaN outside their domains
 > instead of whatever the formula produced.
 

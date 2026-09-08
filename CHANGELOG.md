@@ -86,6 +86,11 @@ which is why this was easy to under-read.
   the (709.783, 710.476] band.
 - **Infinities**: `sinh(±inf) = ±inf`, `cosh(±inf) = +inf`. ⚠ These are *guards* —
   the root cause is stdlib's `f64_exp(±inf) = NaN`, which is not ganita's to fix.
+  **Filed upstream 2026-09-08** as
+  `cyrius/docs/development/issues/2026-09-08-f64-exp-nan-for-infinite-argument.md`
+  with a repro. Scope there is exactly `f64_exp` and `f64_exp2` at both signs of
+  infinity — every other f64 builtin already matches C. The guards come out when
+  it lands and ganita re-pins.
 - **Domains**: `acos`, `acosh`, `atanh` return NaN outside their domains.
   `_f64_is_int` no longer calls an infinity an integer.
 
