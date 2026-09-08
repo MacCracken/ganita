@@ -4,6 +4,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`cyrius bench` runs with zero warnings again.** Every run printed
+  `warning: undefined function 'ganita_f64_pow' / 'ganita_f64_atan2' /
+  'ganita_f64_hypot'`. `tests/ganita.bcyr` carries its own include list — the
+  auto-prepend is skipped once a file has includes — and it included
+  `src/math_f32.cyr` **without** `src/math_advanced.cyr`, but `math_f32`'s
+  `pow` / `atan2` / `hypot` / `cbrt` forward to the `ganita_f64_*` fns that live
+  there. Fixed by adding `include "src/math_advanced.cyr"` ahead of the
+  `math_f32` include, matching the order `tests/ganita.tcyr` already uses (the
+  compiler is single-pass, so definition order matters).
+
+  Harmless until now only because no benchmark called those four — the first one
+  that did would have linked against nothing. No `src/` change, no behavioural
+  change: 243/243 assertions, `audit` exits 0, `fmt --check` clean.
+
 ## [1.2.1] — 2026-09-07 — toolchain 6.6.0, and the docs audit that came with it
 
 Maintenance. Cyrius pin `6.5.36` → **6.6.0**, `lib/` re-vendored to an exact match

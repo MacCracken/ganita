@@ -7,7 +7,9 @@
 # the full overhead-vs-batching guidance.
 #
 # Carries its own includes so the f32 tier is in scope (auto-prepend is skipped
-# once a file has includes), mirroring tests/ganita.tcyr's list.
+# once a file has includes), mirroring tests/ganita.tcyr's list. math_advanced
+# comes first because the f32 pow/atan2/hypot/cbrt forward to its ganita_f64_*
+# implementations and the compiler is single-pass.
 include "lib/syscalls.cyr"
 include "lib/string.cyr"
 include "lib/alloc.cyr"
@@ -17,6 +19,7 @@ include "lib/str.cyr"
 include "lib/math.cyr"
 include "lib/bench.cyr"
 
+include "src/math_advanced.cyr"
 include "src/math_f32.cyr"
 
 # Empty call: measures the harness floor, not any ganita work.

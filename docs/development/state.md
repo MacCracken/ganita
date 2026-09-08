@@ -203,26 +203,17 @@ tree diff · consumer-check.
    does no fuzzing. It reports PASS, so the CI gate that runs it is vacuous until
    the harness is real. (`tests/ganita.bcyr` grew real f32 benchmarks at 1.2.0;
    only its `bench_noop` floor is scaffold.)
-2. **`cyrius bench` links with three undefined symbols.**
-   `warning: undefined function 'ganita_f64_pow' / 'ganita_f64_atan2' /
-   'ganita_f64_hypot'` on every run. `tests/ganita.bcyr` carries its own include
-   list and includes `src/math_f32.cyr` **without** `src/math_advanced.cyr`, but
-   `math_f32`'s `pow`/`atan2`/`hypot`/`cbrt` forward to the `ganita_f64_*` fns
-   that live there. Harmless today only because no benchmark calls those four —
-   the first one that does links against nothing. Pre-dates 1.2.1 (unrelated to
-   the 6.6.0 bump); the fix is one `include` line, deliberately not bundled into
-   a toolchain release.
-3. **`fmt_float` drops the carry when a fraction rounds up to 1.0** —
+2. **`fmt_float` drops the carry when a fraction rounds up to 1.0** —
    `fmt_float(2.9999999, 6)` prints `2.1000000` (seven fraction digits). Display
    only, but near-integer results are routine after a decomposition, so correct
    answers read as wrong ones. cyrius stdlib, vendored. Filed:
    [2026-08-19](issues/2026-08-19-fmt-float-missing-carry-on-round-up.md).
    ganita's tests assert numerically, never on printed text, so they are
    unaffected.
-4. **`math_advanced.cyr` is 4/13** — the remaining in-repo coverage gap now that
+3. **`math_advanced.cyr` is 4/13** — the remaining in-repo coverage gap now that
    the f32 and linalg tiers are done. Its deep coverage lives upstream in
    cyrius's `math` `.tcyr` suite.
-5. **`lib/ganita.cyr` is ganita's own fold vendored back into ganita's own
+4. **`lib/ganita.cyr` is ganita's own fold vendored back into ganita's own
    `lib/`** — new at this pin, because `lib sync --full` copies the whole
    snapshot and cyrius now carries the ganita fold. Nothing in `src/`,
    `tests/`, or `cyrius.cyml` includes it, so it is inert, but it defines the
@@ -231,7 +222,7 @@ tree diff · consumer-check.
    the durable fix is upstream, a `lib sync` self-exclusion. bayan carries the
    identical gap. At the 6.6.0 pin it holds ganita **1.2.0** — one release behind
    `src/`, so it is also stale, not merely redundant.
-6. **`README.md` is stale** — still describes the pre-1.1.0 surface.
+5. **`README.md` is stale** — still describes the pre-1.1.0 surface.
 
 ## Dependencies
 
