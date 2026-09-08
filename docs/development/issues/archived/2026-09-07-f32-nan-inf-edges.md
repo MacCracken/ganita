@@ -1,5 +1,26 @@
 # f32 tier: NaN and infinity edges, and the missing comparators
 
+> ✅ **RESOLVED in ganita 1.2.4** (2026-09-08). All five items closed.
+>
+> 1. **min/max are IEEE-754 minNum/maxNum**: a NaN operand is ignored, and NaN
+>    comes back only when both are. The filing left this as a decision between
+>    three options; the choice made was (b) — an explicit NaN test — because the
+>    previous behaviour was not a defensible trade but an accident: whether a NaN
+>    won or lost depended on its SIGN BIT.
+> 2. **clamp propagates a NaN x** rather than ignoring it, deliberately unlike
+>    min/max: clamp transforms ONE value and a NaN has no clamped form, whereas
+>    min/max choose between two and skipping an absent one is meaningful.
+>    Composing min and max would have quietly returned `hi`.
+> 3. **`exp`/`exp2` handle infinities** — `+inf` and `0` respectively.
+> 4. **`sign(NaN)` returns NaN**; **`cbrt(±inf)` returns ±inf**.
+> 5. **The comparators exist**: `ganita_f32_lt` / `_le` / `_gt` / `_ge`, all
+>    false on a NaN operand. They normalise the ZEROS, which `_f32_key` alone
+>    does not — the key is a total order that ranks -0.0 below +0.0, correct for
+>    sorting and wrong for comparison, where IEEE says the zeros are equal.
+>    That distinction is why these are four functions rather than an exported
+>    `_f32_key`, and it was caught by a failing assertion, not by inspection.
+
+
 **Filed by**: ganita's 1.2.3 P(-1) sweep (math-f32 lens)
 **Against**: `src/math_f32.cyr`
 **Date**: 2026-09-07

@@ -118,8 +118,40 @@ fn bench_eigen(n, reps, handle): i64 {
     return 0;
 }
 
+# Time `reps` multiplications of two n x n matrices.
+fn bench_matmul(n, reps, handle): i64 {
+    var a = bench_sym_matrix(n);
+    var b = bench_sym_matrix(n);
+    if (a == 0 || b == 0) { return 0 - 1; }
+    bench_batch_start(handle);
+    var i = 0;
+    while (i < reps) {
+        ganita_mat_mul(a, b);
+        i = i + 1;
+    }
+    bench_batch_stop(handle, reps);
+    bench_report(handle);
+    return 0;
+}
+
+# Time `reps` numerical-rank computations of an n x n matrix.
+fn bench_rank(n, reps, handle): i64 {
+    var a = bench_sym_matrix(n);
+    if (a == 0) { return 0 - 1; }
+    var tol = f64_div(f64_from(1), f64_from(1000000000));
+    bench_batch_start(handle);
+    var i = 0;
+    while (i < reps) {
+        ganita_mat_rank(a, tol);
+        i = i + 1;
+    }
+    bench_batch_stop(handle, reps);
+    bench_report(handle);
+    return 0;
+}
+
 # Bench entry point — harness floor, f32 native vs widened for mul and lerp,
-# least-squares scaling, then the Jacobi eigensolver.
+# least-squares scaling, the Jacobi eigensolver, then matmul and rank.
 fn main(): i64 {
     alloc_init();
     var b = bench_new("noop");
@@ -183,6 +215,18 @@ fn main(): i64 {
     bench_eigen(20, 20, bench_new("eigen_sym n=20"));
     bench_eigen(40, 10, bench_new("eigen_sym n=40"));
     bench_eigen(80, 3, bench_new("eigen_sym n=80"));
+
+    # --- 1.2.4 optimizations ---------------------------------------------
+    # mat_mul's accumulation loop uses raw row/column pointers instead of
+    # ganita_mat_get, which re-reads the header and recomputes the offset on
+    # every call — twice per multiply-accumulate. Measured 3.34x at 120x120
+    # against 1.2.3 on this host.
+    bench_matmul(60, 10, bench_new("mat_mul 60x60"));
+    bench_matmul(120, 3, bench_new("mat_mul 120x120"));
+    # rank reads only the singular values, so it now takes a values-only path
+    # that skips the V accumulation and the U construction entirely. Measured
+    # 1.61x at 40x40 — which also folds in the move off the A^T A eigensolver.
+    bench_rank(40, 5, bench_new("rank 40x40 (values-only SVD)"));
     return 0;
 }
 

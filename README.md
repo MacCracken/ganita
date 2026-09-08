@@ -13,12 +13,13 @@ Written in [Cyrius](https://github.com/MacCracken/cyrius).
 
 ## Status
 
-**1.2.3** — P(-1) hardening sweep. See [`CHANGELOG.md`](CHANGELOG.md) for the
-full history and [`docs/development/state.md`](docs/development/state.md) for the
-live snapshot. Recent releases in brief:
+**1.2.4** — the P(-1) backlog, repaired. See [`CHANGELOG.md`](CHANGELOG.md) for
+the full history and [`docs/development/state.md`](docs/development/state.md) for
+the live snapshot. Recent releases in brief:
 
 | | |
 |---|---|
+| **1.2.4** | relative tolerances, one-sided Jacobi SVD, exact integer `pow`, f32 comparators; mat_mul 3.34× |
 | **1.2.3** | P(-1) sweep: audit, hardening, optimization, runnable examples, security policy |
 | **1.2.2** | `mat_least_squares` forms no Q at all (was a SIGSEGV at m ≈ 5793); every internal allocation checked |
 | **1.2.1** | toolchain 6.5.36 → 6.6.0 |
@@ -33,7 +34,7 @@ live snapshot. Recent releases in brief:
 | `matrix` | `ganita_mat_*` | dense f64 matrix: new / from / identity / get / set / add / sub / scale / mul / transpose / dot / print |
 | `linalg` | `ganita_mat_*` | copy / neg / row / col / set_row / set_col / submatrix / trace / eq / is_symmetric / frobenius / max_norm · LU / det / inverse / Cholesky / QR / Gaussian-elim / least-squares / eigen-sym / SVD / pseudo-inverse / rank / condition |
 | `math_advanced` | `ganita_f64_*`, `ganita_fibonacci`/`ganita_binomial` | transcendental (sinh/cosh/tanh/pow/asin/acos/atan2/asinh/acosh/atanh/hypot) + number theory |
-| `math_f32` | `ganita_f32_*` | single-precision scalar tier: native arithmetic (add/sub/mul/div), shape (abs/neg/sign/min/max/clamp/floor/ceil/trunc/round/lerp), sqrt, and transcendental forwarders |
+| `math_f32` | `ganita_f32_*` | single-precision scalar tier: native arithmetic (add/sub/mul/div), comparators (lt/le/gt/ge), shape (abs/neg/sign/min/max/clamp/floor/ceil/trunc/round/lerp), sqrt, and transcendental forwarders |
 
 ### Back-compat aliases
 
@@ -50,12 +51,16 @@ and for an allocation failure. Every function that builds a matrix propagates
 that null. **Check it.** ganita 1.2.2 fixed a SIGSEGV that existed only because
 one internal caller did not, on a caller's matrix that was 0.05 % of the cap.
 
-**Failure is reported in each function's own vocabulary.** Null for the matrix-
-and array-returning functions, `-1` for the status ones (`-2` for `eigen_sym`,
-whose `-1` already meant max-iterations), and **NaN** for `det` and `condition` —
-because `0.0` and `-1.0` are real answers *about the matrix* there, and
-overloading either would report an invertible matrix as singular. The full table
-is in [`docs/examples/README.md`](docs/examples/README.md).
+**Failure is reported in each function's own vocabulary**, settled in
+[ADR 0001](docs/adr/0001-failure-vocabulary.md): null for the matrix- and
+array-returning functions; **negative** for the status ones (`-1` allocation,
+`-2` contract violation, `-3` non-convergence), so `< 0` is a universal failure
+test; and **NaN** for `det` and `condition` — because `0.0` and `-1.0` are real
+answers *about the matrix* there, and overloading either would report an
+invertible matrix as singular. `ganita_mat_lu` is the one exception: its
+successes are the permutation signs `+1`/`-1`, so it folds failure into its
+existing `0`. The full table is in
+[`docs/examples/README.md`](docs/examples/README.md).
 
 ## Build
 

@@ -39,9 +39,9 @@ different one:
 |---|---|---|
 | a matrix (`copy`, `inv`, `transpose`, `mul`, `pseudo_inv`, …) | pointer | `0` |
 | a flat array (`row`, `col`) | pointer | `0` |
-| a status (`lu_solve`, `cholesky_solve`, `qr`, `least_squares`, `svd`) | `0` | `-1` |
-| `eigen_sym` | iteration count ≥ 0 | `-1` max iterations · `-2` allocation |
-| `rank` | count ≥ 0 | `-1` |
+| a status (`lu_solve`, `cholesky_solve`, `qr`, `least_squares`, `svd`) | `0` | `-1` allocation · `-2` contract violation |
+| `eigen_sym` | rotation count ≥ 0 | `-1` allocation · `-2` contract · `-3` max iterations |
+| `rank` | count ≥ 0 | `-1` allocation · `-2` contract |
 | `det` | the determinant, `0.0` if singular | **NaN** |
 | `condition` | the ratio, `-1.0` if singular | **NaN** |
 | `lu` | permutation sign ±1 | `0` if singular |
@@ -51,6 +51,12 @@ different one:
 `det` and `condition` return NaN rather than `0.0` / `-1.0` because those two values
 are real answers *about the matrix*. Overloading either to also mean "the run failed"
 would report a perfectly invertible matrix as singular.
+
+The negative codes are uniform across every status function, so `< 0` is a
+universal failure test — see [ADR 0001](../adr/0001-failure-vocabulary.md).
+`ganita_mat_lu` is the single exception: its successful returns are the
+permutation signs `+1` and `-1`, leaving no negative to spend, so it folds a
+contract violation into the `0` that already means "cannot decompose".
 
 ## Contracts the examples rely on
 

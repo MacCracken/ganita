@@ -2,9 +2,22 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-09-07 (P(-1) sweep).
+> Last refreshed: 2026-09-08 (the P(-1) backlog, repaired).
 
 ## Version
+
+**1.2.4** — **the P(-1) backlog, repaired.** Four of the five 1.2.3 filings
+closed, plus five of six items in the fifth. **`LINALG_EPS` is a RELATIVE factor**
+now, so singularity verdicts no longer depend on the caller's units — a 2×2
+identity scaled by 1e-20 read *singular / null / cond −1.0* from `det`/`inv`/
+`condition` while `rank` said full rank, i.e. the library contradicted itself.
+**SVD is one-sided Jacobi** and never forms AᵀA: on `[[1,1],[1,1+e]]` the
+invariant σ₁σ₂ = |det| was *exactly 0* at e=1e-9 and is now 1.000000. **`pow` on
+an integral exponent is exact** (`pow(7,2)` was 48.999… and floored to 48).
+`hypot` scales before squaring; `acos` uses the half-angle form; sinh/tanh/atanh
+get small-|x| series; f32 min/max are IEEE minNum/maxNum and the tier finally
+ships `lt`/`le`/`gt`/`ge`. Measured: **mat_mul 3.34×**, rank 1.61×. 433
+assertions (was 322).
 
 **1.2.3** — **P(-1) hardening sweep.** Seven audit lenses over `src/`, each
 adversarially verified, every finding reproduced by a program that was built and
@@ -221,8 +234,8 @@ Two figures are now tracked, and CI gates on **both**:
 
 | | 1.2.2 | 1.2.3 | gate |
 |---|---|---|---|
-| `cyrius coverage` (substring) | 109/135 (80 %) | **115/135 (85 %)** | `--min 85` |
-| `scripts/coverage-honest.sh` (word boundary, comments stripped) | 72/135 (**53 %**) | **77/142 (54 %)** | `54` |
+| `cyrius coverage` (substring) | 109/135 (80 %) | **131/139 (94 %)** | `--min 94` |
+| `scripts/coverage-honest.sh` (word boundary, comments stripped) | 72/135 (**53 %**) | **87/153 (56 %)** | `56` |
 
 The honest count is the one to plan against. The tool's is kept as a ratchet
 because it sees things a regex does not — but it is not the only gate, because it
@@ -233,11 +246,14 @@ helpers added by the sweep):
 
 | Module | Referenced |
 |---|---|
-| `math_f32.cyr`      | 27/29 |
-| `linalg.cyr`        | 26/29 |
-| `matrix.cyr`        | 12/14 |
-| `math_advanced.cyr` | 5/15 |
+| `math_f32.cyr`      | 31/35 |
+| `linalg.cyr`        | 26/31 |
+| `matrix.cyr`        | 12/15 |
+| `math_advanced.cyr` | 11/17 |
 | `_compat.cyr`       | **5/53** |
+
+`math_advanced.cyr` went 5/15 → 11/17 at 1.2.4: the accuracy repairs came with
+assertions, which is where most of that came from.
 
 **`_compat.cyr` was published as 40/53 and is really 5/53.** Anyone planning the
 alias removal against "75 % exercised" was planning against nothing. All 53 were
@@ -286,21 +302,19 @@ wrong thing:
 
 ## Open filings
 
-**Five**, all opened by the 1.2.3 P(-1) sweep, all reproduced, all deliberately
-deferred rather than rushed into a hardening patch. Reasons are in each file and
-summarised in [the audit](../audit/2026-09-07-v1.2.3-audit.md).
+**One**, down from five. The 1.2.3 P(-1) sweep opened five; 1.2.4 closed four
+outright and five of the six items in the fifth. Reasons are in each file and
+summarised in [the 1.2.3 audit](../audit/2026-09-07-v1.2.3-audit.md).
 
-| Severity | Filing | Why deferred |
+| Severity | Filing | Status |
 |---|---|---|
-| **HIGH** | [`linalg-eps-absolute-tolerance`](issues/2026-09-07-linalg-eps-absolute-tolerance.md) | Changes what "singular" MEANS across 11 functions; needs its own release and a decision on whether the tolerance becomes a parameter |
-| MEDIUM | [`svd-via-ata-squares-condition`](issues/2026-09-07-svd-via-ata-squares-condition.md) | A replacement algorithm (one-sided Jacobi), not a repair |
-| MEDIUM | [`f64-transcendental-accuracy`](issues/2026-09-07-f64-transcendental-accuracy.md) | Series expansions and scaled reformulations — numerics work, not hardening |
-| MEDIUM | [`f32-nan-inf-edges`](issues/2026-09-07-f32-nan-inf-edges.md) | Contract *decisions* about NaN/inf semantics, plus new public API |
-| MEDIUM | [`performance-backlog`](issues/2026-09-07-performance-backlog.md) | Measured, ranked; includes raising `GANITA_MAT_MAX_ELEMS` |
+| MEDIUM | [`performance-backlog`](issues/2026-09-07-performance-backlog.md) | **Partially resolved at 1.2.4** — 5 of 6 items landed and are measured. What remains: `mat_inv`'s per-call scratch and the discarded transposes both need a public API change, and raising `GANITA_MAT_MAX_ELEMS` is still the policy question the 1.2.3 audit deferred. |
 
-The LINALG_EPS one is the one to read. An absolute 1e-12 makes the library
-**contradict itself**: scale a well-conditioned matrix down by 1e-6 and `det`,
-`inv` and `condition` call it singular while `rank` calls it full rank.
+Four filings closed at 1.2.4 — the absolute `LINALG_EPS`, SVD via AᵀA, the f64
+transcendental accuracy group, and the f32 NaN/inf group — all in
+`issues/archived/` with resolution banners. The performance one is kept **open**
+rather than archived: an open item in an archived folder is how a backlog quietly
+disappears.
 
 Closed at 1.2.2 and kept as history: the `ganita_mat_least_squares` null write and
 `fmt_float`'s dropped carry (fixed upstream at cyrius 6.5.30). The repro

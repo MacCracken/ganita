@@ -1,5 +1,30 @@
 # `LINALG_EPS` is an absolute 1e-12, so every singularity verdict depends on the caller's units
 
+> ✅ **RESOLVED in ganita 1.2.4** (2026-09-08). `LINALG_EPS` is now a RELATIVE
+> factor, multiplied by a magnitude taken from the data at each use site: the
+> matrix scale for the pivot tests in `lu` and `gaussian_elim`, the input's
+> largest entry for the reflector tests in `qr` and `least_squares`, the initial
+> off-diagonal magnitude for Jacobi convergence, and the largest singular value
+> for the rank tests in `svd`, `pseudo_inv` and `condition`. It is also EAGER —
+> a literal bit pattern rather than a lazily-initialised global — so no call
+> depends any more on what ran before it.
+>
+> The self-contradiction is closed, verified in both directions: a 2x2 identity
+> scaled by 1e-20 (cond = 1) now reads *not singular, inv ok, rank 2, cond 1.0*
+> where 1.2.3 said *singular, null, rank 2, -1.0*; and `[1 2; 2 4]` stays
+> singular scaled up by 1e9.
+>
+> The QR half is closed too. The two-norm is now computed by scaling out the
+> largest magnitude first (`_linalg_norm2`), so it no longer overflows to NaN
+> for large-magnitude matrices, and the reflector skip test is relative, so a
+> merely small-scaled matrix no longer gets every reflector skipped.
+>
+> The open question the filing raised — *should the tolerance become a
+> parameter?* — was answered NO for now: `mat_eq`, `is_symmetric` and `rank`
+> already take one, and the rest are internal judgements where a relative
+> default is the right behaviour. Revisit if a consumer needs to tune it.
+
+
 **Filed by**: ganita's own 1.2.3 P(-1) sweep (linalg-core and contracts lenses,
 independently, then confirmed by both verifiers)
 **Against**: `src/linalg.cyr:16` and every function that reads `LINALG_EPS`

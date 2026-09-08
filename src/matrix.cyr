@@ -36,6 +36,26 @@
 # tracked separately — see docs/audit/2026-09-07-v1.2.3-audit.md.
 var GANITA_MAT_MAX_ELEMS = 33554430;
 
+# Allocate WITHOUT the zero fill — internal use only.
+#
+# ganita_mat_new's zero fill is part of its public contract: a fresh matrix reads
+# as zeros. But nine callers inside this module and linalg.cyr write every
+# element immediately afterwards, so for them the fill is a second full pass over
+# the buffer that nothing can observe. This keeps the CWE-190 guard — which is
+# the part that matters — and skips only the fill.
+#
+# ⚠ Use this ONLY where every element is provably written before any read. The
+# guard is identical; the memory is not zeroed.
+fn _ganita_mat_new_raw(rows, cols): i64 {
+    if (rows <= 0 || cols <= 0) { return 0; }
+    if (rows > GANITA_MAT_MAX_ELEMS / cols) { return 0; }
+    var m = alloc(16 + rows * cols * 8);
+    if (m == 0) { return 0; }
+    store64(m, rows);
+    store64(m + 8, cols);
+    return m;
+}
+
 # Create a zero-filled rows x cols matrix. Returns 0 (null) for non-positive
 # dimensions, for an element count too large to allocate (overflow-safe), or on
 # allocation failure — a caller sizing a matrix from untrusted input MUST check
@@ -101,7 +121,7 @@ fn ganita_mat_identity(n): i64 {
 # Create a matrix from a flat array of f64 values. Propagates null from
 # ganita_mat_new for non-positive / overflow-prone dims (CWE-190 guard).
 fn ganita_mat_from(rows, cols, data): i64 {
-    var m = ganita_mat_new(rows, cols);
+    var m = _ganita_mat_new_raw(rows, cols);
     if (m == 0) { return 0; }
     var i = 0;
     while (i < rows * cols) {
@@ -122,7 +142,7 @@ fn ganita_mat_add(a, b): i64 {
     var rows = ganita_mat_rows(a);
     var cols = ganita_mat_cols(a);
     if ((ganita_mat_rows(b) != rows) || (ganita_mat_cols(b) != cols)) { return 0; }
-    var c = ganita_mat_new(rows, cols);
+    var c = _ganita_mat_new_raw(rows, cols);
     if (c == 0) { return 0; }
     var i = 0;
     while (i < rows * cols) {
@@ -142,7 +162,7 @@ fn ganita_mat_sub(a, b): i64 {
     var rows = ganita_mat_rows(a);
     var cols = ganita_mat_cols(a);
     if ((ganita_mat_rows(b) != rows) || (ganita_mat_cols(b) != cols)) { return 0; }
-    var c = ganita_mat_new(rows, cols);
+    var c = _ganita_mat_new_raw(rows, cols);
     if (c == 0) { return 0; }
     var i = 0;
     while (i < rows * cols) {
@@ -160,7 +180,7 @@ fn ganita_mat_scale(a, scalar): i64 {
     if (a == 0) { return 0; }
     var rows = ganita_mat_rows(a);
     var cols = ganita_mat_cols(a);
-    var c = ganita_mat_new(rows, cols);
+    var c = _ganita_mat_new_raw(rows, cols);
     if (c == 0) { return 0; }
     var i = 0;
     while (i < rows * cols) {
@@ -189,19 +209,35 @@ fn ganita_mat_mul(a, b): i64 {
     var k = ganita_mat_cols(a);
     if (ganita_mat_rows(b) != k) { return 0; }
     var n = ganita_mat_cols(b);
-    var c = ganita_mat_new(m, n);
+    var c = _ganita_mat_new_raw(m, n);
     if (c == 0) { return 0; }
+    # ⚡ Raw pointers in the accumulation loop (1.2.4). ganita_mat_get re-reads
+    # the column count from the header and recomputes the whole offset on every
+    # call, and this loop calls it TWICE per multiply-accumulate — the measured
+    # cost was 2x to 3.7x over a hoisted base. This is the one place in the
+    # module where that is worth open-coding, because it is the only O(m*n*k)
+    # loop; everywhere else the accessors stay, since a per-element saving that
+    # nobody can measure is not worth an off-by-one that writes out of bounds.
+    #
+    # a_row walks A's row i contiguously (stride 8). b_col walks B's column j
+    # (stride n*8). c_ptr walks C's row i contiguously.
     var i = 0;
     while (i < m) {
+        var a_row = a + 16 + i * k * 8;
+        var c_ptr = c + 16 + i * n * 8;
         var j = 0;
         while (j < n) {
             var sum = f64_from(0);
+            var ap = a_row;
+            var bp = b + 16 + j * 8;
             var p = 0;
             while (p < k) {
-                sum = f64_add(sum, f64_mul(ganita_mat_get(a, i, p), ganita_mat_get(b, p, j)));
+                sum = f64_add(sum, f64_mul(load64(ap), load64(bp)));
+                ap = ap + 8;
+                bp = bp + n * 8;
                 p = p + 1;
             }
-            ganita_mat_set(c, i, j, sum);
+            store64(c_ptr + j * 8, sum);
             j = j + 1;
         }
         i = i + 1;
@@ -215,7 +251,7 @@ fn ganita_mat_transpose(a): i64 {
     if (a == 0) { return 0; }
     var rows = ganita_mat_rows(a);
     var cols = ganita_mat_cols(a);
-    var t = ganita_mat_new(cols, rows);
+    var t = _ganita_mat_new_raw(cols, rows);
     if (t == 0) { return 0; }
     var i = 0;
     while (i < rows) {

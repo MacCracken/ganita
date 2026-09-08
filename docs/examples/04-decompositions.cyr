@@ -68,10 +68,9 @@ fn main(): i64 {
     syscall(1, 1, ", R[2][0] = ", 12); fmt_float(ganita_mat_get(r, 2, 0), 12); println("");
 
     # --- symmetric eigendecomposition (Jacobi) -----------------------------
-    # [[2,1],[1,2]] has eigenvalues 3 and 1. eigen_sym returns the ITERATION
-    # COUNT on success — any NEGATIVE return is a failure: -1 means it hit the
-    # 100*n^2 iteration ceiling, -2 (since 1.2.2) means a working allocation
-    # failed. Check `>= 0`, not `== 0`.
+    # [[2,1],[1,2]] has eigenvalues 3 and 1. eigen_sym returns the ROTATION
+    # COUNT on success — any NEGATIVE return is a failure: -1 allocation, -2
+    # contract violation, -3 max iterations exceeded. Check `>= 0`, not `== 0`.
     println("");
     println("Symmetric eigendecomposition of [2 1; 1 2]  (eigenvalues 3 and 1)");
     var sym = ganita_mat_new(2, 2);

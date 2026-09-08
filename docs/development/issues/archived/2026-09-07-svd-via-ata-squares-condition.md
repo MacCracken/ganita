@@ -1,5 +1,32 @@
 # SVD is computed from the eigendecomposition of AᵀA, which squares the condition number
 
+> ✅ **RESOLVED in ganita 1.2.4** (2026-09-08). `ganita_mat_svd` is now a
+> ONE-SIDED JACOBI SVD. It orthogonalises A's columns in place by rotations
+> applied on the right, accumulating V; at convergence sigma_j is the norm of
+> column j and U's column j is that column normalised. **A is never squared**,
+> so the conditioning the caller hands in is the conditioning it works in. The
+> matrix is scaled by its largest entry up front and the singular values scaled
+> back, so the column dot products cannot overflow either.
+>
+> Measured on `A = [[1, 1], [1, 1+e]]` — entries all O(1), det = e, so the
+> singular values are ~2 and ~e/2. The invariant is `sigma1 * sigma2 = |det A|`:
+>
+> | e | 1.2.3 (via AᵀA) | 1.2.4 |
+> |---|---|---|
+> | 1e-6 | 1.000045 | **1.000000** |
+> | 1e-9 | **0.000000 — sigma2 collapsed to exactly zero** | **1.000000** |
+> | 1e-11 | **0.000000** | 1.000008 |
+>
+> At e=1e-9 the old path reported sigma2 = 0 for a matrix `det` and `inv` handle
+> correctly, so `rank` said 1 and `condition` said "singular" for an invertible
+> matrix. A diagonal matrix does NOT discriminate here — AᵀA is exact for one —
+> which is why the original filing's severity was easy to under-read.
+>
+> The companion performance item is also done: `rank` and `condition` take a
+> values-only path that skips the V accumulation and U construction entirely.
+> Measured 1.61x at 40x40.
+
+
 **Filed by**: ganita's 1.2.3 P(-1) sweep (linalg-advanced lens; DOWNGRADED from
 HIGH by the verifier, which reproduced the exact crossover)
 **Against**: `src/linalg.cyr` — `ganita_mat_svd`, and everything routed through it

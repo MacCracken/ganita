@@ -1,17 +1,99 @@
 # ganita math_advanced — transcendental + number-theory carved from
 # cyrius stdlib lib/math.cyr at v6.1.26. Self-contained (f64 builtins only).
+#
+# ACCURACY POLICY (1.2.4). Three failure modes recur across this module, and the
+# guards below name which one they close:
+#
+#   CANCELLATION — a form that subtracts two nearly equal quantities loses every
+#     significant digit near the point where they meet. sinh, tanh, atanh and
+#     asinh all did, returning exactly 0.0 for arguments where the answer is
+#     approximately the argument. Closed with a series expansion below a
+#     threshold where the next term is under half a ulp.
+#   OVERFLOW — squaring or exponentiating before the final scaling reaches +inf
+#     for inputs whose ANSWER is perfectly representable. hypot's entire reason
+#     for existing is not to do this, and it did. Closed by scaling out the
+#     larger magnitude first, or by an asymptotic form in the large regime.
+#   INFINITY — stdlib's f64_exp returns NaN for an infinite argument, so every
+#     function here that reaches for it returned NaN where the true value is a
+#     defined infinity. Closed by handling the infinite case before the general
+#     path. This one is a workaround, not a fix: the fix belongs upstream.
+#
+# Filed with reproductions in
+# docs/development/issues/archived/2026-09-07-f64-transcendental-accuracy.md.
 
-# sinh(x) = (exp(x) - exp(-x)) / 2
+# 2^-26. Below this, x^3/6 and x^3/3 are under half a ulp of x, so the series
+# truncated to its first term IS the correctly-rounded answer.
+var _F64_TINY = 0x3E50000000000000;
+# 709.0 — just under where f64_exp overflows. Above it sinh/cosh switch to
+# exp(|x| - ln 2), which stays finite to about 710.47.
+var _F64_EXP_BIG = 0x4086280000000000;
+# 2^26. Above it, sqrt(x^2 ± 1) equals |x| to within an ulp, so the asymptotic
+# form is exact and the x*x that would overflow is never formed.
+var _F64_SQ_BIG = 0x4190000000000000;
+
+# True when an f64 bit pattern is an infinity, either sign.
+fn _f64_is_inf(v): i64 {
+    if ((v & 0x7FFFFFFFFFFFFFFF) == 0x7FF0000000000000) { return 1; }
+    return 0;
+}
+
+# True when an f64 bit pattern is a NaN — max exponent, non-zero mantissa.
+fn _f64_is_nan_pat(v): i64 {
+    if (((v >> 52) & 0x7FF) != 0x7FF) { return 0; }
+    if ((v & 0x000FFFFFFFFFFFFF) == 0) { return 0; }
+    return 1;
+}
+
+# sinh(x) = (exp(x) - exp(-x)) / 2, with the small, large and infinite regimes
+# handled separately. sinh(±inf) = ±inf; sinh(NaN) = NaN.
 fn ganita_f64_sinh(x): i64 {
+    if (_f64_is_nan_pat(x) == 1) { return x; }
+    # CANCELLATION: for tiny x the two exponentials are both ~1 and their
+    # difference is pure rounding noise. sinh(x) = x + x^3/6 + ..., so x is the
+    # correctly-rounded answer here. Returned exactly 0.0 below ~1e-17 before.
+    var a = f64_abs(x);
+    if (f64_lt(a, _F64_TINY) == 1) { return x; }
+    # INFINITY: f64_exp(±inf) is NaN, so the general form cannot produce this.
+    if (_f64_is_inf(x) == 1) { return x; }
+    # OVERFLOW: above ~709.78 f64_exp(x) is +inf, but sinh(x) -> exp(x)/2 =
+    # exp(x - ln 2), which stays finite to ~710.47. That band returned +inf.
+    if (f64_gt(a, _F64_EXP_BIG) == 1) {
+        var h = f64_exp(f64_sub(a, F64_LN2));
+        if ((x >> 63) & 1 == 1) { return f64_neg(h); }
+        return h;
+    }
+    # ⚡ ONE exp, not two: exp(-x) = 1/exp(x). Bounded at |x| <= 500 because
+    # beyond it exp(x) is heading for the subnormal range at one end, where the
+    # reciprocal loses precision or overflows, and the asymptotic branch above
+    # has taken over at the other. Inside the bound exp(x) is comfortably normal
+    # (7e-218 .. 1.4e217) and the reciprocal costs one rounding against a whole
+    # second polyfill evaluation.
     var ex = f64_exp(x);
-    var enx = f64_exp(f64_neg(x));
+    var enx = f64_from(0);
+    if (f64_lt(a, f64_from(500)) == 1) {
+        enx = f64_div(F64_ONE, ex);
+    } else {
+        enx = f64_exp(f64_neg(x));
+    }
     return f64_div(f64_sub(ex, enx), F64_TWO);
 }
 
-# cosh(x) = (exp(x) + exp(-x)) / 2
+# cosh(x) = (exp(x) + exp(-x)) / 2. cosh(±inf) = +inf; cosh(NaN) = NaN.
+# cosh has no cancellation — the terms ADD — so it needs only the infinity and
+# overflow guards. See ganita_f64_sinh for both.
 fn ganita_f64_cosh(x): i64 {
+    if (_f64_is_nan_pat(x) == 1) { return x; }
+    var a = f64_abs(x);
+    if (_f64_is_inf(x) == 1) { return a; }
+    if (f64_gt(a, _F64_EXP_BIG) == 1) { return f64_exp(f64_sub(a, F64_LN2)); }
+    # One exp — see ganita_f64_sinh.
     var ex = f64_exp(x);
-    var enx = f64_exp(f64_neg(x));
+    var enx = f64_from(0);
+    if (f64_lt(a, f64_from(500)) == 1) {
+        enx = f64_div(F64_ONE, ex);
+    } else {
+        enx = f64_exp(f64_neg(x));
+    }
     return f64_div(f64_add(ex, enx), F64_TWO);
 }
 
@@ -23,6 +105,11 @@ fn ganita_f64_cosh(x): i64 {
 # (e^x+e^-x) form returns inf/inf = NaN (e.g. GELU's tanh(c·(x+a·x³)) on a large
 # activation). Threshold 20 sits safely inside the saturated region.
 fn ganita_f64_tanh(x): i64 {
+    if (_f64_is_nan_pat(x) == 1) { return x; }
+    # CANCELLATION: tanh(x) = x - x^3/3 + ..., and below 2^-26 the cubic term is
+    # under half a ulp, so x is the correctly-rounded answer. The quotient form
+    # returned exactly 0.0 for every |x| below ~1e-17.
+    if (f64_lt(f64_abs(x), _F64_TINY) == 1) { return x; }
     if (f64_gt(x, f64_from(20)) == 1) { return f64_from(1); }
     if (f64_lt(x, f64_from(0 - 20)) == 1) { return f64_from(0 - 1); }
     var ex = f64_exp(x);
@@ -34,6 +121,11 @@ fn ganita_f64_tanh(x): i64 {
 
 # True when an f64 holds an exact integer value.
 fn _f64_is_int(v): i64 {
+    # floor(inf) == inf and floor(NaN) is NaN != NaN, so the bare test below
+    # called an infinity an integer — which routed ganita_f64_pow's negative-base
+    # branch into computing a parity for it. Non-finite values are not integers.
+    if (_f64_is_nan_pat(v) == 1) { return 0; }
+    if (_f64_is_inf(v) == 1) { return 0; }
     if (f64_floor(v) == v) { return 1; }
     return 0;
 }
@@ -76,6 +168,42 @@ fn ganita_f64_pow(base, exp): i64 {
     if (base & 0x7FFFFFFFFFFFFFFF == 0) {
         if (f64_lt(exp, f64_from(0)) == 1) { return f64_div(f64_from(1), f64_from(0)); }
         return f64_from(0);
+    }
+
+    # NaN in, NaN out — but only after x^0 = 1, which holds for NaN too.
+    if (_f64_is_nan_pat(base) == 1 || _f64_is_nan_pat(exp) == 1) {
+        return f64_div(f64_from(0), f64_from(0));
+    }
+
+    # ⚡ INTEGRAL EXPONENT — binary exponentiation, not exp(y·ln x) (1.2.4).
+    #
+    # The exp/ln path carries the error of two transcendental evaluations
+    # through a multiply, and it showed: pow(7,2) came back
+    # 48.99999999999999296, so a caller who floored it got 48. pow(10,15) was
+    # 1000000000000005.875 — up to 47 ulps out.
+    #
+    # Squaring is exact whenever the result is representable, so this path is
+    # EXACT for the integer powers that fit and correctly rounded to within a
+    # few ulps otherwise. It also handles a negative base for free, with no
+    # parity reasoning, because it never takes a logarithm. The 1024 bound keeps
+    # the loop short; beyond it any base but 1 has overflowed or underflowed
+    # anyway, and the general path takes over.
+    if (_f64_is_int(exp) == 1 && f64_le(f64_abs(exp), f64_from(1024)) == 1) {
+        var n = f64_to(f64_abs(exp));
+        var acc = F64_ONE;
+        var sq = base;
+        while (n > 0) {
+            if (n & 1 == 1) { acc = f64_mul(acc, sq); }
+            sq = f64_mul(sq, sq);
+            n = n >> 1;
+        }
+        if ((exp >> 63) & 1 == 1) { return f64_div(F64_ONE, acc); }
+        return acc;
+    }
+
+    # ±inf base or exponent, past the integral path above.
+    if (_f64_is_inf(base) == 1 || _f64_is_inf(exp) == 1) {
+        return f64_div(f64_from(0), f64_from(0));
     }
 
     # negative base — real only for an integral exponent
@@ -127,9 +255,33 @@ fn ganita_f64_asin(x): i64 {
     return f64_atan(f64_div(x, denom));
 }
 
-# acos(x) = π/2 − asin(x)
+# acos(x), accurate across the whole domain including the ends.
+#
+# ⚠ NOT π/2 − asin(x), which is what shipped through 1.2.3. For x near 1 the
+# answer is near 0, so subtracting two quantities near π/2 destroys the leading
+# digits — about 6 of them — and this is precisely where the function is used
+# most: acos(dot(u, v)) for unit vectors puts the argument at the edge whenever
+# the vectors are nearly parallel, which is the case people care about.
+#
+# The half-angle form 2·atan(√((1−x)/(1+x))) has no cancellation there: for
+# x = 1−δ the subtraction 1−x is exact, and the small quantity stays small
+# instead of being recovered by differencing two large ones. Near x = −1 the
+# roles swap and (1+x) is the exact one, so the branches are split at 0.
 fn ganita_f64_acos(x): i64 {
-    return f64_sub(F64_PI_2, ganita_f64_asin(x));
+    if (_f64_is_nan_pat(x) == 1) { return x; }
+    # Outside [-1, 1] there is no real angle. NaN is the correct answer and the
+    # formula below would produce it anyway through sqrt of a negative.
+    if (f64_gt(f64_abs(x), F64_ONE) == 1) { return f64_div(f64_from(0), f64_from(0)); }
+    if (f64_ge(x, f64_from(0)) == 1) {
+        # 2·atan(√((1−x)/(1+x))) — accurate as x → 1, where acos → 0.
+        var num = f64_sub(F64_ONE, x);
+        var den = f64_add(F64_ONE, x);
+        return f64_mul(F64_TWO, f64_atan(f64_sqrt(f64_div(num, den))));
+    }
+    # π − 2·atan(√((1+x)/(1−x))) — accurate as x → −1, where acos → π.
+    var num2 = f64_add(F64_ONE, x);
+    var den2 = f64_sub(F64_ONE, x);
+    return f64_sub(F64_PI, f64_mul(F64_TWO, f64_atan(f64_sqrt(f64_div(num2, den2)))));
 }
 
 # Two-argument arctangent with full-plane quadrant handling. Result
@@ -207,14 +359,32 @@ fn ganita_f64_asinh(x): i64 {
     return r;
 }
 
-# acosh(x) = ln(x + √(x² − 1)), x ≥ 1
+# acosh(x) = ln(x + √(x² − 1)), defined for x ≥ 1. NaN below 1, +inf at +inf.
+#
+# OVERFLOW: x*x reaches +inf above ~1.34e154, so the whole expression came back
+# +inf for arguments whose answer is around 355 and perfectly finite. Above
+# 2^26, √(x²−1) equals x to within an ulp, so acosh(x) = ln(x) + ln 2 exactly —
+# and that form never squares anything.
 fn ganita_f64_acosh(x): i64 {
+    if (_f64_is_nan_pat(x) == 1) { return x; }
+    if (f64_lt(x, F64_ONE) == 1) { return f64_div(f64_from(0), f64_from(0)); }
+    if (_f64_is_inf(x) == 1) { return x; }
+    if (f64_gt(x, _F64_SQ_BIG) == 1) { return f64_add(f64_ln(x), F64_LN2); }
     var x2_minus_1 = f64_sub(f64_mul(x, x), F64_ONE);
     return f64_ln(f64_add(x, f64_sqrt(x2_minus_1)));
 }
 
-# atanh(x) = ½ · ln((1 + x) / (1 − x)), |x| < 1
+# atanh(x) = ½ · ln((1 + x) / (1 − x)), defined for |x| < 1.
+# Returns ±inf at ±1 (correct — the function diverges there) and NaN outside.
+#
+# CANCELLATION: for tiny x the quotient rounds to exactly 1.0 and ln(1) is 0, so
+# everything below ~1e-17 came back as a hard zero. atanh(x) = x + x^3/3 + ...,
+# so x is the correctly-rounded answer below 2^-26.
 fn ganita_f64_atanh(x): i64 {
+    if (_f64_is_nan_pat(x) == 1) { return x; }
+    var a = f64_abs(x);
+    if (f64_lt(a, _F64_TINY) == 1) { return x; }
+    if (f64_gt(a, F64_ONE) == 1) { return f64_div(f64_from(0), f64_from(0)); }
     var num = f64_add(F64_ONE, x);
     var den = f64_sub(F64_ONE, x);
     return f64_mul(F64_HALF, f64_ln(f64_div(num, den)));
@@ -222,7 +392,25 @@ fn ganita_f64_atanh(x): i64 {
 
 # Hypotenuse: sqrt(x^2 + y^2). No overflow protection (use for normal ranges).
 fn ganita_f64_hypot(x, y): i64 {
-    return f64_sqrt(f64_add(f64_mul(x, x), f64_mul(y, y)));
+    var ax = f64_abs(x);
+    var ay = f64_abs(y);
+    # hypot(±inf, anything) = +inf, NaN INCLUDED — that is the C rule, and it
+    # outranks NaN propagation: the magnitude is infinite whatever the other leg
+    # is, so there is nothing indeterminate to report. The infinity test must
+    # therefore come FIRST.
+    if (_f64_is_inf(ax) == 1 || _f64_is_inf(ay) == 1) { return f64_div(F64_ONE, f64_from(0)); }
+    if (_f64_is_nan_pat(x) == 1) { return x; }
+    if (_f64_is_nan_pat(y) == 1) { return y; }
+    # Scale by the larger leg. The direct form squares first, so it overflowed to
+    # +inf above ~1.3e154 and underflowed to 0 below ~1.5e-162 — for hypotenuses
+    # that are perfectly representable. Not overflowing is the ENTIRE reason this
+    # function exists rather than callers writing sqrt(x*x + y*y) themselves.
+    var mx = ax;
+    if (f64_gt(ay, mx) == 1) { mx = ay; }
+    if (mx & 0x7FFFFFFFFFFFFFFF == 0) { return f64_from(0); }
+    var rx = f64_div(ax, mx);
+    var ry = f64_div(ay, mx);
+    return f64_mul(mx, f64_sqrt(f64_add(f64_mul(rx, rx), f64_mul(ry, ry))));
 }
 
 # Fibonacci number (iterative). Returns -1 if n > 92 (overflow).

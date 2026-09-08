@@ -81,24 +81,111 @@ fn ganita_f32_abs(x): i64 { return x & 0x7FFFFFFF; }
 fn ganita_f32_neg(x): i64 { return (x & 0xFFFFFFFF) ^ 0x80000000; }
 
 # min / max — one signed compare on the monotone key.
+# True when an f32 pattern (low 32 bits) is a NaN — max exponent, non-zero
+# mantissa. Needed by min/max, which otherwise order NaNs by their sign bit.
+fn _f32_is_nan(x): i64 {
+    var lo = x & 0xFFFFFFFF;
+    if ((lo & 0x7F800000) != 0x7F800000) { return 0; }
+    if ((lo & 0x007FFFFF) == 0) { return 0; }
+    return 1;
+}
+
+# ================================================================
+# COMPARATORS (1.2.4)
+# ================================================================
+# ⚠ THE TIER SHIPPED NONE OF THESE UNTIL 1.2.4, and that was the gap that
+# mattered most in the f32 audit. `_f32_key` — the only correct way to order two
+# f32 patterns — was PRIVATE, so a consumer needing a comparison fell back to the
+# raw integer compare that this module's own header spends a paragraph calling a
+# trap. Documenting a trap and then withholding the tool that avoids it is worse
+# than not documenting it.
+#
+# All four return 1 or 0, and all four are FALSE when either operand is a NaN —
+# including `lt(NaN, NaN)` and `le(NaN, NaN)` — which is IEEE-754's rule and the
+# opposite of what the raw key compare does.
+#
+# ⚠ They also normalise the ZEROS, which `_f32_key` alone does not. `_f32_key`
+# is a TOTAL order, so it ranks -0.0 strictly below +0.0 — correct for sorting,
+# wrong for comparison, where IEEE-754 says the two zeros are EQUAL. Without the
+# normalisation `le(-0.0, +0.0)` and `ge(-0.0, +0.0)` disagree, and exactly one
+# of them is wrong. This is the difference between an ordering key and a
+# comparison, and it is why these are four functions rather than an exported
+# `_f32_key`.
+
+# `_f32_key` with the zeros collapsed onto +0.0 — an ordering key suitable for
+# COMPARISON rather than for sorting.
+fn _f32_cmp_key(x): i64 {
+    if (x & 0x7FFFFFFF == 0) { return _f32_key(0); }
+    return _f32_key(x);
+}
+
+# a < b. False if either operand is NaN.
+fn ganita_f32_lt(a, b): i64 {
+    if (_f32_is_nan(a) == 1 || _f32_is_nan(b) == 1) { return 0; }
+    if (_f32_cmp_key(a) < _f32_cmp_key(b)) { return 1; }
+    return 0;
+}
+
+# a <= b. False if either operand is NaN.
+fn ganita_f32_le(a, b): i64 {
+    if (_f32_is_nan(a) == 1 || _f32_is_nan(b) == 1) { return 0; }
+    if (_f32_cmp_key(a) <= _f32_cmp_key(b)) { return 1; }
+    return 0;
+}
+
+# a > b. False if either operand is NaN.
+fn ganita_f32_gt(a, b): i64 {
+    if (_f32_is_nan(a) == 1 || _f32_is_nan(b) == 1) { return 0; }
+    if (_f32_cmp_key(a) > _f32_cmp_key(b)) { return 1; }
+    return 0;
+}
+
+# a >= b. False if either operand is NaN.
+fn ganita_f32_ge(a, b): i64 {
+    if (_f32_is_nan(a) == 1 || _f32_is_nan(b) == 1) { return 0; }
+    if (_f32_cmp_key(a) >= _f32_cmp_key(b)) { return 1; }
+    return 0;
+}
+
+# Smaller of a and b, correct across the whole f32 range including negatives.
 fn ganita_f32_min(a, b): i64 {
+    # IEEE-754 minNum (1.2.4): a NaN operand is IGNORED, and NaN comes back only
+    # when both are. Through 1.2.3 `_f32_key` mapped NaNs into the total order
+    # like any other pattern, so whether a NaN won or lost depended on its SIGN
+    # BIT — a negative NaN beat every finite value, a positive one lost to every
+    # finite value. Arbitrary either way, and not what fminf or Rust's f32::min
+    # do, which is what a consumer porting into this tier expects.
+    if (_f32_is_nan(a) == 1) { return b & 0xFFFFFFFF; }
+    if (_f32_is_nan(b) == 1) { return a & 0xFFFFFFFF; }
     if (_f32_key(a) <= _f32_key(b)) { return a & 0xFFFFFFFF; }
     return b & 0xFFFFFFFF;
 }
 # max(a, b) — one signed compare on the monotone key.
 fn ganita_f32_max(a, b): i64 {
+    # IEEE-754 maxNum — see ganita_f32_min.
+    if (_f32_is_nan(a) == 1) { return b & 0xFFFFFFFF; }
+    if (_f32_is_nan(b) == 1) { return a & 0xFFFFFFFF; }
     if (_f32_key(a) >= _f32_key(b)) { return a & 0xFFFFFFFF; }
     return b & 0xFFFFFFFF;
 }
 
 # clamp(x, lo, hi) — the loop body ranga runs per pixel.
 fn ganita_f32_clamp(x, lo, hi): i64 {
+    # A NaN x PROPAGATES here rather than being ignored, which is the opposite of
+    # min/max and is deliberate: min/max are choosing between two values, so
+    # skipping an absent one is meaningful, while clamp is transforming ONE value
+    # and a NaN input has no clamped form. Composing min and max would instead
+    # have quietly returned `hi`.
+    if (_f32_is_nan(x) == 1) { return x & 0xFFFFFFFF; }
     return ganita_f32_min(ganita_f32_max(x, lo), hi);
 }
 
 # sign(x) -> -1.0f / 0.0f / +1.0f. Zero (either signed zero) returns +0.0f.
 # 0x3F800000 = 1.0f, 0xBF800000 = -1.0f.
 fn ganita_f32_sign(x): i64 {
+    # NaN has no sign to report. Returning ±1.0f turned a NaN into a finite
+    # value, which ends exactly the propagation that makes a NaN useful.
+    if (_f32_is_nan(x) == 1) { return x & 0xFFFFFFFF; }
     if (x & 0x7FFFFFFF == 0) { return 0; }
     if (x & 0x80000000 != 0) { return 0xBF800000; }
     return 0x3F800000;
@@ -153,13 +240,30 @@ fn ganita_f32_sqrt(x): i64 { return f32_from(f64_sqrt(f32_to(x))); }
 # an f64 routine that already exists and is already tested — the value delivered is the
 # symmetry and the removal of per-call-site `f32_from(f64_x(f32_to(v)))` boilerplate from
 # every consumer, not new numerics.
-fn ganita_f32_exp(x): i64 { return f32_from(f64_exp(f32_to(x))); }
+# e raised to x. exp(+inf) = +inf, exp(-inf) = 0, exp(NaN) = NaN.
+# stdlib's f64_exp returns NaN for an infinite argument, so the infinite cases
+# are handled here rather than forwarded. The fix belongs upstream.
+fn ganita_f32_exp(x): i64 {
+    if (_f32_is_nan(x) == 1) { return x & 0xFFFFFFFF; }
+    if ((x & 0x7FFFFFFF) == 0x7F800000) {
+        if ((x & 0x80000000) != 0) { return 0; }
+        return 0x7F800000;
+    }
+    return f32_from(f64_exp(f32_to(x)));
+}
 # Natural logarithm.
 fn ganita_f32_ln(x): i64 { return f32_from(f64_ln(f32_to(x))); }
 # Base-2 logarithm.
 fn ganita_f32_log2(x): i64 { return f32_from(f64_log2(f32_to(x))); }
 # 2 raised to x.
-fn ganita_f32_exp2(x): i64 { return f32_from(f64_exp2(f32_to(x))); }
+fn ganita_f32_exp2(x): i64 {
+    if (_f32_is_nan(x) == 1) { return x & 0xFFFFFFFF; }
+    if ((x & 0x7FFFFFFF) == 0x7F800000) {
+        if ((x & 0x80000000) != 0) { return 0; }
+        return 0x7F800000;
+    }
+    return f32_from(f64_exp2(f32_to(x)));
+}
 # Largest |x| for which the underlying f64 sin/cos perform argument reduction.
 # Above 2^63 they return the argument unchanged, which for a bounded function is
 # not an approximation but a category error.
@@ -230,6 +334,10 @@ fn ganita_f32_cbrt(x): i64 {
     # and ln(0) = -inf makes that NaN — so cbrt(0) returned NaN, which no caller
     # expects and which a positives-only test never sees. Sign of zero preserved.
     if (x & 0x7FFFFFFF == 0) { return x & 0xFFFFFFFF; }
+    # cbrt(±inf) = ±inf, and cbrt(NaN) = NaN. Both used to fall into the pow
+    # path and come back as a negative quiet NaN.
+    if (_f32_is_nan(x) == 1) { return x & 0xFFFFFFFF; }
+    if ((x & 0x7FFFFFFF) == 0x7F800000) { return x & 0xFFFFFFFF; }
     var xf = f32_to(x);
     var third = f64_div(f64_from(1), f64_from(3));
     if (x & 0x80000000 != 0) {

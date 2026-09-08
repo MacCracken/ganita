@@ -4,6 +4,138 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.4] — 2026-09-08 — the P(-1) backlog, repaired
+
+Closes four of the five filings the 1.2.3 sweep opened, and five of six items in
+the fifth. Everything here was deferred from 1.2.3 because it needed a design
+decision, an algorithm replacement, or a consumer-visible change that a hardening
+patch should not make unilaterally. **433 assertions** (was 322).
+
+### Fixed — tolerances are RELATIVE, so verdicts are scale-invariant
+
+⭐ `LINALG_EPS` was compared **directly** against pivots, norms and singular
+values, so "is this matrix singular?" depended on the caller's **units**. A 2×2
+identity scaled by 1e-20 is still perfectly conditioned — cond = 1 — but:
+
+| | 1.2.3 | 1.2.4 |
+|---|---|---|
+| `det(I·1e-20)` | **0.0 (singular)** | not singular |
+| `inv(I·1e-20)` | **null** | succeeds |
+| `condition(I·1e-20)` | **−1.0 (singular)** | 1.0 |
+| `rank(I·1e-20)` | 2 | 2 |
+
+The library contradicted **itself** about one matrix. `LINALG_EPS` is now a
+relative *factor*, multiplied by a magnitude taken from the data at each site:
+the matrix scale for the pivot tests, the input's largest entry for the reflector
+tests, the initial off-diagonal magnitude for Jacobi convergence, the largest
+singular value for the rank tests. Verified in **both** directions — a
+well-conditioned matrix is not called singular at any scale, and `[1 2; 2 4]`
+stays singular scaled up by 1e9.
+
+It is also **eager** — a literal bit pattern, not a lazily-initialised global — so
+no call depends on what ran before it. That was a real hazard: `mat_eq`'s doc told
+callers to pass `LINALG_EPS`, which read `0` until some decomposition had run.
+
+- **The two-norm is scaled.** `qr` and `least_squares` summed squares directly, so
+  a large-magnitude matrix produced a **NaN norm** and both still returned
+  success. `_linalg_norm2` scales out the largest magnitude first.
+- **The reflector skip test is relative.** Against an absolute 1e-12, a matrix
+  whose entries were merely *small* had every Householder reflector skipped,
+  leaving R non-triangular and a plausible-looking wrong answer with `rc = 0`.
+
+### Fixed — SVD no longer forms AᵀA
+
+⭐ `ganita_mat_svd` is now a **one-sided Jacobi** SVD: it orthogonalises A's
+columns in place, accumulating V, and never squares A. Forming AᵀA squares the
+condition number, spending half the available precision before the eigensolver
+starts.
+
+On `A = [[1, 1], [1, 1+e]]` — entries all O(1), det = e — the invariant
+`σ₁·σ₂ = |det A|` gives:
+
+| e | 1.2.3 | 1.2.4 |
+|---|---|---|
+| 1e-6 | 1.000045 | **1.000000** |
+| 1e-9 | **0.000000 — σ₂ collapsed to exactly zero** | **1.000000** |
+| 1e-11 | **0.000000** | 1.000008 |
+
+At e=1e-9 the old path reported σ₂ = 0 for a matrix `det` and `inv` handle
+correctly, so `rank` said 1 and `condition` said "singular" for an invertible
+matrix. A **diagonal** matrix does not discriminate here — AᵀA is exact for one —
+which is why this was easy to under-read.
+
+### Fixed — f64 transcendental accuracy
+
+- ⭐ **`hypot` scales before squaring.** `hypot(3e116, 4e116) = 5e116` and
+  `hypot(3e-116, 4e-116) = 5e-116` are now exact; they were `+inf` and `0`. Not
+  overflowing is the entire reason this function exists rather than callers
+  writing `sqrt(x*x + y*y)`. `hypot(inf, NaN) = +inf` — infinity outranks NaN
+  propagation, which is ordering-sensitive and pinned by a test.
+- ⭐ **`acos` is no longer `π/2 − asin(x)`.** That differences two quantities near
+  π/2 to produce an answer near 0, losing ~6 digits exactly where `acos(dot)` for
+  near-parallel unit vectors lands. The half-angle form's error now **shrinks**
+  toward the ends where the old one's grew: at 1 − 2⁻⁵⁰, ~0 against 1.3e-9.
+- ⭐ **`pow` on an integral exponent is binary exponentiation.** `pow(7,2)` is
+  exactly **49** — it was 48.99999999999999296, which *floors to 48* — and
+  `pow(10,15)` is exactly 1e15, not ...005.875. It gets infinite bases right for
+  free, because it takes no logarithm.
+- **Small-|x| series** for `sinh`, `tanh`, `atanh`: below 2⁻²⁶ each returns `x`,
+  which *is* the correctly-rounded answer. They returned exactly `0.0` below
+  ~1e-17.
+- **Overflow bands**: `acosh` is finite at 1e192 (was `+inf`); `sinh`/`cosh` cover
+  the (709.783, 710.476] band.
+- **Infinities**: `sinh(±inf) = ±inf`, `cosh(±inf) = +inf`. ⚠ These are *guards* —
+  the root cause is stdlib's `f64_exp(±inf) = NaN`, which is not ganita's to fix.
+- **Domains**: `acos`, `acosh`, `atanh` return NaN outside their domains.
+  `_f64_is_int` no longer calls an infinity an integer.
+
+### Fixed — f32 NaN and infinity semantics
+
+- ⭐ **`min`/`max` are IEEE-754 minNum/maxNum**: a NaN operand is ignored, NaN
+  returns only if both are. Previously `_f32_key` ordered NaNs like any other
+  pattern, so whether a NaN won or lost depended on its **sign bit**.
+- **`clamp` propagates a NaN x**, deliberately unlike min/max: it transforms one
+  value and a NaN has no clamped form, where min/max choose between two and
+  skipping an absent one is meaningful. Composing them returned `hi`.
+- **`sign(NaN)` is NaN** (was ±1.0f — turning a NaN into a finite value);
+  **`cbrt(±inf)` is ±inf**; **`exp`/`exp2`** handle infinities.
+
+### Added — `ganita_f32_lt` / `_le` / `_gt` / `_ge`
+
+The only correct f32 comparator (`_f32_key`) was **private**, so a consumer
+needing to compare fell back to the raw integer compare the module's own header
+spends a paragraph calling a trap. All four are false on a NaN operand, and they
+**normalise the zeros** — `_f32_key` is a *total order* that ranks −0.0 below
++0.0, correct for sorting and wrong for comparison, where IEEE says the zeros are
+equal. That distinction is why these are four functions rather than an exported
+`_f32_key`, and it was caught by a failing assertion rather than by inspection.
+
+### Optimized — all measured against 1.2.3 in one process
+
+| | speedup |
+|---|---|
+| `mat_mul` 120×120 — raw row/column pointers in the accumulation loop | **3.34×** |
+| `rank` 40×40 — values-only SVD path | **1.61×** |
+| `pseudo_inv` 40×40 — column scaling instead of a dense diagonal multiply | 1.12× |
+
+`ganita_mat_get` re-reads the header and recomputes the offset on every call, and
+`mat_mul`'s loop calls it *twice per multiply-accumulate*. The pointer rewrite is
+deliberately confined to that one loop — it is the only O(m·n·k) one, and a
+per-element saving nobody can measure is not worth an off-by-one that writes out
+of bounds. Also: `_ganita_mat_new_raw` keeps the CWE-190 guard and skips only the
+zero fill for callers that overwrite every element; `qr`'s reflector allocation is
+hoisted out of its k-loop; `sinh`/`cosh` evaluate one `exp` instead of two.
+
+### Still open
+
+[`performance-backlog`](docs/development/issues/2026-09-07-performance-backlog.md)
+stays in `issues/` rather than `archived/` — an open item in an archived folder is
+how a backlog quietly disappears. What remains: `mat_inv`'s per-column scratch and
+the discarded transposes both need a **public API change**, and raising
+`GANITA_MAT_MAX_ELEMS` is still the policy question the 1.2.3 audit deferred, for
+reasons that have not changed.
+
+
 ## [1.2.3] — 2026-09-07 — P(-1) hardening sweep
 
 A full audit / refactor / hardening / optimization / security pass per the AGNOS

@@ -757,6 +757,66 @@ assert_eq(t_dclose(ganita_mat_condition(SING), t_d(0 - 1)), 1,
 # cond = sigma_max / sigma_min, and it is >= 1 for anything well-formed.
 assert_eq(f64_ge(ganita_mat_condition(A2), t_d(1)), 1, "condition >= 1 for a non-singular matrix");
 
+test_group("hardening: tolerances are RELATIVE, so verdicts are scale-invariant (1.2.4)");
+# ⭐ LINALG_EPS was compared DIRECTLY against pivots, norms and singular values,
+# so "is this matrix singular?" depended on the caller's units. The identity
+# scaled by 1e-20 is still perfectly conditioned — cond = 1 — but through 1.2.3
+# `det` called it singular, `inv` returned null and `condition` returned -1.0,
+# while `rank` said full rank. The library contradicted ITSELF about one matrix.
+#
+# These assertions pin BOTH directions: a well-conditioned matrix must not be
+# called singular at any scale, and a singular one must stay singular at any
+# scale. A one-directional test would pass on a tolerance of zero.
+fn t_scaled_ident(n, s): i64 {
+    var m = ganita_mat_new(n, n);
+    if (m == 0) { return 0; }
+    var i = 0;
+    while (i < n) { ganita_mat_set(m, i, i, s); i = i + 1; }
+    return m;
+}
+# 1e-20 and 1e10, the two ends that used to break in opposite ways.
+var TINY_S = f64_div(t_d(1), f64_mul(t_d(10000000000), t_d(10000000000)));
+var HUGE_S = f64_from(10000000000);
+var ID_TINY = t_scaled_ident(2, TINY_S);
+var ID_HUGE = t_scaled_ident(2, HUGE_S);
+assert_eq(ganita_mat_det(ID_TINY) & 0x7FFFFFFFFFFFFFFF == 0, 0,
+  "det(I * 1e-20) is NOT zero — cond is 1, the matrix is not singular");
+assert_eq(ganita_mat_inv(ID_TINY) != 0, 1, "inv(I * 1e-20) succeeds (was null)");
+assert_eq(t_dclose(ganita_mat_condition(ID_TINY), t_d(1)), 1,
+  "condition(I * 1e-20) = 1 (was -1.0, i.e. 'singular')");
+assert_eq(ganita_mat_rank(ID_TINY, f64_mul(LINALG_EPS, TINY_S)), 2, "rank(I * 1e-20) = 2");
+assert_eq(ganita_mat_inv(ID_HUGE) != 0, 1, "inv(I * 1e10) succeeds");
+assert_eq(t_dclose(ganita_mat_condition(ID_HUGE), t_d(1)), 1, "condition(I * 1e10) = 1");
+# The other direction: [1 2; 2 4] is singular at every scale.
+var SG_1 = t_m2(t_d(1), t_d(2), t_d(2), t_d(4));
+var SG_BIG = t_m2(t_d(1000000000), t_d(2000000000), t_d(2000000000), t_d(4000000000));
+assert_eq(ganita_mat_det(SG_1) & 0x7FFFFFFFFFFFFFFF == 0, 1, "det[1 2; 2 4] = 0 (singular)");
+assert_eq(ganita_mat_inv(SG_1), 0, "inv[1 2; 2 4] -> null");
+assert_eq(ganita_mat_det(SG_BIG) & 0x7FFFFFFFFFFFFFFF == 0, 1,
+  "det of the SAME matrix scaled by 1e9 is still 0 — scaling up must not hide singularity");
+assert_eq(ganita_mat_inv(SG_BIG), 0, "inv of the scaled singular matrix is still null");
+assert_eq(t_dclose(ganita_mat_condition(SG_BIG), f64_neg(t_d(1))), 1,
+  "condition of the scaled singular matrix is still -1.0");
+# LINALG_EPS is EAGER now: it reads its value with no decomposition having run.
+assert_eq(LINALG_EPS != 0, 1, "LINALG_EPS is initialised eagerly, not on first decomposition");
+assert_eq(t_dclose(LINALG_EPS, f64_div(t_d(1), t_d(1000000000000))), 1, "LINALG_EPS = 1e-12");
+
+# The scaled two-norm: qr and least_squares used a raw sum of squares, which
+# overflowed to NaN for large-magnitude matrices while still returning success.
+var LSQ_BIG = ganita_mat_new(3, 2);
+var BIGV = f64_mul(f64_mul(t_d(1000000000), t_d(1000000000)), f64_mul(t_d(1000000000), t_d(1000000000)));
+var bi2 = 0;
+while (bi2 < 3) {
+    ganita_mat_set(LSQ_BIG, bi2, 0, BIGV);
+    ganita_mat_set(LSQ_BIG, bi2, 1, f64_mul(BIGV, t_d(bi2 + 1)));
+    bi2 = bi2 + 1;
+}
+var BIGQ = ganita_mat_new(3, 3);
+var BIGR = ganita_mat_new(3, 2);
+assert_eq(ganita_mat_qr(LSQ_BIG, BIGQ, BIGR), 0, "qr accepts a matrix of ~1e36 entries");
+assert_eq(t_f64_is_nan(ganita_mat_get(BIGR, 0, 0)), 0,
+  "qr's R is not NaN at 1e36 (the unscaled two-norm used to overflow)");
+
 test_group("hardening: math domains and overflow (1.2.3)");
 # ⭐ asinh was only correct for x >= 0. It is an ODD function, so |asinh(-x)|
 # must equal asinh(x) — but ln(x + sqrt(x*x+1)) at a negative x subtracts two
@@ -850,6 +910,259 @@ assert_eq(t_f64_is_nan(ganita_f64_pow(t_d(0 - 8), f64_div(t_d(1), t_d(3)))), 1,
 assert_eq(t_dclose(ganita_f64_pow(t_d(2), t_d(10)), t_d(1024)), 1, "pow(2,10) = 1024 unchanged");
 assert_eq(t_dclose(ganita_f64_pow(t_d(9), f64_div(t_d(1), t_d(2))), t_d(3)), 1, "pow(9,0.5) = 3 unchanged");
 assert_eq(t_dclose(ganita_f64_pow(t_d(2), t_d(0 - 2)), f64_div(t_d(1), t_d(4))), 1, "pow(2,-2) = 0.25 unchanged");
+
+test_group("hardening: SVD no longer forms A^T A (1.2.4)");
+# ⭐ Forming A^T A SQUARES the condition number, so half the available precision
+# was spent before the eigensolver started. The discriminating input is one whose
+# ENTRIES are all O(1) but whose singular values are not — a diagonal matrix does
+# not discriminate, because A^T A is then exact.
+#
+# A = [[1, 1], [1, 1+e]] has det = e, so sigma1 ~ 2 and sigma2 ~ e/2. The
+# invariant sigma1 * sigma2 = |det A| holds for every SVD, so it is the test.
+# Through 1.2.3 sigma2 came back EXACTLY ZERO at e = 1e-9 — for a matrix that
+# ganita_mat_det and ganita_mat_inv both handle correctly — which made rank
+# report 1 and condition report "singular" for an invertible matrix.
+fn t_near_singular(e): i64 {
+    var a = ganita_mat_new(2, 2);
+    if (a == 0) { return 0; }
+    ganita_mat_set(a, 0, 0, t_d(1)); ganita_mat_set(a, 0, 1, t_d(1));
+    ganita_mat_set(a, 1, 0, t_d(1)); ganita_mat_set(a, 1, 1, f64_add(t_d(1), e));
+    return a;
+}
+# Ratio sigma1*sigma2 / |det| must be 1. Checked at 1e-6 and 1e-9, both of which
+# the A^T A path got wrong (4.5e-5 out, then a hard zero).
+var SVE9 = f64_div(t_d(1), t_d(1000000000));
+var SVA9 = t_near_singular(SVE9);
+var SVU = ganita_mat_new(2, 2);
+var SVS = alloc(16);
+var SVVT = ganita_mat_new(2, 2);
+assert_eq(ganita_mat_svd(SVA9, SVU, SVS, SVVT), 0, "svd converges on a near-singular matrix");
+assert_eq(load64(SVS + 8) & 0x7FFFFFFFFFFFFFFF == 0, 0,
+  "sigma2 is NOT zero at e=1e-9 (the A^T A path collapsed it to exactly 0)");
+# The bound is RELATIVE and deliberately loose: cond(A) is about 4/e = 4e9 here,
+# so roughly 9 of f64's ~16 digits are genuinely unavailable and the measured
+# error is 5.3e-8. 1e-6 sits comfortably above that and enormously below the
+# 1.0 the A^T A path produced by returning sigma2 = 0. A tight absolute bound
+# would be asserting precision the problem does not contain.
+assert_eq(f64_lt(f64_abs(f64_sub(f64_div(f64_mul(load64(SVS), load64(SVS + 8)), SVE9), t_d(1))),
+    f64_div(t_d(1), t_d(1000000))), 1,
+  "sigma1 * sigma2 = |det A| to 1e-6 relative at e=1e-9 (the old path was 100% out)");
+# At e=1e-6 the conditioning is mild enough to demand much more.
+var SVE6 = f64_div(t_d(1), t_d(1000000));
+var SVA6 = t_near_singular(SVE6);
+var SVS6 = alloc(16);
+assert_eq(ganita_mat_svd(SVA6, ganita_mat_new(2, 2), SVS6, ganita_mat_new(2, 2)), 0, "svd at e=1e-6");
+assert_eq(f64_lt(f64_abs(f64_sub(f64_div(f64_mul(load64(SVS6), load64(SVS6 + 8)), SVE6), t_d(1))),
+    f64_div(t_d(1), t_d(1000000000))), 1,
+  "sigma1 * sigma2 = |det A| to 1e-9 relative at e=1e-6 (the old path was 4.5e-5 out)");
+assert_eq(ganita_mat_rank(SVA9, f64_div(t_d(1), t_d(1000000000000))), 2,
+  "rank = 2 at e=1e-9 — the matrix IS invertible, and det/inv always agreed");
+assert_eq(t_dclose(ganita_mat_det(SVA9), SVE9), 1, "det agrees: it is e, not 0");
+assert_eq(ganita_mat_inv(SVA9) != 0, 1, "inv succeeds, as it always did — now rank agrees with it");
+
+# The reconstruction properties every SVD must satisfy, on a tall matrix.
+var SVB = ganita_mat_new(3, 2);
+ganita_mat_set(SVB, 0, 0, t_d(1)); ganita_mat_set(SVB, 0, 1, t_d(2));
+ganita_mat_set(SVB, 1, 0, t_d(3)); ganita_mat_set(SVB, 1, 1, t_d(4));
+ganita_mat_set(SVB, 2, 0, t_d(5)); ganita_mat_set(SVB, 2, 1, t_d(6));
+var SVU2 = ganita_mat_new(3, 2);
+var SVS2 = alloc(16);
+var SVV2 = ganita_mat_new(2, 2);
+assert_eq(ganita_mat_svd(SVB, SVU2, SVS2, SVV2), 0, "svd of a 3x2 succeeds");
+assert_eq(ganita_mat_eq(ganita_mat_mul(ganita_mat_transpose(SVU2), SVU2), I2, t_tol()), 1,
+  "U^T U = I — U's columns are orthonormal");
+assert_eq(ganita_mat_eq(ganita_mat_mul(SVV2, ganita_mat_transpose(SVV2)), I2, t_tol()), 1,
+  "V^T V = I — V is orthogonal");
+var SVSM = ganita_mat_new(2, 2);
+ganita_mat_set(SVSM, 0, 0, load64(SVS2)); ganita_mat_set(SVSM, 1, 1, load64(SVS2 + 8));
+assert_eq(ganita_mat_eq(ganita_mat_mul(ganita_mat_mul(SVU2, SVSM), SVV2), SVB, t_tol()), 1,
+  "U * diag(sigma) * V^T = A — the factorisation reconstructs");
+assert_eq(f64_ge(load64(SVS2), load64(SVS2 + 8)) , 1, "singular values come back descending");
+# Moore-Penrose, through the rebuilt SVD.
+assert_eq(ganita_mat_eq(ganita_mat_mul(ganita_mat_mul(SVB, ganita_mat_pseudo_inv(SVB)), SVB), SVB, t_tol()), 1,
+  "A A+ A = A");
+# The zero matrix has a defined SVD and used to divide by its own zero scale.
+var SVZ = ganita_mat_new(2, 2);
+var SVZU = ganita_mat_new(2, 2);
+var SVZS = alloc(16);
+var SVZV = ganita_mat_new(2, 2);
+assert_eq(ganita_mat_svd(SVZ, SVZU, SVZS, SVZV), 0, "svd of the zero matrix succeeds");
+assert_eq(load64(SVZS) & 0x7FFFFFFFFFFFFFFF == 0, 1, "zero matrix: every singular value is 0");
+assert_eq(ganita_mat_eq(SVZV, I2, t_tol()), 1, "zero matrix: V is the identity");
+
+test_group("hardening: f32 NaN/inf semantics and the new comparators (1.2.4)");
+# The f32 NaN pattern, and a couple of finite fixtures.
+var FNAN = f32_from(f64_div(t_d(0), t_d(0)));
+var FNEGNAN = FNAN | 0x80000000;
+var FINF = 0x7F800000;
+var FNEGINF = 0xFF800000;
+assert_eq(t_is_nan(FNAN), 1, "the NaN fixture really is an f32 NaN");
+assert_eq(t_is_nan(FNEGNAN), 1, "the negative-NaN fixture is a NaN too");
+
+# ⭐ min/max were a TOTAL ORDER over the raw key, so a NaN won or lost purely by
+# its SIGN BIT: a negative NaN beat every finite value, a positive one lost to
+# every finite value. Arbitrary, and not what fminf or Rust's f32::min do.
+# IEEE-754 minNum/maxNum ignore a NaN operand and return NaN only if both are.
+assert_eq(ganita_f32_min(FNAN, t_f32(3)), t_f32(3), "min(NaN, 3) = 3 — the NaN is ignored");
+assert_eq(ganita_f32_min(FNEGNAN, t_f32(3)), t_f32(3),
+  "min(-NaN, 3) = 3 — a NEGATIVE NaN used to win, purely by its sign bit");
+assert_eq(ganita_f32_min(t_f32(3), FNAN), t_f32(3), "min(3, NaN) = 3 — order does not matter");
+assert_eq(ganita_f32_max(FNAN, t_f32(3)), t_f32(3), "max(NaN, 3) = 3");
+assert_eq(ganita_f32_max(FNEGNAN, t_f32(3)), t_f32(3), "max(-NaN, 3) = 3");
+assert_eq(t_is_nan(ganita_f32_min(FNAN, FNAN)), 1, "min(NaN, NaN) is NaN — only when BOTH are");
+assert_eq(t_is_nan(ganita_f32_max(FNAN, FNEGNAN)), 1, "max(NaN, -NaN) is NaN");
+# The sign-magnitude ordering the tier exists for is untouched.
+assert_eq(ganita_f32_min(t_f32(0 - 1), t_f32(0 - 2)), t_f32(0 - 2), "min(-1, -2) = -2 unchanged");
+assert_eq(ganita_f32_max(t_f32(0 - 1), t_f32(2)), t_f32(2), "max(-1, 2) = 2 unchanged");
+# clamp PROPAGATES a NaN x instead of ignoring it: it transforms one value
+# rather than choosing between two, and composing min/max returned `hi`.
+assert_eq(t_is_nan(ganita_f32_clamp(FNAN, t_f32(0), t_f32(1))), 1, "clamp(NaN, 0, 1) is NaN, not hi");
+assert_eq(ganita_f32_clamp(t_f32(5), t_f32(0), t_f32(1)), t_f32(1), "clamp(5, 0, 1) = 1 unchanged");
+
+# ⭐ THE COMPARATORS THE TIER NEVER SHIPPED. `_f32_key` was private, so a
+# consumer needing to compare f32 patterns fell back to the raw integer compare
+# this module's own header calls a trap. All four are false on a NaN operand.
+assert_eq(ganita_f32_lt(t_f32(0 - 2), t_f32(0 - 1)), 1, "lt(-2, -1) — negatives order correctly");
+assert_eq(ganita_f32_lt(t_f32(0 - 1), t_f32(0 - 2)), 0, "lt(-1, -2) = 0");
+assert_eq(t_f32(0 - 2) > t_f32(0 - 1), 1,
+  "...whereas the RAW compare says -2 > -1, which is the trap the tier exists for");
+assert_eq(ganita_f32_lt(t_f32(0 - 1), t_f32(1)), 1, "lt(-1, 1) — a negative must not compare high");
+assert_eq(ganita_f32_gt(t_f32(1), t_f32(0 - 1)), 1, "gt(1, -1)");
+assert_eq(ganita_f32_le(t_f32(3), t_f32(3)), 1, "le(3, 3)");
+assert_eq(ganita_f32_ge(t_f32(3), t_f32(3)), 1, "ge(3, 3)");
+assert_eq(ganita_f32_lt(t_f32(3), t_f32(3)), 0, "lt(3, 3) = 0");
+# -0.0 and +0.0 compare equal, as IEEE requires.
+assert_eq(ganita_f32_le(t_f32(0) | 0x80000000, t_f32(0)), 1, "le(-0.0, +0.0) — the zeros are equal");
+assert_eq(ganita_f32_ge(t_f32(0) | 0x80000000, t_f32(0)), 1, "ge(-0.0, +0.0)");
+# Every comparator is false on a NaN, including against itself.
+assert_eq(ganita_f32_lt(FNAN, t_f32(1)), 0, "lt(NaN, 1) = 0");
+assert_eq(ganita_f32_gt(FNAN, t_f32(1)), 0, "gt(NaN, 1) = 0");
+assert_eq(ganita_f32_le(FNAN, FNAN), 0, "le(NaN, NaN) = 0 — NaN is not even <= itself");
+assert_eq(ganita_f32_ge(t_f32(1), FNAN), 0, "ge(1, NaN) = 0");
+
+# ⭐ sign(NaN) returned ±1.0f, turning a NaN into a FINITE value and ending the
+# propagation that makes a NaN useful as a signal.
+assert_eq(t_is_nan(ganita_f32_sign(FNAN)), 1, "sign(NaN) is NaN (was +/-1.0f)");
+assert_eq(ganita_f32_sign(t_f32(0 - 5)), 0xBF800000, "sign(-5) = -1.0f unchanged");
+assert_eq(ganita_f32_sign(t_f32(0)), 0, "sign(0) = +0.0f unchanged");
+
+# ⭐ cbrt(+-inf) fell into the pow path and returned a negative quiet NaN.
+assert_eq(ganita_f32_cbrt(FINF), FINF, "cbrt(+inf) = +inf (was NaN)");
+assert_eq(ganita_f32_cbrt(FNEGINF), FNEGINF, "cbrt(-inf) = -inf (was NaN)");
+assert_eq(t_is_nan(ganita_f32_cbrt(FNAN)), 1, "cbrt(NaN) is NaN");
+assert_eq(ganita_f32_cbrt(t_f32(0)), t_f32(0), "cbrt(0) = 0 unchanged (the 1.1.2 fix)");
+assert_eq(t_dclose(f32_to(ganita_f32_cbrt(t_f32(8))), t_d(2)), 1, "cbrt(8) = 2 unchanged");
+
+# ⭐ exp/exp2 forwarded to f64_exp, which returns NaN for an infinite argument.
+assert_eq(ganita_f32_exp(FINF), FINF, "exp(+inf) = +inf (was NaN)");
+assert_eq(ganita_f32_exp(FNEGINF), 0, "exp(-inf) = 0 (was NaN)");
+assert_eq(ganita_f32_exp2(FINF), FINF, "exp2(+inf) = +inf (was NaN)");
+assert_eq(ganita_f32_exp2(FNEGINF), 0, "exp2(-inf) = 0 (was NaN)");
+assert_eq(t_is_nan(ganita_f32_exp(FNAN)), 1, "exp(NaN) is NaN");
+assert_eq(t_dclose(f32_to(ganita_f32_exp(t_f32(0))), t_d(1)), 1, "exp(0) = 1 unchanged");
+assert_eq(t_dclose(f32_to(ganita_f32_exp2(t_f32(3))), t_d(8)), 1, "exp2(3) = 8 unchanged");
+
+test_group("hardening: f64 transcendental accuracy (1.2.4)");
+# ⭐ CANCELLATION. sinh/tanh/atanh/asinh all evaluated a form that subtracts two
+# nearly equal quantities near zero, so everything below ~1e-17 came back as a
+# hard 0.0 and 1e-16 was 44% wrong. Each is x + O(x^3), and below 2^-26 the
+# cubic term is under half a ulp — so `== x` EXACTLY is the assertion, not
+# "close to x". That discriminates: the old code returned 0.0, which is close to
+# 1e-18 in absolute terms and infinitely wrong in relative ones.
+var T18 = f64_div(t_d(1), f64_mul(t_d(1000000000), t_d(1000000000)));
+assert_eq(ganita_f64_sinh(T18), T18, "sinh(1e-18) == 1e-18 exactly (was 0.0)");
+assert_eq(ganita_f64_tanh(T18), T18, "tanh(1e-18) == 1e-18 exactly (was 0.0)");
+assert_eq(ganita_f64_atanh(T18), T18, "atanh(1e-18) == 1e-18 exactly (was 0.0)");
+assert_eq(ganita_f64_asinh(T18), T18, "asinh(1e-18) == 1e-18 exactly");
+# The ordinary range is untouched.
+assert_eq(t_dclose(ganita_f64_sinh(t_d(1)), f64_div(f64_sub(F64_E, f64_div(t_d(1), F64_E)), t_d(2))), 1,
+  "sinh(1) = (e - 1/e)/2 unchanged");
+assert_eq(t_dclose(ganita_f64_tanh(t_d(1)), f64_div(ganita_f64_sinh(t_d(1)), ganita_f64_cosh(t_d(1)))), 1,
+  "tanh(1) = sinh(1)/cosh(1) unchanged");
+
+# ⭐ OVERFLOW. hypot exists precisely so that a caller does not have to worry
+# about x*x overflowing — and it squared first, so it returned +inf above
+# ~1.3e154 and 0 below ~1.5e-162 for hypotenuses that are representable.
+var E116 = t_d(1);
+var ek = 0;
+while (ek < 116) { E116 = f64_mul(E116, t_d(10)); ek = ek + 1; }
+var E116N = f64_div(t_d(1), E116);
+assert_eq(ganita_f64_hypot(f64_mul(t_d(3), E116), f64_mul(t_d(4), E116)), f64_mul(t_d(5), E116),
+  "hypot(3e116, 4e116) = 5e116 exactly (was +inf)");
+assert_eq(ganita_f64_hypot(f64_mul(t_d(3), E116N), f64_mul(t_d(4), E116N)), f64_mul(t_d(5), E116N),
+  "hypot(3e-116, 4e-116) = 5e-116 exactly (was 0)");
+assert_eq(ganita_f64_hypot(t_d(3), t_d(4)), t_d(5), "hypot(3,4) = 5 unchanged");
+assert_eq(ganita_f64_hypot(t_d(0), t_d(0)), t_d(0), "hypot(0,0) = 0");
+# hypot(inf, NaN) is +inf: the magnitude is infinite whatever the other leg is,
+# so infinity OUTRANKS NaN propagation here. Ordering-sensitive, hence pinned.
+var F64_INF = f64_div(t_d(1), t_d(0));
+assert_eq(ganita_f64_hypot(F64_INF, f64_div(t_d(0), t_d(0))), F64_INF, "hypot(inf, NaN) = +inf");
+
+# ⭐ INFINITY. stdlib's f64_exp returns NaN for an infinite argument, so every
+# function reaching for it returned NaN where the true value is a defined
+# infinity. Guarded in ganita; the fix belongs upstream.
+assert_eq(ganita_f64_sinh(F64_INF), F64_INF, "sinh(+inf) = +inf (was NaN)");
+assert_eq(ganita_f64_sinh(f64_neg(F64_INF)), f64_neg(F64_INF), "sinh(-inf) = -inf (was NaN)");
+assert_eq(ganita_f64_cosh(F64_INF), F64_INF, "cosh(+inf) = +inf (was NaN)");
+assert_eq(ganita_f64_cosh(f64_neg(F64_INF)), F64_INF, "cosh(-inf) = +inf (cosh is even)");
+
+# ⭐ pow on an INTEGRAL exponent is now binary exponentiation, not exp(y ln x).
+# The old path was up to 47 ulps out, so pow(7,2) floored to 48 — a caller
+# indexing an array with it was off by one for no visible reason.
+assert_eq(ganita_f64_pow(t_d(7), t_d(2)), t_d(49), "pow(7,2) == 49 EXACTLY (was 48.999...)");
+assert_eq(ganita_f64_pow(t_d(10), t_d(15)), t_d(1000000000000000),
+  "pow(10,15) == 1e15 exactly (was 1000000000000005.875)");
+assert_eq(ganita_f64_pow(t_d(2), t_d(53)), f64_mul(t_d(4503599627370496), t_d(2)), "pow(2,53) is exact");
+assert_eq(ganita_f64_pow(t_d(0 - 2), t_d(3)), t_d(0 - 8), "pow(-2,3) = -8 (no logarithm taken)");
+assert_eq(ganita_f64_pow(t_d(2), t_d(0 - 2)), f64_div(t_d(1), t_d(4)), "pow(2,-2) = 0.25 exactly");
+assert_eq(t_dclose(ganita_f64_pow(t_d(9), f64_div(t_d(1), t_d(2))), t_d(3)), 1,
+  "pow(9,0.5) = 3 — the non-integral path still works");
+# An infinite base now goes through the integral fast path, which takes no
+# logarithm and therefore gets the IEEE answers for free. _f64_is_int used to
+# call inf an integer too, which routed the NEGATIVE-base branch into computing
+# a parity for an infinity; it now reports non-finite values as non-integers.
+assert_eq(ganita_f64_pow(F64_INF, t_d(2)), F64_INF, "pow(inf, 2) = +inf");
+assert_eq(ganita_f64_pow(f64_neg(F64_INF), t_d(3)), f64_neg(F64_INF), "pow(-inf, 3) = -inf (odd power keeps the sign)");
+assert_eq(ganita_f64_pow(f64_neg(F64_INF), t_d(2)), F64_INF, "pow(-inf, 2) = +inf (even power)");
+assert_eq(ganita_f64_pow(F64_INF, t_d(0 - 1)), t_d(0), "pow(inf, -1) = 0");
+# A NON-integral exponent on an infinite base has no fast path, so it reaches the
+# guard rather than exp(y * ln inf).
+assert_eq(t_f64_is_nan(ganita_f64_pow(F64_INF, f64_div(t_d(1), t_d(2)))), 1,
+  "pow(inf, 0.5) is NaN — the guard, not a mis-branch");
+
+# ⭐ DOMAIN. acos/acosh/atanh now reject their out-of-domain arguments instead of
+# returning whatever the formula produced.
+assert_eq(t_f64_is_nan(ganita_f64_acos(t_d(2))), 1, "acos(2) is NaN — outside [-1,1]");
+assert_eq(t_f64_is_nan(ganita_f64_acosh(f64_div(t_d(1), t_d(2)))), 1, "acosh(0.5) is NaN — below 1");
+assert_eq(t_f64_is_nan(ganita_f64_atanh(t_d(2))), 1, "atanh(2) is NaN — outside (-1,1)");
+assert_eq(ganita_f64_acosh(t_d(1)), t_d(0), "acosh(1) = 0");
+# acosh squared its argument, so it hit +inf above ~1.34e154 where the answer is
+# about 355 and finite.
+var E192 = t_d(1);
+var e2k = 0;
+while (e2k < 192) { E192 = f64_mul(E192, t_d(10)); e2k = e2k + 1; }
+assert_eq(t_f64_is_pos_inf(ganita_f64_acosh(E192)), 0, "acosh(1e192) is FINITE (was +inf)");
+assert_eq(t_dclose(ganita_f64_acosh(E192), f64_add(f64_ln(E192), f64_ln(t_d(2)))), 1,
+  "acosh(1e192) = ln(x) + ln 2");
+
+# ⭐ acos is no longer pi/2 - asin(x). The old form differenced two quantities
+# near pi/2 to produce an answer near 0, so it lost ~6 digits exactly where
+# acos(dot) for near-parallel unit vectors lands. The half-angle form's error
+# SHRINKS toward the ends where the old one's grew.
+assert_eq(ganita_f64_acos(t_d(1)), t_d(0), "acos(1) = 0 exactly");
+assert_eq(ganita_f64_acos(t_d(0 - 1)), F64_PI, "acos(-1) = pi exactly");
+assert_eq(ganita_f64_acos(t_d(0)), F64_PI_2, "acos(0) = pi/2 exactly");
+# 1 - 2^-50 is exactly representable, so this measures the implementation and
+# not the construction of the argument. True value = sqrt(2 * 2^-50).
+var D50 = t_d(1);
+var dk = 0;
+while (dk < 50) { D50 = f64_div(D50, t_d(2)); dk = dk + 1; }
+var ACWANT = f64_sqrt(f64_mul(t_d(2), D50));
+assert_eq(f64_lt(f64_div(f64_abs(f64_sub(ganita_f64_acos(f64_sub(t_d(1), D50)), ACWANT)), ACWANT),
+    f64_div(t_d(1), t_d(1000000000000))) , 1,
+  "acos(1 - 2^-50) is within 1e-12 relative (the old form was 1.3e-9 out)");
+assert_eq(t_dclose(ganita_f64_acos(f64_div(t_d(1), t_d(2))), f64_div(F64_PI, t_d(3))), 1,
+  "acos(0.5) = pi/3 unchanged");
 
 test_group("back-compat aliases");
 var a2 = mat_new(4, 5);

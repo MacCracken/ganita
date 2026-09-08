@@ -1,5 +1,36 @@
 # `math_advanced` accuracy: cancellation, overflow, and infinity handling
 
+> ✅ **RESOLVED in ganita 1.2.4** (2026-09-08). All four groups closed, in the
+> priority order this filing set:
+>
+> 1. **hypot** scales out the larger leg before squaring, so `hypot(3e116,
+>    4e116) = 5e116` and `hypot(3e-116, 4e-116) = 5e-116` are now exact where
+>    they were `+inf` and `0`. `hypot(inf, NaN) = +inf` — infinity outranks NaN
+>    propagation, which is ordering-sensitive and now pinned by a test.
+> 2. **acos** is no longer `pi/2 - asin(x)`. The half-angle form
+>    `2·atan(sqrt((1-x)/(1+x)))` has no cancellation at the ends, and the branch
+>    splits at 0 so both ends are covered. Measured on exactly-representable
+>    arguments, the error now SHRINKS toward x = 1 where the old form's grew:
+>    at 1 - 2^-50, ~0 against 1.3e-9.
+> 3. **Small-|x| series** for sinh, tanh and atanh (asinh was done at 1.2.3).
+>    Below 2^-26 each returns x, which IS the correctly-rounded answer; they
+>    used to return exactly 0.0 below ~1e-17.
+> 4. **Overflow bands**: `acosh` uses `ln(x) + ln 2` above 2^26 so it is finite
+>    at 1e192 where it used to be `+inf`; `sinh`/`cosh` use `exp(|x| - ln 2)`
+>    above 709 to cover the band that used to overflow.
+> 5. **pow on an integral exponent** is binary exponentiation, not
+>    `exp(y·ln x)`. `pow(7,2)` is exactly 49 (was 48.99999999999999296, which
+>    floored to 48) and `pow(10,15)` is exactly 1e15 (was ...005.875). It also
+>    gets infinite bases right for free, since it takes no logarithm.
+> 6. **Infinite arguments**: `sinh(±inf) = ±inf`, `cosh(±inf) = +inf`, handled
+>    in ganita because stdlib's `f64_exp` returns NaN for them. `_f64_is_int` no
+>    longer calls an infinity an integer. **The underlying `f64_exp(±inf) = NaN`
+>    is a stdlib defect and is NOT fixed here** — ganita only guards around it.
+>
+> Also closed: `acos`, `acosh` and `atanh` now return NaN outside their domains
+> instead of whatever the formula produced.
+
+
 **Filed by**: ganita's 1.2.3 P(-1) sweep (math-advanced lens)
 **Against**: `src/math_advanced.cyr`
 **Date**: 2026-09-07

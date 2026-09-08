@@ -1,5 +1,46 @@
 # Performance backlog, and the `GANITA_MAT_MAX_ELEMS` raise
 
+> ⚠️ **PARTIALLY RESOLVED — THIS FILING STAYS OPEN.** Five of six items landed in
+> ganita 1.2.4 (2026-09-08) and are measured below; what remains is one policy
+> decision and two items that need a public API change, so the file is kept in
+> `issues/` rather than `archived/` — an open item in an archived folder is how
+> a backlog quietly disappears.
+>
+> **Done:**
+> - **`mat_get`/`_set` in the hot loop** — `ganita_mat_mul`'s accumulation loop
+>   uses raw row/column pointers. **3.34x at 120x120**, matching the predicted
+>   2–3.7x. Deliberately confined to that one loop: it is the only O(m·n·k) one,
+>   and a per-element saving nobody can measure is not worth an off-by-one that
+>   writes out of bounds.
+> - **`pseudo_inv`'s dense Sigma_inv is gone** — V's columns are scaled in
+>   place, O(n²) instead of a full O(n³) multiply by a diagonal.
+> - **`mat_new`'s redundant zero fill** — `_ganita_mat_new_raw` keeps the
+>   CWE-190 guard and skips only the fill, used by the callers that provably
+>   overwrite every element.
+> - **`rank`/`condition` values-only** — a flagged SVD path skips the V
+>   accumulation and U construction. **1.61x at 40x40.**
+> - **`qr`'s reflector allocation** is hoisted out of the k-loop; it used to leak
+>   O(m·n) of bump-allocator scratch per factorisation.
+> - **`sinh`/`cosh` evaluate one exp**, using `exp(-x) = 1/exp(x)`, bounded at
+>   |x| <= 500 so the reciprocal stays in the normal range.
+>
+> **Still open, and why:**
+> - **`mat_inv`'s per-column scratch.** The allocation is inside
+>   `ganita_mat_lu_solve`, which `mat_inv` calls n times. Hoisting it means
+>   changing `lu_solve`'s signature to accept a caller-provided buffer — a
+>   public API change for what is, with a bump allocator, memory growth rather
+>   than time. Not worth it alone; worth folding into any future API revision.
+> - **Transposes materialised once and discarded.** Inherent to
+>   `ganita_mat_transpose` returning a new matrix. Removing them needs in-place
+>   or fused variants, i.e. new public API.
+> - **Raising `GANITA_MAT_MAX_ELEMS`** — STILL DEFERRED, for the reasons in the
+>   1.2.3 audit, which have not changed: one 268M-element matrix is 2 GiB, the
+>   entire ALLOC_MAX, so allocating it leaves nothing for the working factors;
+>   and it multiplies by 8 the memory a single call can demand of every existing
+>   consumer. This is a policy question about whether ganita should cap below the
+>   allocator, not a defect.
+
+
 **Filed by**: ganita's 1.2.3 P(-1) sweep (performance lens — every claim below was
 benchmarked, not asserted)
 **Against**: `src/matrix.cyr`, `src/linalg.cyr`, `src/math_advanced.cyr`
