@@ -1,6 +1,12 @@
 # chrono.cyr — time and duration utilities
 # Usage: include "lib/chrono.cyr"
 # Requires: syscalls.cyr (for clock_gettime)
+# v6.5.39: atomic.cyr, for the aarch64 release fence on the lazy-init publish below.
+# ⚠ MEASURED ZERO COST: alloc.cyr already pulls atomic.cyr and includes are once-only, so
+# adding this changed NOTHING — A/B on tests/tcyr/stdlib/chrono.tcyr is byte-identical on
+# x86-linux, PE and the bare-metal kernel fixture. The proposal listed the include cost as
+# part of the decision; it is not.
+include "lib/atomic.cyr"
 
 var CLOCK_REALTIME = 0;
 var CLOCK_MONOTONIC = 1;
@@ -183,19 +189,65 @@ fn sleep_ms(ms): i64 {
 var _chrono_mdays = 0;
 fn _chrono_init_mdays(): i64 {
     if (_chrono_mdays != 0) { return 0; }
-    _chrono_mdays = alloc(96);
-    store64(_chrono_mdays, 31);       # Jan
-    store64(_chrono_mdays + 8, 28);   # Feb
-    store64(_chrono_mdays + 16, 31);  # Mar
-    store64(_chrono_mdays + 24, 30);  # Apr
-    store64(_chrono_mdays + 32, 31);  # May
-    store64(_chrono_mdays + 40, 30);  # Jun
-    store64(_chrono_mdays + 48, 31);  # Jul
-    store64(_chrono_mdays + 56, 31);  # Aug
-    store64(_chrono_mdays + 64, 30);  # Sep
-    store64(_chrono_mdays + 72, 31);  # Oct
-    store64(_chrono_mdays + 80, 30);  # Nov
-    store64(_chrono_mdays + 88, 31);  # Dec
+    # ⛔ v6.5.37 — FILL A LOCAL, PUBLISH LAST. The global used to be assigned the
+    # alloc() result on the FIRST statement, so between that assignment and the twelfth
+    # store64 the table was reachable by another thread and READ AS ZEROS. A concurrent
+    # `epoch_to_date` then divided by a zero month length and returned **month 13** —
+    # silent, wrong, and only under threads. Found by a samay v1.0.4 concurrency audit
+    # (docs/development/proposals/2026-08-30-lazy-init-publish-before-fill.md).
+    #
+    # ⚠ This is a CLASS, not an incident: the same audit found the identical shape in
+    # patra's own `src/pcache.cyr` (fixed upstream at patra 1.13.11, folded here at
+    # v6.5.37). ⚠ The proposal originally also named `lib/patra.cyr:453` — that was
+    # misfiled: patra.cyr is a GENERATED bundle and a fix there evaporates on the next
+    # `cyrius distlib`. Fix the source repo, never the fold.
+    #
+    # A tree-wide sweep for `if (_g != 0) { return }` followed by `_g = alloc(...)` with
+    # stores after the publish found this as the ONLY remaining site in lib/, cbt/ and
+    # src/ at 6.5.37.
+    #
+    # Single-threaded callers see no behaviour change: the table is fully built before
+    # anything can observe a non-zero pointer, which is what the guard already promised.
+    var t = alloc(96);
+    store64(t, 31);       # Jan
+    store64(t + 8, 28);   # Feb
+    store64(t + 16, 31);  # Mar
+    store64(t + 24, 30);  # Apr
+    store64(t + 32, 31);  # May
+    store64(t + 40, 30);  # Jun
+    store64(t + 48, 31);  # Jul
+    store64(t + 56, 31);  # Aug
+    store64(t + 64, 30);  # Sep
+    store64(t + 72, 31);  # Oct
+    store64(t + 80, 30);  # Nov
+    store64(t + 88, 31);  # Dec
+    # v6.5.39 — RELEASE FENCE before the publishing store. Filling a local and publishing
+    # last (v6.5.37) fixes the PROGRAM-ORDER race and is mutation-proven on x86: 0 of 400
+    # threaded runs go wrong on the live tree, against 29 of 400 with the pre-.37
+    # publish-first shape restored. It does NOT fix the MEMORY-ORDER race. cyrius emits no
+    # ordering whatsoever for ordinary global access on aarch64 — disassembling a threaded
+    # aarch64 binary built from this file shows the guard read as a plain `ldr`, this
+    # publish as a plain `str`, and the whole binary containing zero `stlr`, zero `ldar`
+    # and exactly one `dmb` (inside atomic_fence's own body). So on a weak model another
+    # thread can observe `_chrono_mdays` non-null before the twelve `store64`s that filled
+    # it — the same month-13 bug, one level down.
+    #
+    # ⚠ AARCH64 ONLY, and the precedent matters. The proposal said to copy
+    # `lib/alloc.cyr:89-98`, which fences on BOTH arches. That is the OLD shape: x86-TSO
+    # already orders store-store, so the fence there is pure tax — measured ~22 ns, 83 % of
+    # the lock cost — and the project deliberately removed it in `lib/freelist.cyr:128-134`
+    # (CHANGELOG [6.5.x]: "a correction, not an omission... the aarch64 release fence is
+    # REQUIRED and is kept"). This copies freelist, not alloc.
+    #
+    # ⚠ The reader is safe with a writer-side fence ONLY because it has an address
+    # dependency on the published pointer (it loads `_chrono_mdays`, then loads through
+    # it), which aarch64 honours. A flag publish with no such dependency needs an acquire
+    # on the reader too — which is why `lib/regex.cyr` is deliberately NOT fenced here.
+    #ifdef CYRIUS_ARCH_AARCH64
+    atomic_fence();
+    #endif
+    _chrono_mdays = t;    # publish only once the table is complete
+
     return 0;
 }
 

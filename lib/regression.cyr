@@ -452,9 +452,9 @@ fn regression_network_probe(addr_ipv4, port, timeout_ms): i64 {
     # AGNOS: raw syscall(41) is SYS_SLEEP_MS (mis-dispatch). Use the portable
     # net.cyr socket adapter (tcp_socket reserves a conn slot, net_connect_nb is
     # agnos-guarded to the blocking #47 connect). v6.2.7.
-    var sr = tcp_socket();
-    if (is_err_result(sr) == 1) { return 0; }
-    var afd = payload(sr);
+    var sr_tag, sr = tcp_socket();
+    if (is_err_result(sr_tag) == 1) { return 0; }
+    var afd = sr;
     var arc = net_connect_nb(afd, addr_ipv4, port, timeout_ms);
     sock_close(afd);
     if (arc == 0) { return 1; }

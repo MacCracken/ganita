@@ -213,8 +213,26 @@ fn uname_machine(uts): i64 { return uts + UTS_MACHINE; }
 # §4.4): uptime@0, totalram@8, freeram@16, procs@24, cpus@32 (byte counts
 # direct — no mem_unit scaling).
 #ifdef CYRIUS_TARGET_AGNOS
-enum SysInfoOffset { SI_UPTIME = 0; SI_TOTALRAM = 8; SI_FREERAM = 16; SI_PROCS = 24; SI_CPUS = 32; }
-enum SysInfoConst { SYSINFO_SIZE = 40; }
+# v6.5.45: AGNOS `sysinfo`#35 grew a TAIL at 1.56.59 and is now 200 bytes / 25 u64
+# (agnos-userland-abi.md §4.4). The syscall's documented rule is that future fields append at
+# the tail and bump the minimum len, while existing offsets are frozen ABI the moment a
+# consumer reads them — so the base 40-byte layout below is unchanged and everything new is
+# additive.
+#
+# ⛔ THE LENGTH TIERS ARE 40 / 104 / 200 AND EACH GATES ITS BAND INDEPENDENTLY. A caller
+# passing 40..103 gets exactly the base struct; 104..199 gets the per-core band and NOT the
+# disk band; 200+ gets both. That is why `sys_sysinfo` (arity 1) can keep asking for 40
+# forever without breaking, and why reading a tail field requires `sys_sysinfo_n` with a
+# length that actually covers it — a short buffer does not error, it just leaves your band
+# unwritten, so a caller who forgets reads whatever was on its stack.
+enum SysInfoOffset { SI_UPTIME = 0; SI_TOTALRAM = 8; SI_FREERAM = 16; SI_PROCS = 24; SI_CPUS = 32;
+    SI_CPU_BASE = 40; SI_BLK_BASE = 104; }
+enum SysInfoConst { SYSINFO_SIZE = 40;          # base band — uptime/ram/procs/cpus
+    SYSINFO_SIZE_CPU = 104;     # + per-core CPU ticks (agnos 1.56.59)
+    SYSINFO_SIZE_FULL = 200;    # + per-device block counters (agnos 1.56.59)
+    SYSINFO_BAND_STRIDE = 16;   # both tail bands are {read/user, write/kern} u64 pairs
+    SYSINFO_MAX_CPUS = 4;       # the hard kernel-wide cap pcpu_cpu() enforces
+    SYSINFO_MAX_BLK_TAGS = 6; } # BLK_NONE(0) + the 5-value device enum
 #endif
 #ifndef CYRIUS_TARGET_AGNOS
 enum SysInfoOffset { SI_UPTIME = 0; SI_TOTALRAM = 32; SI_FREERAM = 40; SI_PROCS = 80; SI_MEM_UNIT = 104; }
@@ -302,6 +320,70 @@ fn sys_sysinfo(out): i64 {
     return 0 - 38;   # ENOSYS — Windows uses GlobalMemoryStatusEx / GetTickCount64
     #endif
 }
+
+# Fill a caller-provided sysinfo buffer, asking for `len` bytes. Returns 0 / -errno.
+#
+# ⭐ THIS IS HOW YOU REACH AGNOS'S TAIL BANDS. `sys_sysinfo(out)` hardcodes 40, so every
+# wrapper consumer saw exactly the base struct no matter how much the kernel had to offer —
+# chakshu, the system monitor this was built for, reads #35 only through lib/mihi.cyr and so
+# could not see the per-core or block fields at all. Pass SYSINFO_SIZE_CPU for the CPU band or
+# SYSINFO_SIZE_FULL for both, and size `out` to match.
+#
+# ⚠ NO NEW SYSCALL NUMBER IS INVOLVED, and that is the point of the change. agnos appended to
+# #35's tail precisely so new capability costs no number; the previous attempt minted
+# `blkstats`#105 for the block band, shipped as a cyrius peer in 6.5.44, and WITHDREW it one
+# release later once an audit found a closed tag enum over flat arrays is just a fixed-size
+# tail block. See the withdrawal note in lib/syscalls_x86_64_agnos.cyr.
+#
+# On non-AGNOS targets `len` is advisory: Linux `sysinfo(2)` takes no length and the macOS
+# emulation writes the Linux-shaped struct, so this delegates and the argument is ignored
+# rather than silently changing behaviour.
+fn sys_sysinfo_n(out, len): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return syscall(SYS_SYSINFO, out, len);
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    return sys_sysinfo(out);
+    #endif
+}
+
+#ifdef CYRIUS_TARGET_AGNOS
+# ── Tail accessors. Named, because hand-computing `+104 + tag*16 + 8` at every call site is
+# how an off-by-one band read becomes a plausible-looking statistic. Each returns -1 for an
+# out-of-range index; the counters themselves are non-negative sector/tick totals, monotonic
+# since boot and never reset, so a monitor differences two samples for a rate.
+#
+# ⚠ THE BUFFER MUST HAVE BEEN FILLED BY sys_sysinfo_n WITH A LENGTH COVERING THE BAND. These
+# only compute an offset — they cannot tell an unwritten band from a zeroed one.
+
+# 100 Hz ticks whose interrupted context was ring 3 (Linux's %us), for `cpu` in 0..3.
+fn sysinfo_cpu_user(buf, cpu): i64 {
+    if (cpu < 0) { return 0 - 1; }
+    if (cpu >= SYSINFO_MAX_CPUS) { return 0 - 1; }
+    return load64(buf + SI_CPU_BASE + cpu * SYSINFO_BAND_STRIDE);
+}
+# 100 Hz ticks whose interrupted context was ring 0 (Linux's %sy), for `cpu` in 0..3.
+fn sysinfo_cpu_kern(buf, cpu): i64 {
+    if (cpu < 0) { return 0 - 1; }
+    if (cpu >= SYSINFO_MAX_CPUS) { return 0 - 1; }
+    return load64(buf + SI_CPU_BASE + cpu * SYSINFO_BAND_STRIDE + 8);
+}
+# Cumulative sectors READ on device `tag`. Tags are the BLK_* enum blk_enum#75 hands out:
+# 0 = BLK_NONE (reserved, always 0) · 1 virtio · 2 nvme · 3 ahci · 4 usb-ms · 5 ramdisk.
+# ⚠ SECTORS, NOT BYTES, deliberately: a byte figure would need the per-device LBA size, which
+# can be 4096, so multiply by `blk_info`#79's reported lba_bytes if you want bytes.
+fn sysinfo_blk_read(buf, tag): i64 {
+    if (tag < 0) { return 0 - 1; }
+    if (tag >= SYSINFO_MAX_BLK_TAGS) { return 0 - 1; }
+    return load64(buf + SI_BLK_BASE + tag * SYSINFO_BAND_STRIDE);
+}
+# Cumulative sectors WRITTEN on device `tag`. Same tag space as sysinfo_blk_read.
+fn sysinfo_blk_write(buf, tag): i64 {
+    if (tag < 0) { return 0 - 1; }
+    if (tag >= SYSINFO_MAX_BLK_TAGS) { return 0 - 1; }
+    return load64(buf + SI_BLK_BASE + tag * SYSINFO_BAND_STRIDE + 8);
+}
+#endif
 
 # Uptime in seconds from a filled sysinfo buffer.
 fn sysinfo_uptime(info): i64 { return load64(info + SI_UPTIME); }

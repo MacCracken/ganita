@@ -173,15 +173,16 @@ var _NET_EAGAIN = 11;
 
 # v6.4.61: shared would-block Result singleton. sock_accept's overwhelmingly common
 # return in a non-blocking server is "nothing pending" (Err(_NET_EAGAIN)); on the
-# no-free bump allocator, boxing a fresh 16-byte Result every poll leaks the arena
-# and eventually NULL-faults a long-running accept-poll daemon (mishrand/agora/
-# descent/setu — issue 2026-07-12-net-sock-accept-per-poll-alloc-leak). Box it ONCE,
-# lazily, and hand back the same pointer each poll → zero steady-state allocation.
-# Safe: callers only READ the tag + code (is_ok / result_unwrap) and never mutate it.
-var _net_eagain_box = 0;
+# no-free bump allocator, boxing a fresh 16-byte Result every poll leaked the arena
+# and eventually NULL-faulted a long-running accept-poll daemon (mishrand/agora/
+# descent/setu — issue 2026-07-12-net-sock-accept-per-poll-alloc-leak). v6.4.61 fixed
+# that by boxing ONCE into a lazy `_net_eagain_box` singleton and handing back the same
+# pointer every poll.
+# ⭐ v6.6.0 DELETED the singleton and the global with it: under the value form `Err(...)`
+# is a register pair and allocates nothing at all, so there is no box to cache and no
+# steady-state growth to avoid. The workaround outlived the defect it worked around.
 fn _net_eagain() : Result {
-    if (_net_eagain_box == 0) { _net_eagain_box = Err(_NET_EAGAIN); }
-    return _net_eagain_box;
+    return Err(_NET_EAGAIN);
 }
 
 # Create a TCP socket. Returns Result(fd). On AGNOS the "fd" is a tagged
@@ -400,6 +401,53 @@ fn sock_recv(fd, buf, len) : Result {
     var n = sys_read(fd, buf, len);
     if (n < 0) { return Err(0 - n); }
     return Ok(n);
+}
+
+# ── Allocator-parameterised send/recv (v6.5.41) ──
+#
+# THE DEFECT (sandhi, filed against 6.4.86, reproducing unchanged on 6.5.39): every
+# `sock_send` / `sock_recv` allocates a **16-byte Result box from the GLOBAL bump allocator**
+# — measured `100x sock_send` → the global allocator grows exactly 1600 B. Its only reclaim is
+# `alloc_reset()`, which invalidates every pointer it has ever handed out, so a long-running
+# server can never call it. Unbounded growth, no consumer-side workaround.
+#
+# These peers take an allocator (`arena_allocator(n)`) and box through it instead, so a server
+# can reset a per-request arena. Layout is identical, so `is_ok` / `is_err_result` /
+# `result_unwrap` / `?` all work on the returned box unchanged.
+#
+# ⚠ THEY REDO THE SYSCALL RATHER THAN DELEGATING, and that is required, not stylistic:
+# `sock_send_a(a, ...) { var r = sock_send(...); ... }` would allocate the global box FIRST and
+# then re-box it, leaving the growth exactly as it was. Delegation cannot fix an allocation
+# that happens inside the callee.
+#
+# ⚠ ONLY send/recv HAVE PEERS, and the reason is a drift hazard, not scope. These two are three
+# lines of straight `sys_write`/`sys_read` with no per-target branches. The other seven
+# `: Result` fns in this file (`tcp_socket`, `udp_socket`, `sock_bind`, `sock_listen`,
+# `sock_accept`, `sock_connect`, `_net_eagain`) each carry `#ifdef CYRIUS_TARGET_AGNOS`
+# branches with genuinely different semantics per target — AGNOS merges bind+listen, its accept
+# is non-blocking, its connect does socket()+connect() in one. Duplicating those into `_a`
+# copies would fork per-target logic into two places that then drift, which is the defect class
+# this repo keeps finding. They are also cold: the filed measurement is the send/recv loop.
+# If they are ever needed, the right move is to make the ONE implementation allocator-aware,
+# not to clone it.
+#
+# ⭐ The real fix is upstream of all of this and is a different size class: the allocation is
+# not a `Result` or a net.cyr property at all — the enum payload-variant constructor lowering
+# (`src/frontend/parse_types.cyr:386`) unconditionally calls the global `alloc`, so EVERY
+# payload-carrying enum in the language does this. Changing that representation touches 24 enum
+# declarations and 516 construction sites. See lib/result.cyr's `ok_via` header.
+# Send on a socket, boxing the Result through the caller's allocator. Returns Ok(n)/Err(errno).
+fn sock_send_a(a, fd, buf, len): i64 {
+    var n = sys_write(fd, buf, len);
+    if (n < 0) { return err_via(a, 0 - n); }
+    return ok_via(a, n);
+}
+
+# Receive from a socket, boxing the Result through the caller's allocator. Ok(n)/Err(errno).
+fn sock_recv_a(a, fd, buf, len): i64 {
+    var n = sys_read(fd, buf, len);
+    if (n < 0) { return err_via(a, 0 - n); }
+    return ok_via(a, n);
 }
 
 # Close socket

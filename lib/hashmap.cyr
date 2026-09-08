@@ -53,6 +53,7 @@
 # encoding moves into the key field.
 
 include "lib/fnptr.cyr"
+include "lib/hashseed.cyr"   # v6.5.39: per-process seed + finalizer (hash-flooding DoS)
 
 # v5.8.26 — key_type symbolic constants. Replaces raw 0/1/2
 # integer literals at the 6 read/write sites in this file.
@@ -68,14 +69,15 @@ enum KeyType {
 # FNV-1a hash for null-terminated string (cstr keys).
 fn hash_str(s): i64 {
     if (s == 0) { return 0; }
-    var h = 0xCBF29CE484222325;
+    # v6.5.39: seeded basis + finalizer — see lib/hashseed.cyr for why both are needed.
+    var h = 0xCBF29CE484222325 ^ _hm_seed_get();
     var hi = 0;
     while (load8(s + hi) != 0) {
         h = h ^ load8(s + hi);
         h = h * 0x100000001B3;
         hi = hi + 1;
     }
-    return h;
+    return _hm_mix(h);
 }
 
 # FNV-1a hash for Str struct (fat pointer keys).
@@ -85,14 +87,14 @@ fn hash_str_v(s): i64 {
     if (s == 0) { return 0; }
     var data = str_data(s);
     var len = str_len(s);
-    var h = 0xCBF29CE484222325;
+    var h = 0xCBF29CE484222325 ^ _hm_seed_get();   # v6.5.39
     var hi = 0;
     while (hi < len) {
         h = h ^ load8(data + hi);
         h = h * 0x100000001B3;
         hi = hi + 1;
     }
-    return h;
+    return _hm_mix(h);
 }
 
 # Internal: pick hash based on map's key_type.
@@ -407,7 +409,9 @@ fn map_iter(m, fp): i64 {
 # modulo page size) pile up in the same bucket and probe chains
 # degenerate to linear scans.
 fn hash_u64(k): i64 {
-    var h = k;
+    # v6.5.39: splitmix64 is INVERTIBLE, so with published constants an attacker computes
+    # preimages for any target bucket directly — no brute force at all. The seed removes that.
+    var h = k ^ _hm_seed_get();
     h = h ^ (h >> 30);
     h = h * 0xBF58476D1CE4E5B9;
     h = h ^ (h >> 27);

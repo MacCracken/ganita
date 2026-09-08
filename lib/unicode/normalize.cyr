@@ -87,7 +87,7 @@ var _UC_HANGUL_NCOUNT = 588;       # VCOUNT * TCOUNT
 var _UC_HANGUL_SBASE = 0xAC00;
 var _UC_HANGUL_SCOUNT = 11172;     # LCOUNT * NCOUNT
 
-# ── Piece dispatchers ─────────────────────────────────────────────────
+# ────────
 
 fn _uc_ccc_piece(idx) {
     if (idx == 0) { return _UNICODE_CCC_PIECE_0; }
@@ -121,7 +121,7 @@ fn _uc_compat_idx_piece(idx) {
     return 0;
 }
 
-# ── Public lookups ────────────────────────────────────────────────────
+# ────────
 
 # Canonical Combining Class — 0 (starter) by default; lookup miss → 0.
 fn unicode_canonical_combining_class(cp) {
@@ -241,7 +241,7 @@ fn unicode_compat_decomp(cp, out_buf, cap) {
                 var i = 0;
                 while (i < n) {
                     store64(out_buf + i * 8,
-                            _uc_u24(_UNICODE_COMPAT_DATA, data_off + 2 + i * 6));
+                      _uc_u24(_UNICODE_COMPAT_DATA, data_off + 2 + i * 6));
                     i = i + 1;
                 }
                 return n;
@@ -328,11 +328,13 @@ fn unicode_compose(cp1, cp2) {
 # `_uc_nz_*` synthetic-collision-dodge prefix) and in casefold.cyr —
 # the prior copies were byte-identical modulo whitespace.
 
-# ── Recursive decomposition ───────────────────────────────────────────
+# ────────
 # Walk s, decomposing each cp recursively until no further expansion.
 # Writes the expanded cp sequence to buf as i64 slots; returns count.
-# Canonical only (NFC/NFD); NFKC/NFKD compat path deferred to a later
-# slot per file header.
+# Canonical only (NFC/NFD); the NFKC/NFKD compat path is unbuilt — tracked on the
+# roadmap-future watching list ("Unicode NFKC/NFKD compatibility forms"), which carries
+# the ~445 KB table cost that is the actual reason it is not here yet. See this file's
+# header for the enum and buffer sizing that already anticipate it.
 
 fn _uc_decompose_cp_recursive(cp, buf, off, cap) {
     var step_buf = alloc(32);    # max 3 cps × 8 bytes (Hangul LVT)
@@ -379,7 +381,7 @@ fn _uc_decompose_cp_recursive_compat(cp, buf, off, cap) {
     return off;
 }
 
-# ── Canonical reordering ──────────────────────────────────────────────
+# ────────
 # Bubble sort consecutive non-starter (CCC > 0) cps by CCC.
 # Starters (CCC == 0) act as fence posts — they don't move and stop runs.
 
@@ -404,7 +406,7 @@ fn _uc_canonical_reorder(buf, n) {
     }
 }
 
-# ── Composition pass (NFC / NFKC) ─────────────────────────────────────
+# ────────
 # Walk the reordered buffer greedily composing pairs. UAX #15 §10.
 # Writes the composed sequence in place; returns new length.
 
@@ -451,7 +453,7 @@ fn _uc_compose_pass(buf, n) {
     return write_pos;
 }
 
-# ── Public Str-level normalization ────────────────────────────────────
+# ────────
 
 fn str_normalize(s, form) {
     var src = str_data(s);

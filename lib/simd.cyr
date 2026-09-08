@@ -161,44 +161,44 @@ fn f64v4_lane3_ptr(p): i64 { return load64(p + 24); }
 # Pointer form of f64v4_add.
 fn f64v4_add_ptr(a_ptr, b_ptr): f64v4 {
     var r: f64v4;
-    if (simd_has_avx2() == 1) { f64v256_add(&r, a_ptr, b_ptr, 4); }
-    else { f64v_add(&r, a_ptr, b_ptr, 4); }
+    f64v_add(&r, a_ptr, b_ptr, 4);
     return r;
 }
 
 # Pointer form of f64v4_sub.
 fn f64v4_sub_ptr(a_ptr, b_ptr): f64v4 {
     var r: f64v4;
-    if (simd_has_avx2() == 1) { f64v256_sub(&r, a_ptr, b_ptr, 4); }
-    else { f64v_sub(&r, a_ptr, b_ptr, 4); }
+    f64v_sub(&r, a_ptr, b_ptr, 4);
     return r;
 }
 
 # Pointer form of f64v4_mul.
 fn f64v4_mul_ptr(a_ptr, b_ptr): f64v4 {
     var r: f64v4;
-    if (simd_has_avx2() == 1) { f64v256_mul(&r, a_ptr, b_ptr, 4); }
-    else { f64v_mul(&r, a_ptr, b_ptr, 4); }
+    f64v_mul(&r, a_ptr, b_ptr, 4);
     return r;
 }
 
 # Pointer form of f64v4_div.
 fn f64v4_div_ptr(a_ptr, b_ptr): f64v4 {
     var r: f64v4;
-    if (simd_has_avx2() == 1) { f64v256_div(&r, a_ptr, b_ptr, 4); }
-    else { f64v_div(&r, a_ptr, b_ptr, 4); }
+    f64v_div(&r, a_ptr, b_ptr, 4);
     return r;
 }
 
 # Pointer form of f64v4_fmadd.
 fn f64v4_fmadd_ptr(a_ptr, b_ptr, c_ptr): f64v4 {
     var r: f64v4;
-    f64v_fmadd(&r, a_ptr, b_ptr, c_ptr, 4);
+    if (_avx2_cache == 2) { simd_has_avx2(); }
+    if (_avx2_cache == 1) { f64v256_fmadd(&r, a_ptr, b_ptr, c_ptr, 4); }
+    else { f64v_fmadd(&r, a_ptr, b_ptr, c_ptr, 4); }
     return r;
 }
 
 # Pointer form of f64v4_dot.
 fn f64v4_dot_ptr(a_ptr, b_ptr): i64 {
+    if (_avx2_cache == 2) { simd_has_avx2(); }
+    if (_avx2_cache == 1) { return f64v256_dot(a_ptr, b_ptr, 4); }
     return f64v_dot(a_ptr, b_ptr, 4);
 }
 
@@ -361,24 +361,21 @@ fn f32v8_lane7_ptr(p): i64 { return load32(p + 28); }
 # Packed add (pointer form) — vaddps ymm (AVX2) or 2×SSE addps. Routes f32v8_add(&x, &y).
 fn f32v8_add_ptr(a_ptr, b_ptr): f32v8 {
     var r: f32v8;
-    if (simd_has_avx2() == 1) { f32v8_add(&r, a_ptr, b_ptr, 8); }
-    else { f32v_add(&r, a_ptr, b_ptr, 8); }
+    f32v_add(&r, a_ptr, b_ptr, 8);
     return r;
 }
 
 # Packed sub (pointer form) — vsubps ymm (AVX2) or 2×SSE subps.
 fn f32v8_sub_ptr(a_ptr, b_ptr): f32v8 {
     var r: f32v8;
-    if (simd_has_avx2() == 1) { f32v8_sub(&r, a_ptr, b_ptr, 8); }
-    else { f32v_sub(&r, a_ptr, b_ptr, 8); }
+    f32v_sub(&r, a_ptr, b_ptr, 8);
     return r;
 }
 
 # Packed mul (pointer form) — vmulps ymm (AVX2) or 2×SSE mulps.
 fn f32v8_mul_ptr(a_ptr, b_ptr): f32v8 {
     var r: f32v8;
-    if (simd_has_avx2() == 1) { f32v8_mul(&r, a_ptr, b_ptr, 8); }
-    else { f32v_mul(&r, a_ptr, b_ptr, 8); }
+    f32v_mul(&r, a_ptr, b_ptr, 8);
     return r;
 }
 
@@ -423,7 +420,8 @@ fn simd_has_fma(): i64 {
 # needing bit-equality across CPUs should use exact-product inputs.
 fn f32v8_fma_ptr(a_ptr, b_ptr, c_ptr): f32v8 {
     var r: f32v8;
-    if (simd_has_fma() == 1) { f32v8_fma(&r, a_ptr, b_ptr, c_ptr, 8); }
+    if (_fma_cache == 2) { simd_has_fma(); }
+    if (_fma_cache == 1) { f32v8_fma(&r, a_ptr, b_ptr, c_ptr, 8); }
     else { f32v_fmadd(&r, a_ptr, b_ptr, c_ptr, 8); }
     return r;
 }
@@ -431,7 +429,8 @@ fn f32v8_fma_ptr(a_ptr, b_ptr, c_ptr): f32v8 {
 # Horizontal dot (pointer form): sum(a[i]*b[i]) over 8 lanes → f32 bit pattern. AVX2
 # (vmulps/vaddps accumulate + vextractf128 8-lane reduce) when available, else SSE f32v_dot.
 fn f32v8_dot_ptr(a_ptr, b_ptr): i64 {
-    if (simd_has_avx2() == 1) { return f32v8_dot(a_ptr, b_ptr, 8); }
+    if (_avx2_cache == 2) { simd_has_avx2(); }
+    if (_avx2_cache == 1) { return f32v8_dot(a_ptr, b_ptr, 8); }
     return f32v_dot(a_ptr, b_ptr, 8);
 }
 
@@ -609,44 +608,71 @@ fn f64v4_lane3(v: f64v4): i64 { return load64(&v + 24); }
 # reserving it as a keyword would make this very definition a parse error.
 fn f64v4_add(a: f64v4, b: f64v4): f64v4 {
     var r: f64v4;
-    if (simd_has_avx2() == 1) { f64v256_add(&r, &a, &b, 4); }
-    else { f64v_add(&r, &a, &b, 4); }
+    # v6.5.60 — VALUE form deliberately stays on the 128-bit kernel. MEASURED: the ymm
+    # kernel is faster in isolation (n=4: 4 ms vs 6 ms) but a value-form f64v4 is moved
+    # in and out of frame slots by LEGACY-SSE pair moves, so each call crosses the
+    # AVX<->SSE boundary and pays a `vzeroupper` that costs more than the halved
+    # iteration count saves: 24 ms against 14 ms on the same loop. The `_ptr` batch
+    # forms above KEEP the AVX2 gate — there the loop body is all-VEX and it wins 2x.
+    f64v_add(&r, &a, &b, 4);
     return r;
 }
 
 # 4-lane packed-double subtract (value form).
 fn f64v4_sub(a: f64v4, b: f64v4): f64v4 {
     var r: f64v4;
-    if (simd_has_avx2() == 1) { f64v256_sub(&r, &a, &b, 4); }
-    else { f64v_sub(&r, &a, &b, 4); }
+    # v6.5.60 — VALUE form deliberately stays on the 128-bit kernel. MEASURED: the ymm
+    # kernel is faster in isolation (n=4: 4 ms vs 6 ms) but a value-form f64v4 is moved
+    # in and out of frame slots by LEGACY-SSE pair moves, so each call crosses the
+    # AVX<->SSE boundary and pays a `vzeroupper` that costs more than the halved
+    # iteration count saves: 24 ms against 14 ms on the same loop. The `_ptr` batch
+    # forms above KEEP the AVX2 gate — there the loop body is all-VEX and it wins 2x.
+    f64v_sub(&r, &a, &b, 4);
     return r;
 }
 
 # 4-lane packed-double multiply (value form).
 fn f64v4_mul(a: f64v4, b: f64v4): f64v4 {
     var r: f64v4;
-    if (simd_has_avx2() == 1) { f64v256_mul(&r, &a, &b, 4); }
-    else { f64v_mul(&r, &a, &b, 4); }
+    # v6.5.60 — VALUE form deliberately stays on the 128-bit kernel. MEASURED: the ymm
+    # kernel is faster in isolation (n=4: 4 ms vs 6 ms) but a value-form f64v4 is moved
+    # in and out of frame slots by LEGACY-SSE pair moves, so each call crosses the
+    # AVX<->SSE boundary and pays a `vzeroupper` that costs more than the halved
+    # iteration count saves: 24 ms against 14 ms on the same loop. The `_ptr` batch
+    # forms above KEEP the AVX2 gate — there the loop body is all-VEX and it wins 2x.
+    f64v_mul(&r, &a, &b, 4);
     return r;
 }
 
 # 4-lane packed-double divide (value form).
 fn f64v4_div(a: f64v4, b: f64v4): f64v4 {
     var r: f64v4;
-    if (simd_has_avx2() == 1) { f64v256_div(&r, &a, &b, 4); }
-    else { f64v_div(&r, &a, &b, 4); }
+    # v6.5.60 — VALUE form deliberately stays on the 128-bit kernel. MEASURED: the ymm
+    # kernel is faster in isolation (n=4: 4 ms vs 6 ms) but a value-form f64v4 is moved
+    # in and out of frame slots by LEGACY-SSE pair moves, so each call crosses the
+    # AVX<->SSE boundary and pays a `vzeroupper` that costs more than the halved
+    # iteration count saves: 24 ms against 14 ms on the same loop. The `_ptr` batch
+    # forms above KEEP the AVX2 gate — there the loop body is all-VEX and it wins 2x.
+    f64v_div(&r, &a, &b, 4);
     return r;
 }
 
 # 4-lane FMA (value form): r[i] = a[i] * b[i] + c[i].
+# v6.5.38: gated onto the 256-bit kernel, matching add/sub/mul/div above. Until now this ran
+# the 128-bit SSE2 loop unconditionally — two iterations for four lanes — because `.24` widened
+# only the four arithmetic ops and left the rest of the family behind.
 fn f64v4_fmadd(a: f64v4, b: f64v4, c: f64v4): f64v4 {
     var r: f64v4;
-    f64v_fmadd(&r, &a, &b, &c, 4);
+    if (_avx2_cache == 2) { simd_has_avx2(); }
+    if (_avx2_cache == 1) { f64v256_fmadd(&r, &a, &b, &c, 4); }
+    else { f64v_fmadd(&r, &a, &b, &c, 4); }
     return r;
 }
 
 # 4-lane dot product (value form). Returns f64 bit pattern in i64.
 fn f64v4_dot(a: f64v4, b: f64v4): i64 {
+    if (_avx2_cache == 2) { simd_has_avx2(); }
+    if (_avx2_cache == 1) { return f64v256_dot(&a, &b, 4); }
     return f64v_dot(&a, &b, 4);
 }
 

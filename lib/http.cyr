@@ -199,11 +199,11 @@ fn http_get(url): i64 {
     # the Result ptr as a fd. Now: explicit is_err_result + payload
     # unwrap, mirroring the lib/sandhi.cyr / regression-tls-live.sh
     # call shape.
-    var fd_r = tcp_socket();
-    if (is_err_result(fd_r) == 1) { var err = alloc(24); store64(err, HTTP_ERROR); return err; }
-    var fd = payload(fd_r);
-    var c_r = sock_connect(fd, host, port);
-    if (is_err_result(c_r) == 1) { sys_close(fd); var err = alloc(24); store64(err, HTTP_ERROR); return err; }
+    var fd_r_tag, fd_r = tcp_socket();
+    if (is_err_result(fd_r_tag) == 1) { var err = alloc(24); store64(err, HTTP_ERROR); return err; }
+    var fd = fd_r;
+    var c_r_tag, c_r = sock_connect(fd, host, port);
+    if (is_err_result(c_r_tag) == 1) { sys_close(fd); var err = alloc(24); store64(err, HTTP_ERROR); return err; }
     # Send request — drop the Result; transient-send-error tolerated
     # for parity with the historic best-effort shape.
     sock_send(fd, req, strlen(req));
@@ -213,10 +213,10 @@ fn http_get(url): i64 {
     var total = 0;
     var rgo = 1;
     while (rgo == 1) {
-        var rd_r = sock_recv(fd, rbuf + total, 65536 - total);
-        if (is_err_result(rd_r) == 1) { rgo = 0; }
+        var rd_r_tag, rd_r = sock_recv(fd, rbuf + total, 65536 - total);
+        if (is_err_result(rd_r_tag) == 1) { rgo = 0; }
         else {
-            var n = payload(rd_r);
+            var n = rd_r;
             if (n <= 0) { rgo = 0; }
             else { total = total + n; if (total >= 65536) { rgo = 0; } }
         }
@@ -237,20 +237,20 @@ fn http_get_r(url) : Result {
     var port = load64(parsed + 8);
     var path = load64(parsed + 16);
     var req = _http_build_request("GET", host, path);
-    var fd_r = tcp_socket();
-    if (is_err_result(fd_r) == 1) { return Err(HttpNetErr); }
-    var fd = payload(fd_r);
-    var c_r = sock_connect(fd, host, port);
-    if (is_err_result(c_r) == 1) { sys_close(fd); return Err(HttpNetErr); }
+    var fd_r_tag, fd_r = tcp_socket();
+    if (is_err_result(fd_r_tag) == 1) { return Err(HttpNetErr); }
+    var fd = fd_r;
+    var c_r_tag, c_r = sock_connect(fd, host, port);
+    if (is_err_result(c_r_tag) == 1) { sys_close(fd); return Err(HttpNetErr); }
     sock_send(fd, req, strlen(req));
     var rbuf = alloc(65536);
     var total = 0;
     var rgo = 1;
     while (rgo == 1) {
-        var rd_r = sock_recv(fd, rbuf + total, 65536 - total);
-        if (is_err_result(rd_r) == 1) { rgo = 0; }
+        var rd_r_tag, rd_r = sock_recv(fd, rbuf + total, 65536 - total);
+        if (is_err_result(rd_r_tag) == 1) { rgo = 0; }
         else {
-            var n = payload(rd_r);
+            var n = rd_r;
             if (n <= 0) { rgo = 0; }
             else { total = total + n; if (total >= 65536) { rgo = 0; } }
         }
@@ -290,16 +290,16 @@ fn http_get_a(a, url): i64 {
     var port = load64(parsed + 8);
     var path = load64(parsed + 16);
     var req = _http_build_request("GET", host, path);
-    var fd_r = tcp_socket();
-    if (is_err_result(fd_r) == 1) {
+    var fd_r_tag, fd_r = tcp_socket();
+    if (is_err_result(fd_r_tag) == 1) {
         var err = alloc_via(a, 24);
         if (err == 0) { return 0; }
         store64(err, HTTP_ERROR);
         return err;
     }
-    var fd = payload(fd_r);
-    var c_r = sock_connect(fd, host, port);
-    if (is_err_result(c_r) == 1) {
+    var fd = fd_r;
+    var c_r_tag, c_r = sock_connect(fd, host, port);
+    if (is_err_result(c_r_tag) == 1) {
         sys_close(fd);
         var err = alloc_via(a, 24);
         if (err == 0) { return 0; }
@@ -312,10 +312,10 @@ fn http_get_a(a, url): i64 {
     var total = 0;
     var rgo = 1;
     while (rgo == 1) {
-        var rd_r = sock_recv(fd, rbuf + total, 65536 - total);
-        if (is_err_result(rd_r) == 1) { rgo = 0; }
+        var rd_r_tag, rd_r = sock_recv(fd, rbuf + total, 65536 - total);
+        if (is_err_result(rd_r_tag) == 1) { rgo = 0; }
         else {
-            var n = payload(rd_r);
+            var n = rd_r;
             if (n <= 0) { rgo = 0; }
             else { total = total + n; if (total >= 65536) { rgo = 0; } }
         }

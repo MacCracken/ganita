@@ -19,6 +19,7 @@ include "lib/bench.cyr"
 
 include "src/math_f32.cyr"
 
+# Empty call: measures the harness floor, not any ganita work.
 fn bench_noop(): i64 { return 0; }
 
 # The 1.1.x shape of the arithmetic that TIER 0 replaced, kept here ONLY as the
@@ -28,6 +29,7 @@ fn bench_f32_mul_widened(a, b): i64 {
     return f32_from(f64_mul(f32_to(a), f32_to(b)));
 }
 
+# The pre-1.2.0 lerp: one f64 rounding for the whole expression. Baseline only.
 fn bench_f32_lerp_widened(a, b, t): i64 {
     var af = f32_to(a);
     var bf = f32_to(b);
@@ -35,6 +37,7 @@ fn bench_f32_lerp_widened(a, b, t): i64 {
     return f32_from(f64_add(af, f64_mul(f64_sub(bf, af), tf)));
 }
 
+# Bench entry point — harness floor, then f32 native vs widened for mul and lerp.
 fn main(): i64 {
     alloc_init();
     var b = bench_new("noop");

@@ -298,6 +298,18 @@ fn _tls_init(): i64 {
     if (_fn_SSL_read == 0) { return 0; }
     if (_fn_SSL_ctrl == 0) { return 0; }
 
+    # v6.5.39 — release fence before the readiness publish, same class as
+    # lib/chrono.cyr's `_chrono_mdays`. `_tls_ok` gates every consumer (:594/:654/:806 and
+    # `tls_available()`), and the ~40 `_fn_*` function pointers resolved above it must be
+    # visible to any thread that observes it set. aarch64 only — see the chrono comment for
+    # why this copies `lib/freelist.cyr` and not `lib/alloc.cyr`.
+    # ⚠ `_tls_inited` (:211) is deliberately NOT fenced: it is an ATTEMPT LATCH, not a
+    # readiness flag — it is set before the resolution work, so ordering it would guarantee
+    # nothing. The lazy-init proposal named :211 as the site; it is the wrong one.
+    # atomic.cyr is already in scope transitively (tls_native.cyr -> alloc.cyr).
+    #ifdef CYRIUS_ARCH_AARCH64
+    atomic_fence();
+    #endif
     _tls_ok = 1;
     return 0;
 }
@@ -506,6 +518,12 @@ fn _tls_resolve_introspect(): i64 {
     _fn_i2d_PUBKEY_v             = tls_dlsym("i2d_PUBKEY");
     _fn_X509_free_v              = tls_dlsym("X509_free");
     _fn_EVP_PKEY_free_v          = tls_dlsym("EVP_PKEY_free");
+    # v6.5.39 — same publish shape, and the proposal missed this one entirely: the
+    # `_fn_*_v` introspection pointers resolved above must be visible to any thread that
+    # observes the flag. aarch64 only.
+    #ifdef CYRIUS_ARCH_AARCH64
+    atomic_fence();
+    #endif
     _tls_introspect_resolved = 1;
     return 0;
 }

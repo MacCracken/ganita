@@ -1,5 +1,5 @@
 # sakshi.cyr — tracing, error handling, and structured logging for Cyrius
-# Bundled distribution of sakshi v2.4.11
+# Bundled distribution of sakshi v2.4.12
 # Source: https://github.com/MacCracken/sakshi
 # License: GPL-3.0-only
 #
@@ -1538,6 +1538,18 @@ var _sk_spans_dropped: i64 = 0;
 # The warning is ONE-SHOT — a saturated stack means the next call saturates
 # too, and a warning per call would be its own log storm.
 fn sakshi_span_enter(name, name_len): i64 {
+    # Lower-bound guard. `offset` below is `_sk_span_depth * 24`, and the three
+    # store64s write 24 bytes there — so a NEGATIVE depth writes BEFORE
+    # _sk_span_stack and corrupts whatever precedes it. The upper bound was
+    # already checked; this is the other half of the same buffer contract
+    # (every `var buf[N]` access offset must land inside the N bytes we own).
+    #
+    # A negative depth cannot arise from balanced single-threaded use — exit
+    # refuses to go below 0 — so reaching this means either memory corruption
+    # or sakshi_span_exit called from two threads at once, which the
+    # single-threaded contract forbids but cannot enforce. Recover to a sane
+    # stack rather than scribbling outside it.
+    if (_sk_span_depth < 0) { _sk_span_depth = 0; }
     if (_sk_span_depth >= _SK_MAX_SPANS) {
         _sk_spans_dropped = _sk_spans_dropped + 1;
         if (_sk_spans_dropped == 1) {

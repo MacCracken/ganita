@@ -1,10 +1,12 @@
 # ganita fuzz harness
 
+# Fuzz entry point: one iteration over `len` bytes at `data`.
 fn fuzz_main(data, len) {
     if (len == 0) { return 0; }
     return 0;
 }
 
+# Harness entry point — drives `fuzz_main` with a fixed seed input.
 fn main() {
     alloc_init();
     fuzz_main("test", 4);

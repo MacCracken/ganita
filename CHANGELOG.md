@@ -4,6 +4,54 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.1] — 2026-09-07 — toolchain 6.6.0, and the docs audit that came with it
+
+Maintenance. Cyrius pin `6.5.36` → **6.6.0**, `lib/` re-vendored to an exact match
+(108 → 109 files), `dist/` regenerated. **No `src/` change and no behavioural
+change** — the 243 assertions are the same 243, green on 6.6.0.
+
+### Changed
+
+- **Cyrius pin `6.5.36` → `6.6.0`.** `cyrius version` reports
+  `manifest-pin: 6.6.0` with no drift line. The whole CI gate was re-run locally
+  against it: format · lint · `vet` (11 deps, 0 untrusted, 0 missing) · build with
+  zero compiler warnings · smoke exits 42 · **243/243 assertions** · fuzz · bench ·
+  `coverage --min 80` (109/135 fns, 7/7 files) · `distlib --all --check` ·
+  regeneration byte-identical · consumer-check clean from 10 declared leaves.
+
+- **`lib/` re-synced to the 6.6.0 snapshot — 109 files, 0 differ** (was 108).
+  37 files changed and one is new: `hashseed.cyr`. None of them is in
+  `[deps].stdlib`; they ride along because `cyrius lib sync --full` vendors the
+  whole snapshot. Verified by comparing the trees against
+  `~/.cyrius/versions/6.6.0/lib`, not by trusting the sync's exit code.
+
+- **`dist/ganita.cyr` regenerated** — 1,690 lines, header `Version: 1.2.1`. The
+  bundle is otherwise byte-identical to 1.2.0's: only the version line moves,
+  because `src/` did not change.
+
+### Fixed
+
+- **`cyrius audit` exits 0 again.** 6.6.0 applies the docs check across the whole
+  audit scope — which is `src` **and** `tests` — so the bump turned 1.2.0's green
+  audit into `15 undocumented public fns`. Every one is a test-harness helper that
+  had simply never been in scope before: 10 in `tests/ganita.tcyr` (`t_tol`,
+  `t_dclose`, `t_m2`, `t_m3`, `t_arr2`, `t_arr3`, `t_f32div`, `t_f64_is_nan`,
+  `t_f64_is_pos_inf`, `t_is_nan`), 3 in `tests/ganita.bcyr` (`bench_noop`,
+  `bench_f32_lerp_widened`, `main`) and 2 in `tests/ganita.fcyr` (`fuzz_main`,
+  `main`).
+
+  **The rule is positional**: the doc comment must sit on the line *immediately*
+  above `fn`. A section banner (`# --- linalg test helpers ---`) documents only the
+  first fn beneath it, which is why files that read as thoroughly commented still
+  counted 15 — `t_d` and `t_f32` passed solely because they happened to be first
+  under their banners. Each of the 15 now carries its own line. No test logic
+  changed: 243 assertions before, 243 after.
+
+  This was never a CI failure — `ci.yml` does not run `cyrius audit`. It is a
+  regression against what 1.2.0 recorded as shipped, which is why it is fixed here
+  rather than deferred.
+
+
 ## [1.2.0] — 2026-09-01 — the f32 arithmetic tier that 1.1.0 said could not be written
 
 Adds `ganita_f32_add` / `_sub` / `_mul` / `_div` in **native single precision**, and

@@ -140,7 +140,7 @@ fn unicode_to_title(cp) {
     return cp;
 }
 
-# ── Full fold (26 hex chars per record) ────────────────────────────────
+# ────────
 # Records are <src u24, 6><count u8, 2><cp1 u24, 6><cp2 u24, 6><cp3 u24, 6>.
 # `count` is 1..3; cp2 / cp3 are 0 when count < 3 / 2.
 #

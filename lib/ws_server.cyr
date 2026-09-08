@@ -134,9 +134,9 @@ fn ws_server_recv_frame(ws, payload_buf, max, opcode_out): i64 {
 
     # First two bytes: FIN/opcode + MASK/length
     var hdr[2];
-    var r1 = sock_recv(fd, &hdr, 2);
-    if (is_err_result(r1) == 1) { return 0 - 1; }
-    if (payload(r1) < 2) { return 0 - 1; }
+    var r1_tag, r1 = sock_recv(fd, &hdr, 2);
+    if (is_err_result(r1_tag) == 1) { return 0 - 1; }
+    if (r1 < 2) { return 0 - 1; }
 
     var op = load8(&hdr) & 0x0F;
     store64(opcode_out, op);
@@ -148,15 +148,15 @@ fn ws_server_recv_frame(ws, payload_buf, max, opcode_out): i64 {
     # Extended length
     if (len == 126) {
         var ext[2];
-        var r2 = sock_recv(fd, &ext, 2);
-        if (is_err_result(r2) == 1) { return 0 - 1; }
-        if (payload(r2) < 2) { return 0 - 1; }
+        var r2_tag, r2 = sock_recv(fd, &ext, 2);
+        if (is_err_result(r2_tag) == 1) { return 0 - 1; }
+        if (r2 < 2) { return 0 - 1; }
         len = (load8(&ext) << 8) | load8(&ext + 1);
     } elif (len == 127) {
         var ext[8];
-        var r3 = sock_recv(fd, &ext, 8);
-        if (is_err_result(r3) == 1) { return 0 - 1; }
-        if (payload(r3) < 8) { return 0 - 1; }
+        var r3_tag, r3 = sock_recv(fd, &ext, 8);
+        if (is_err_result(r3_tag) == 1) { return 0 - 1; }
+        if (r3 < 8) { return 0 - 1; }
         len = 0;
         var ei = 0;
         while (ei < 8) {
@@ -170,17 +170,17 @@ fn ws_server_recv_frame(ws, payload_buf, max, opcode_out): i64 {
     # Mask key (4 bytes) — required for client→server frames per RFC 6455
     var mask[4];
     if (has_mask == 1) {
-        var rm = sock_recv(fd, &mask, 4);
-        if (is_err_result(rm) == 1) { return 0 - 1; }
-        if (payload(rm) < 4) { return 0 - 1; }
+        var rm_tag, rm = sock_recv(fd, &mask, 4);
+        if (is_err_result(rm_tag) == 1) { return 0 - 1; }
+        if (rm < 4) { return 0 - 1; }
     }
 
     # Payload — read in a loop because TCP may fragment
     var got = 0;
     while (got < len) {
-        var rp = sock_recv(fd, payload_buf + got, len - got);
-        if (is_err_result(rp) == 1) { return 0 - 1; }
-        var pn = payload(rp);
+        var rp_tag, rp = sock_recv(fd, payload_buf + got, len - got);
+        if (is_err_result(rp_tag) == 1) { return 0 - 1; }
+        var pn = rp;
         if (pn <= 0) { return 0 - 1; }
         got = got + pn;
     }

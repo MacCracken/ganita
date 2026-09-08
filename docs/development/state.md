@@ -2,9 +2,19 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-09-01.
+> Last refreshed: 2026-09-07.
 
 ## Version
+
+**1.2.1** — toolchain. Cyrius pin 6.5.36 → **6.6.0**, `lib/` re-vendored to an
+exact match (108 → **109** files, `hashseed.cyr` is new), `dist/` regenerated at
+1.2.1. **No `src/` change, no behavioural change** — the same 243 assertions,
+green on 6.6.0. One repair the bump forced: 6.6.0 applies the docs check across
+the whole audit scope (`src` **and** `tests`), so `cyrius audit` went from green
+to `15 undocumented public fns`, all test-harness helpers. The rule is
+positional — the doc comment must sit on the line *immediately* above `fn`, so a
+section banner documents only the first fn beneath it. All 15 now carry their
+own line and audit exits 0 again.
 
 **1.2.0** — the f32 arithmetic tier (`ganita_f32_add` / `_sub` / `_mul` / `_div`) in
 native single precision, `ganita_f32_lerp` de-widened onto it, and every public fn
@@ -47,13 +57,21 @@ initial carve out of cyrius stdlib (2026-06-10, cyrius v6.1.26).
 
 ## Toolchain
 
-- **Cyrius pin**: `6.5.36` (`cyrius.cyml [package].cyrius`, since 1.2.0).
-  `cyrius version` reports `manifest-pin: 6.5.36` with no drift line, and the
-  `./lib/ shadows version-pinned ...` warning 1.1.4 shipped with is gone —
-  `cyrius lib sync --full` re-copied all 108 files from the 6.5.36 snapshot.
-- **`lib/` matches the pin exactly**: 108 files, 0 differ. Verify by comparing
-  the trees, not by trusting `cyrius lib sync --full`'s exit code.
-- ✅ **The 1.1.4 CI blocker is retired.** 6.5.36 is published, so the install step
+- **Cyrius pin**: `6.6.0` (`cyrius.cyml [package].cyrius`, since 1.2.1).
+  `cyrius version` reports `manifest-pin: 6.6.0` with no drift line, and no
+  `./lib/ shadows version-pinned ...` warning — `cyrius lib sync --full`
+  re-copied all 109 files from the 6.6.0 snapshot.
+- **`lib/` matches the pin exactly**: 109 files, 0 differ. Verify by comparing
+  the trees against `~/.cyrius/versions/<pin>/lib`, not by trusting
+  `cyrius lib sync --full`'s exit code.
+- ⚠ **6.6.0 audits docs in `tests/` too.** The docs check used to reach only
+  `src/`; at 6.6.0 it covers the whole audit scope, which the tool prints as
+  `scope: src tests`. The pin bump alone therefore turns a green `cyrius audit`
+  red on any repo whose harness helpers are undocumented — 15 of them here. The
+  rule is **positional**: the comment must be the line immediately above `fn`, so
+  a `# --- section banner ---` documents only the first fn under it. `ci.yml`
+  does not run `cyrius audit`, so this surfaces locally, not in CI.
+- ✅ **The 1.1.4 CI blocker is retired.** The pin is published, so the install step
   resolves. The paragraph below is kept as the record of what 1.1.4 shipped into.
 - ⛔ **(1.1.4, historical) 6.5.29 was not published as a GitHub release.** CI hands the pin to
   `scripts/install.sh`, which downloads
@@ -61,9 +79,10 @@ initial carve out of cyrius stdlib (2026-06-10, cyrius v6.1.26).
   the install step until the release ships**. 1.1.4 was verified against the
   locally installed 6.5.29. Re-verify against the tarball when it lands — a
   local install and a release can differ, which is exactly what bit bayan 1.4.2.
-- **`lib/` grew 98 → 108 files** at 1.1.1's 6.5.28 bump: `unicode/` (7 files)
-  plus the macOS `async`/`thread` variants. None is in `[deps].stdlib`; they
-  ride along because `--full` vendors the whole snapshot.
+- **`lib/` grew 98 → 108 files** at 1.1.1's 6.5.28 bump (`unicode/`, 7 files,
+  plus the macOS `async`/`thread` variants) and **108 → 109** at 1.2.1's 6.6.0
+  bump (`hashseed.cyr`). None is in `[deps].stdlib`; they ride along because
+  `--full` vendors the whole snapshot.
 - ⚠ **Verify against the RELEASE TARBALL, not `~/.cyrius`.** A machine that also
   develops cyrius can hold an in-flight build reporting the same version string;
   artifacts generated with it are not reproducible on CI. Install the release
@@ -81,31 +100,32 @@ initial carve out of cyrius stdlib (2026-06-10, cyrius v6.1.26).
 ## Source
 
 Linear-algebra & advanced-math modules carved from cyrius stdlib, public
-functions prefixed `ganita_`. Regenerated from the tree 2026-08-19:
+functions prefixed `ganita_`. Regenerated from the tree 2026-09-07:
 
 | Module | Lines | Public fns | Canonical prefix |
 |--------|-------|-----------|------------------|
 | `src/linalg.cyr`        | 957 | 26 | `ganita_mat_*` (extends matrix) |
 | `src/matrix.cyr`        | 197 | 14 | `ganita_mat_*` |
-| `src/math_advanced.cyr` | 174 | 13 | `ganita_f64_*` / `ganita_fibonacci` / `ganita_binomial` |
-| `src/math_f32.cyr`      | 143 | 23 | `ganita_f32_*` |
+| `src/math_advanced.cyr` | 226 | 13 | `ganita_f64_*` / `ganita_fibonacci` / `ganita_binomial` |
+| `src/math_f32.cyr`      | 200 | 27 | `ganita_f32_*` |
 
 - `src/_compat.cyr` — 53 back-compat aliases (legacy names → `ganita_*`).
   Single-pass order: matrix → linalg → math_advanced → math_f32 → `_compat`
   last, since its aliases reference every `ganita_*` symbol.
-- `dist/ganita.cyr` — regenerated via `cyrius distlib` at 1.2.0 on released
-  6.5.28. This is the artifact folded into
-  `cyrius/lib/ganita.cyr`.
-- `dist/ganita.deps` — 7 stdlib leaves: `syscalls string alloc fmt vec str math`.
-  Verified sufficient by `scripts/consumer-check.sh` (`str` is over-declared but
-  harmless).
+- `dist/ganita.cyr` — 1,690 lines, regenerated via `cyrius distlib` at 1.2.1 on
+  6.6.0. This is the artifact folded into `cyrius/lib/ganita.cyr`. Regeneration
+  is idempotent; the only 1.2.0 → 1.2.1 delta is the version header, since `src/`
+  did not change.
+- `dist/ganita.deps` — 10 stdlib leaves: `syscalls string alloc fmt vec str math
+  io assert bench`. Verified sufficient by `scripts/consumer-check.sh` (`str` is
+  over-declared but harmless).
 
 ## Tests
 
 - `tests/ganita.tcyr` — matrix dims + identity + **CWE-190 dimension guard** +
   binomial/fibonacci + `f64_tanh` saturation + alias parity + **the full f32
-  tier** (1.1.2) + **the full linalg surface** (1.1.3). **227 assertions,
-  green** on released 6.5.28.
+  tier** (1.1.2) + **the full linalg surface** (1.1.3). **243 assertions,
+  green** on 6.6.0.
 
   The linalg block asserts **properties**, not transcribed outputs — `A·A⁻¹ = I`,
   `Qᵀ·Q = I`, `L·Lᵀ = A`, `U·Σ·Vᵀ = A`, `Σλ = trace`, `Πλ = det`, `Πσ = |det|`,
@@ -137,14 +157,14 @@ functions prefixed `ganita_`. Regenerated from the tree 2026-08-19:
 
 ### Coverage
 
-`cyrius coverage` — **105/131 fns (80%)**, 7/7 files referenced (22/131 and 4/7
+`cyrius coverage` — **109/135 fns (80%)**, 7/7 files referenced (22/131 and 4/7
 before 1.1.2). A floor, not a correctness proof, but the two carved tiers are
 now fully exercised in-repo:
 
 | Module | Referenced |
 |---|---|
 | `linalg.cyr`        | **26/26** |
-| `math_f32.cyr`      | **23/23** |
+| `math_f32.cyr`      | **27/27** |
 | `matrix.cyr`        | 10/14 |
 | `_compat.cyr`       | 40/53 |
 | `math_advanced.cyr` | 4/13 |
@@ -179,29 +199,39 @@ tree diff · consumer-check.
 
 ## Known gaps
 
-1. **`tests/ganita.fcyr` and `tests/ganita.bcyr` are `cyrius init` scaffolds** —
-   the fuzz harness does no fuzzing, the bench measures a no-op. Both report
-   PASS, so the two CI gates that run them are vacuous until the harnesses are
-   real.
-2. **`fmt_float` drops the carry when a fraction rounds up to 1.0** —
+1. **`tests/ganita.fcyr` is still a `cyrius init` scaffold** — the fuzz harness
+   does no fuzzing. It reports PASS, so the CI gate that runs it is vacuous until
+   the harness is real. (`tests/ganita.bcyr` grew real f32 benchmarks at 1.2.0;
+   only its `bench_noop` floor is scaffold.)
+2. **`cyrius bench` links with three undefined symbols.**
+   `warning: undefined function 'ganita_f64_pow' / 'ganita_f64_atan2' /
+   'ganita_f64_hypot'` on every run. `tests/ganita.bcyr` carries its own include
+   list and includes `src/math_f32.cyr` **without** `src/math_advanced.cyr`, but
+   `math_f32`'s `pow`/`atan2`/`hypot`/`cbrt` forward to the `ganita_f64_*` fns
+   that live there. Harmless today only because no benchmark calls those four —
+   the first one that does links against nothing. Pre-dates 1.2.1 (unrelated to
+   the 6.6.0 bump); the fix is one `include` line, deliberately not bundled into
+   a toolchain release.
+3. **`fmt_float` drops the carry when a fraction rounds up to 1.0** —
    `fmt_float(2.9999999, 6)` prints `2.1000000` (seven fraction digits). Display
    only, but near-integer results are routine after a decomposition, so correct
    answers read as wrong ones. cyrius stdlib, vendored. Filed:
    [2026-08-19](issues/2026-08-19-fmt-float-missing-carry-on-round-up.md).
    ganita's tests assert numerically, never on printed text, so they are
    unaffected.
-3. **`math_advanced.cyr` is 4/13** — the remaining in-repo coverage gap now that
+4. **`math_advanced.cyr` is 4/13** — the remaining in-repo coverage gap now that
    the f32 and linalg tiers are done. Its deep coverage lives upstream in
    cyrius's `math` `.tcyr` suite.
-4. **`lib/ganita.cyr` is ganita's own fold vendored back into ganita's own
+5. **`lib/ganita.cyr` is ganita's own fold vendored back into ganita's own
    `lib/`** — new at this pin, because `lib sync --full` copies the whole
    snapshot and cyrius now carries the ganita fold. Nothing in `src/`,
    `tests/`, or `cyrius.cyml` includes it, so it is inert, but it defines the
    same symbols as `src/`: a last-definition-wins hazard waiting for someone to
    include it. Deleting it is not durable (`--full` re-adds it on every bump);
    the durable fix is upstream, a `lib sync` self-exclusion. bayan carries the
-   identical gap.
-5. **`README.md` is stale** — still describes the pre-1.1.0 surface.
+   identical gap. At the 6.6.0 pin it holds ganita **1.2.0** — one release behind
+   `src/`, so it is also stale, not merely redundant.
+6. **`README.md` is stale** — still describes the pre-1.1.0 surface.
 
 ## Dependencies
 
@@ -214,11 +244,10 @@ No sibling `[deps.NAME]` entries, so `cyrius deps` writes no `cyrius.lock`.
 
 ## Consumers
 
-- **cyrius** — folds `dist/ganita.cyr` → `lib/ganita.cyr`. The 6.5.28 snapshot
-  carries ganita **1.1.0**; 1.1.1 (toolchain/CI), 1.1.2 (f32 tests + the
-  `cbrt(0)` fix), 1.1.3 (linalg tests) and 1.1.4 (the `f64_pow` domain fix) are
-  not folded yet. **cyrius ships the `f64_pow` NaN defect under that plain name**
-  via the fold's `_compat` alias, so the refold is worth scheduling.
+- **cyrius** — folds `dist/ganita.cyr` → `lib/ganita.cyr`. The 6.6.0 snapshot
+  carries ganita **1.2.0**, so the `f64_pow` domain fix (1.1.4) and the native f32
+  arithmetic tier (1.2.0) are both in. 1.2.1 changes nothing but the version
+  header, so the refold is cosmetic and can ride the next real release.
 - **ranga** (image-processing port) — drove the 1.1.0 f32 tier.
 - Downstream repos using matrix/linalg/advanced-math migrate to `ganita_*` on
   re-pin (aliases bridge the window).
@@ -226,5 +255,5 @@ No sibling `[deps.NAME]` entries, so `cyrius deps` writes no `cyrius.lock`.
 ## Next
 
 See [`roadmap.md`](roadmap.md). bayan (data formats) is the sibling carve, at
-**1.4.2** on the same 6.5.28 pin; Phase E (the stdlib data/math carve) closes
+**1.5.5** on the same **6.6.0** pin; Phase E (the stdlib data/math carve) closes
 with ganita.
