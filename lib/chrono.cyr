@@ -12,15 +12,25 @@ var CLOCK_REALTIME = 0;
 var CLOCK_MONOTONIC = 1;
 
 # Get current time in nanoseconds (monotonic clock).
-# v6.2.6: agnos binds the monotonic clock to uptime_ms (#40, since kernel
-# 1.43.x) — ms since boot, scaled to ns. The low 6 digits are zero at the
-# 100 Hz / 10 ms tick resolution (same sub-tick-zero shape as the wall-clock
-# clock_epoch_ns note). (Was a fixed-zero stub through v6.2.5, predicated on
-# the obsolete "no monotonic syscall in the frozen 0-33 surface" assumption —
-# 228=clock_gettime is out of range, but #40 always was the agnos path.)
+#
+# ⛔ v6.6.1 — AGNOS NOW READS #95 (uptime_us, rdtsc), NOT #40 (uptime_ms, timer_ticks).
+# A foreground `run` program on AGNOS executes with IF CLEARED — only /bin/agnsh gets IF=1 —
+# so the 100 Hz timer ISR never fires, `timer_ticks` never advances, and #40 is FROZEN for
+# that program's entire run. Anything timing itself with it measured exactly zero, forever,
+# with no error. #95 is read via rdtsc and needs no interrupts, so it is the only correct
+# monotonic source on that path.
+#
+# ⚠ The trap was already documented TWO FILES AWAY, above the wrapper this function did not
+# call (`lib/syscalls_x86_64_agnos.cyr`, sys_uptime_us): "*#95 is the only correct clock
+# there*". AGNOS's own ABI note records that it cost two iron burns on the 3D arc's rung-10
+# gate before it was understood. The general-purpose clock still walked into it for four
+# minors. Filed 2026-09-07 from sakshi's 2.5.0 P(-1) audit.
+#
+# v6.2.6 bound it to #40 and that was correct WHEN WRITTEN — #95 did not exist yet.
+# Resolution improves as a side effect: µs rather than the 10 ms tick.
 fn clock_now_ns(): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
-    return sys_uptime_ms() * 1000000;
+    return sys_uptime_us() * 1000;
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
     var ts[16];
