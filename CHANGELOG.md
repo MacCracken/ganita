@@ -13,7 +13,6 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   build, tests, and any bench/fuzz/distlib target, including every
   `[lib.<profile>]` bundle.
 
-
 ## [1.2.4] — 2026-09-08 — the P(-1) backlog, repaired
 
 Closes four of the five filings the 1.2.3 sweep opened, and five of six items in

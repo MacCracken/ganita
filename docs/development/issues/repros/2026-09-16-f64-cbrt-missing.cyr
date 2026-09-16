@@ -1,0 +1,161 @@
+# ganita has no f64 cube root, and the pow-built stand-in every consumer has to
+# write instead is neither exact on perfect cubes nor correctly rounded.
+#
+# Filed with docs/development/issues/2026-09-16-f64-cbrt-missing.md.
+#
+# Build and run from the ganita repo root:
+#   cyrius build docs/development/issues/repros/2026-09-16-f64-cbrt-missing.cyr /tmp/cbrt
+#   /tmp/cbrt; echo "exit=$?"      # -> 2 today (perfect cubes, rounding), 0 once fixed
+#
+# From the repo root this builds under ganita's 6.6.2 pin. The same source built
+# under cyrius 6.6.4 prints identical counts and exits 2 as well.
+#
+# The exit code is the number of FAILING GROUPS for `candidate_cbrt`, not the
+# number of wrong answers: the perfect-cube group alone has well over 255 of
+# those, which an 8-bit exit status cannot carry. The counts are printed.
+#
+# When ganita_f64_cbrt lands, replace the body of `candidate_cbrt` with
+#     return ganita_f64_cbrt(x);
+# and expect exit 0. `naive_cbrt` is reported for the record only — it is what
+# a line-for-line port of `libm::cbrt(x)` to `f64_pow(x, 1.0/3.0)` produces.
+#
+# Includes src/ directly rather than lib/ganita.cyr so it exercises the working
+# source. math_advanced has no matrix/linalg dependency.
+
+include "lib/syscalls.cyr"
+include "lib/string.cyr"
+include "lib/alloc.cyr"
+include "lib/fmt.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/math.cyr"
+
+include "src/math_advanced.cyr"
+
+var SIGN = 0x8000000000000000;
+
+# Integer -> f64 bits through an `: i64` return, so comparisons below are
+# bit-pattern comparisons and never mix f64 and integer operand types.
+fn d(n): i64 { return f64_from(n); }
+
+fn third(): i64 { return f64_div(f64_from(1), f64_from(3)); }
+
+# What a careful consumer writes today: the f64 twin of ganita_f32_cbrt —
+# zero / NaN / inf passed through, sign split so pow never sees a negative base.
+fn guarded_cbrt(x): i64 {
+    if ((x & 0x7FFFFFFFFFFFFFFF) == 0) { return x; }
+    if (_f64_is_nan_pat(x) == 1) { return x; }
+    if (_f64_is_inf(x) == 1) { return x; }
+    if (((x >> 63) & 1) == 1) {
+        return ganita_f64_pow(x & 0x7FFFFFFFFFFFFFFF, third()) | SIGN;
+    }
+    return ganita_f64_pow(x, third());
+}
+
+# What a line-for-line port writes: cbrt(x) -> pow(x, 1/3).
+fn naive_cbrt(x): i64 { return ganita_f64_pow(x, third()); }
+
+# ⚠ Swap point: `return ganita_f64_cbrt(x);` once it exists.
+fn candidate_cbrt(x): i64 { return guarded_cbrt(x); }
+
+fn cb(mode, x): i64 {
+    if (mode == 0) { return candidate_cbrt(x); }
+    return naive_cbrt(x);
+}
+
+# Group A — IEEE special values, sign of zero and infinity preserved.
+fn group_special(mode): i64 {
+    var bad = 0;
+    if (cb(mode, 0) != 0) { bad = bad + 1; }
+    if (cb(mode, SIGN) != SIGN) { bad = bad + 1; }
+    if (cb(mode, 0x7FF0000000000000) != 0x7FF0000000000000) { bad = bad + 1; }
+    if (cb(mode, 0xFFF0000000000000) != 0xFFF0000000000000) { bad = bad + 1; }
+    if (_f64_is_nan_pat(cb(mode, 0x7FF8000000000000)) != 1) { bad = bad + 1; }
+    return bad;
+}
+
+# Group B — perfect cubes are exact: cbrt(+-k^3) = +-k for k = 1..1000.
+# Every k^3 here is below 2^53, so both the input and the answer are exact f64s
+# and there is exactly one right bit pattern.
+fn group_cubes(mode): i64 {
+    var bad = 0;
+    var k = 1;
+    while (k <= 1000) {
+        var x = d(k * k * k);
+        var want = d(k);
+        if (cb(mode, x) != want) { bad = bad + 1; }
+        if (cb(mode, x | SIGN) != (want | SIGN)) { bad = bad + 1; }
+        k = k + 1;
+    }
+    return bad;
+}
+
+# Group C — correctly rounded results, (input bits, expected bits). Expected
+# values are the round-to-nearest f64 of the exact cube root of the exact binary
+# input, computed at 120 significant digits. Rust's libm::cbrt (musl) returns
+# every one of them. Rows marked (tanmatra) are nucleon counts it takes A^(1/3)
+# of; 286 is the worst case (-2 ulp) of pow's form over n = 1..300.
+fn rounding_table(): i64 {
+    var t = alloc(12 * 16);
+    store64(t + 0,   0x4000000000000000); store64(t + 8,   0x3FF428A2F98D728B);  # 2
+    store64(t + 16,  0x4008000000000000); store64(t + 24,  0x3FF7137449123EF6);  # 3
+    store64(t + 32,  0x4024000000000000); store64(t + 40,  0x40013C484138704F);  # 10
+    store64(t + 48,  0x404C000000000000); store64(t + 56,  0x400E9B5DBA58189E);  # 56   (tanmatra: Fe-56)
+    store64(t + 64,  0x406A000000000000); store64(t + 72,  0x4017B3312382B4B5);  # 208  (tanmatra: Pb-208)
+    store64(t + 80,  0x406DC00000000000); store64(t + 88,  0x4018C9E2DA25E5E4);  # 238  (tanmatra: U-238)
+    store64(t + 96,  0x4071E00000000000); store64(t + 104, 0x401A5AA8345EF361);  # 286
+    store64(t + 112, 0x3FE0000000000000); store64(t + 120, 0x3FE965FEA53D6E3D);  # 0.5
+    store64(t + 128, 0x7E37E43C8800759C); store64(t + 136, 0x54B249AD2594C37D);  # 1e300 (x*x*x overflows a naive Newton step)
+    store64(t + 144, 0x01A56E1FC2F8F359); store64(t + 152, 0x2B2BFF2EE48E0530);  # 1e-300
+    store64(t + 160, 0x0010000000000000); store64(t + 168, 0x2AA428A2F98D728B);  # DBL_MIN, 2^-1022
+    store64(t + 176, 0x0000000000000001); store64(t + 184, 0x2990000000000000);  # 2^-1074 (min subnormal) -> 2^-358 exactly
+    return t;
+}
+
+fn group_rounding(mode, t): i64 {
+    var bad = 0;
+    var i = 0;
+    while (i < 12) {
+        var x = load64(t + i * 16);
+        var want = load64(t + i * 16 + 8);
+        if (cb(mode, x) != want) { bad = bad + 1; }
+        i = i + 1;
+    }
+    return bad;
+}
+
+fn report(label, n, total): i64 {
+    syscall(1, 1, label, strlen(label));
+    fmt_int(n);
+    syscall(1, 1, " / ", 3);
+    fmt_int(total);
+    syscall(1, 1, " wrong\n", 7);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    var t = rounding_table();
+
+    var a0 = group_special(0);
+    var b0 = group_cubes(0);
+    var c0 = group_rounding(0, t);
+    println("candidate_cbrt (today: guarded pow workaround)");
+    report("  A special values   : ", a0, 5);
+    report("  B perfect cubes    : ", b0, 2000);
+    report("  C correct rounding : ", c0, 12);
+
+    println("naive_cbrt = pow(x, 1/3), for the record");
+    report("  A special values   : ", group_special(1), 5);
+    report("  B perfect cubes    : ", group_cubes(1), 2000);
+    report("  C correct rounding : ", group_rounding(1, t), 12);
+
+    var failing = 0;
+    if (a0 != 0) { failing = failing + 1; }
+    if (b0 != 0) { failing = failing + 1; }
+    if (c0 != 0) { failing = failing + 1; }
+    return failing;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);
