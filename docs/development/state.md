@@ -2,9 +2,29 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-09-08 (the P(-1) backlog, repaired).
+> Last refreshed: 2026-09-16 (1.2.6 — a correctly rounded cube root, the backlog
+> closed, toolchain 6.6.4).
 
 ## Version
+
+**1.2.6** — **a correctly rounded cube root, and the backlog closed.** Both open
+filings closed, no public signature changed. **`ganita_f64_cbrt`** (filed by
+tanmatra for its Rust → Cyrius port) is correctly rounded for every f64, subnormals
+included. The exponent is split exactly, a line plus two Halley steps gets within
+1.17 ulp, and the rounding is decided by an exact 26-bit-limb comparison of
+`(2Y±1)³` against the input — so the approximation decides only the speed. The
+filing's repro went 2 → 0 failing groups, and an exact oracle agreed on 5.8M inputs.
+**`ganita_f32_cbrt`** now widens onto it and is correctly rounded for every f32, checked
+exhaustively over all 2^31 positive inputs; the pow form it replaced was one ulp out on
+exactly 13 of them. The **performance backlog**: `mat_inv` takes one scratch column
+and substitutes from the pivot row (**1.18×**, 8n² fewer bytes), `qr` transposes Q
+in place (116,176 → 960 bytes at 120²), `pseudo_inv` forms no transposes (−27%
+bytes) — all bit-identical to 1.2.5 — and `GANITA_MAT_MAX_ELEMS` is **settled as a
+policy limit** by [ADR 0002](../adr/0002-element-cap-is-policy.md). Toolchain
+**6.6.2 → 6.6.4**. 491 assertions (was 433).
+
+**1.2.5** — toolchain. Cyrius pin 6.6.0 → **6.6.2**, `lib/` re-vendored (109 → **110**
+files, `boxed.cyr` is new). No `src/` change, no behavioural change.
 
 **1.2.4** — **the P(-1) backlog, repaired.** Four of the five 1.2.3 filings
 closed, plus five of six items in the fifth. **`LINALG_EPS` is a RELATIVE factor**
@@ -100,13 +120,21 @@ initial carve out of cyrius stdlib (2026-06-10, cyrius v6.1.26).
 
 ## Toolchain
 
-- **Cyrius pin**: `6.6.0` (`cyrius.cyml [package].cyrius`, since 1.2.1).
-  `cyrius version` reports `manifest-pin: 6.6.0` with no drift line, and no
+- **Cyrius pin**: `6.6.4` (`cyrius.cyml [package].cyrius`, since 1.2.6).
+  `cyrius version` reports `manifest-pin: 6.6.4` with no drift line, and no
   `./lib/ shadows version-pinned ...` warning — `cyrius lib sync --full`
-  re-copied all 109 files from the 6.6.0 snapshot.
-- **`lib/` matches the pin exactly**: 109 files, 0 differ. Verify by comparing
+  re-copied all 110 files from the 6.6.4 snapshot (22 changed since 6.6.2).
+- **`lib/` matches the pin exactly**: 110 files, 0 differ. Verify by comparing
   the trees against `~/.cyrius/versions/<pin>/lib`, not by trusting
   `cyrius lib sync --full`'s exit code.
+- **Gated against the 6.6.4 release tarball** (sha256 `c2a540c9…2fab`, matching the
+  published `.sha256`), installed into an isolated `CYRIUS_HOME` as described below:
+  the whole gate is green there, as it is on the local install. The tarball's `lib/`
+  is identical to the local snapshot. Of the binaries the two share, only the
+  bootstrap seed `cybs` differs, and nothing here uses it.
+- **The `f64_exp(±inf) = NaN` defect ganita filed was fixed upstream at 6.6.1.**
+  ganita's guards in `sinh`/`cosh` and the f32 `exp`/`exp2` stay: they cost a
+  compare, and `dist/ganita.cyr` is also consumed under older stdlib pins.
 - ⚠ **6.6.0 audits docs in `tests/` too.** The docs check used to reach only
   `src/`; at 6.6.0 it covers the whole audit scope, which the tool prints as
   `scope: src tests`. The pin bump alone therefore turns a green `cyrius audit`
@@ -123,8 +151,8 @@ initial carve out of cyrius stdlib (2026-06-10, cyrius v6.1.26).
   locally installed 6.5.29. Re-verify against the tarball when it lands — a
   local install and a release can differ, which is exactly what bit bayan 1.4.2.
 - **`lib/` grew 98 → 108 files** at 1.1.1's 6.5.28 bump (`unicode/`, 7 files,
-  plus the macOS `async`/`thread` variants) and **108 → 109** at 1.2.1's 6.6.0
-  bump (`hashseed.cyr`). None is in `[deps].stdlib`; they ride along because
+  plus the macOS `async`/`thread` variants), **108 → 109** at 1.2.1's 6.6.0
+  bump (`hashseed.cyr`) and **109 → 110** at 1.2.5's 6.6.2 bump (`boxed.cyr`). None is in `[deps].stdlib`; they ride along because
   `--full` vendors the whole snapshot.
 - ⚠ **Verify against the RELEASE TARBALL, not `~/.cyrius`.** A machine that also
   develops cyrius can hold an in-flight build reporting the same version string;
@@ -143,7 +171,7 @@ initial carve out of cyrius stdlib (2026-06-10, cyrius v6.1.26).
 ## Source
 
 Linear-algebra & advanced-math modules carved from cyrius stdlib, public
-functions prefixed `ganita_`. Regenerated from the tree 2026-09-07:
+functions prefixed `ganita_`. Regenerated from the tree 2026-09-16:
 
 **Allocation-failure contract (1.2.2).** Every internal `ganita_mat_new` / `alloc`
 is checked, and each function reports in its own return vocabulary: **null** for
@@ -159,15 +187,20 @@ operands whose product is not.
 
 | Module | Lines | Public fns | Canonical prefix |
 |--------|-------|-----------|------------------|
-| `src/linalg.cyr`        | 1404 | 26 | `ganita_mat_*` (extends matrix) |
-| `src/matrix.cyr`        | 268 | 14 | `ganita_mat_*` |
-| `src/math_advanced.cyr` | 281 | 13 | `ganita_f64_*` / `ganita_fibonacci` / `ganita_binomial` |
-| `src/math_f32.cyr`      | 239 | 27 | `ganita_f32_*` |
+| `src/linalg.cyr`        | 1656 | 26 | `ganita_mat_*` (extends matrix) |
+| `src/matrix.cyr`        | 331 | 14 | `ganita_mat_*` |
+| `src/math_advanced.cyr` | 667 | 14 | `ganita_f64_*` / `ganita_fibonacci` / `ganita_binomial` |
+| `src/math_f32.cyr`      | 346 | 31 | `ganita_f32_*` |
 
-- `src/_compat.cyr` — 53 back-compat aliases (legacy names → `ganita_*`).
+- `src/_compat.cyr` — 54 back-compat aliases (legacy names → `ganita_*`, plus
+  `f64_cbrt`, added with its function at 1.2.6 as tanmatra's filing asked).
+- **One open-coded 2-D walk.** `_ganita_mat_mul_into` (matrix.cyr) is the only loop
+  that strides rows and columns by raw pointer instead of indexing through
+  `ganita_mat_get`/`_set` (flat whole-matrix loops aside). `ganita_mat_mul` and
+  `ganita_mat_pseudo_inv`, in its transposed form, both go through it.
   Single-pass order: matrix → linalg → math_advanced → math_f32 → `_compat`
   last, since its aliases reference every `ganita_*` symbol.
-- `dist/ganita.cyr` — regenerated via `cyrius distlib` at 1.2.3 on 6.6.0. This is the artifact folded into `cyrius/lib/ganita.cyr`. Regeneration
+- `dist/ganita.cyr` — regenerated via `cyrius distlib` at 1.2.6 on 6.6.4 (3113 lines). This is the artifact folded into `cyrius/lib/ganita.cyr`. Regeneration
   is idempotent.
 - `dist/ganita.deps` — 10 stdlib leaves: `syscalls string alloc fmt vec str math
   io assert bench`. Verified sufficient by `scripts/consumer-check.sh` (`str` is
@@ -179,8 +212,18 @@ operands whose product is not.
   binomial/fibonacci + `f64_tanh` saturation + alias parity + **the full f32
   tier** (1.1.2) + **the full linalg surface** (1.1.3) + **the least-squares
   regression and the allocation-failure contract** (1.2.2) + **the shape/range
-  preconditions, NaN-fails-closed, and the math domain fixes** (1.2.3).
-  **322 assertions, green** on 6.6.0.
+  preconditions, NaN-fails-closed, and the math domain fixes** (1.2.3) + **relative
+  tolerances, one-sided Jacobi SVD, transcendental accuracy, f32 NaN/inf and
+  comparators** (1.2.4) + **the correctly rounded cube root, the element-cap policy
+  pins, and the backlog's bit-identity and bytes-per-call checks** (1.2.6).
+  **491 assertions, green** on 6.6.4.
+
+  **The 1.2.6 additions are mutation-verified**: 15 mutations across the f64 and f32
+  cube roots, `inv`, `qr`, `pseudo_inv` and the multiply kernel, and 14 caught. The
+  survivor is equivalent by design: forcing the bisection fallback gives the same
+  answers. The cube root's deep verification lives outside the suite and is recorded
+  in the CHANGELOG: 5.8M inputs against an exact integer oracle, and the f32 tier
+  exhaustively.
 
   The linalg block asserts **properties**, not transcribed outputs — `A·A⁻¹ = I`,
   `Qᵀ·Q = I`, `L·Lᵀ = A`, `U·Σ·Vᵀ = A`, `Σλ = trace`, `Πλ = det`, `Πσ = |det|`,
@@ -232,28 +275,29 @@ during the 1.2.3 sweep: appending **one comment line** naming `ganita_mat_print(
 
 Two figures are now tracked, and CI gates on **both**:
 
-| | 1.2.2 | 1.2.3 | gate |
-|---|---|---|---|
-| `cyrius coverage` (substring) | 109/135 (80 %) | **131/139 (94 %)** | `--min 94` |
-| `scripts/coverage-honest.sh` (word boundary, comments stripped) | 72/135 (**53 %**) | **87/153 (56 %)** | `56` |
+| | 1.2.2 | 1.2.3 | 1.2.6 | gate |
+|---|---|---|---|---|
+| `cyrius coverage` (substring) | 109/135 (80 %) | 131/139 (94 %) | **133/141 (94 %)** | `--min 94` |
+| `scripts/coverage-honest.sh` (word boundary, comments stripped) | 72/135 (**53 %**) | 87/153 (56 %) | **92/158 (58 %)** | `58` |
 
 The honest count is the one to plan against. The tool's is kept as a ratchet
 because it sees things a regex does not — but it is not the only gate, because it
 is a number a comment can move.
 
-Per module, honest count at 1.2.3 (the denominator now includes the private
-helpers added by the sweep):
+Per module, honest count at 1.2.6 (the denominator includes private helpers):
 
 | Module | Referenced |
 |---|---|
 | `math_f32.cyr`      | 31/35 |
 | `linalg.cyr`        | 26/31 |
-| `matrix.cyr`        | 12/15 |
-| `math_advanced.cyr` | 11/17 |
-| `_compat.cyr`       | **5/53** |
+| `matrix.cyr`        | 13/16 |
+| `math_advanced.cyr` | 14/20 |
+| `_compat.cyr`       | **6/54** |
 
-`math_advanced.cyr` went 5/15 → 11/17 at 1.2.4: the accuracy repairs came with
-assertions, which is where most of that came from.
+`math_advanced.cyr` went 5/15 → 11/17 at 1.2.4 and → 14/20 at 1.2.6: the accuracy
+repairs and the cube root came with assertions. Its two public functions still
+unreferenced by name are `ganita_f64_asin` and `ganita_f64_atan2` (the latter is
+exercised only through `ganita_f32_atan2`).
 
 **`_compat.cyr` was published as 40/53 and is really 5/53.** Anyone planning the
 alias removal against "75 % exercised" was planning against nothing. All 53 were
@@ -287,9 +331,9 @@ sweep. Three properties worth remembering when editing it:
 
 Gates (20 steps as of 1.2.3): pin-drift · version consistency · `lib/` vs
 snapshot · format (src, tests **and examples**) · lint · vet · build with 0
-warnings · smoke exits 42 · test · fuzz · bench · `coverage --min 85` ·
-**`coverage-honest.sh 54`** · `distlib --all --check` · regeneration leaves no
-tree diff · consumer-check · **examples build and run**.
+warnings · smoke exits 42 · test · fuzz · bench · `coverage --min 94` ·
+**`coverage-honest.sh 58`** (ratcheted from 56 at 1.2.6) · `distlib --all --check` ·
+regeneration leaves no tree diff · consumer-check · **examples build and run**.
 
 Two of those are new at 1.2.3 and both exist because a gate was measuring the
 wrong thing:
@@ -302,24 +346,20 @@ wrong thing:
 
 ## Open filings
 
-**One**, down from five. The 1.2.3 P(-1) sweep opened five; 1.2.4 closed four
-outright and five of the six items in the fifth. Reasons are in each file and
-summarised in [the 1.2.3 audit](../audit/2026-09-07-v1.2.3-audit.md).
+**None.** 1.2.6 closed the two that were open, and both are in `issues/archived/`
+with resolution banners:
 
-| Severity | Filing | Status |
+| Severity | Filing | Resolution |
 |---|---|---|
-| MEDIUM | [`performance-backlog`](issues/2026-09-07-performance-backlog.md) | **Partially resolved at 1.2.4** — 5 of 6 items landed and are measured. What remains: `mat_inv`'s per-call scratch and the discarded transposes both need a public API change, and raising `GANITA_MAT_MAX_ELEMS` is still the policy question the 1.2.3 audit deferred. |
+| MEDIUM | [`f64-cbrt-missing`](issues/archived/2026-09-16-f64-cbrt-missing.md) (tanmatra) | `ganita_f64_cbrt`, correctly rounded; `ganita_f32_cbrt` re-pointed. The repro is the regression witness and exits 0. |
+| MEDIUM | [`performance-backlog`](issues/archived/2026-09-07-performance-backlog.md) (1.2.3 sweep) | The last three items: `mat_inv` scratch and the discarded transposes fixed with no public API change; the element cap decided by [ADR 0002](../adr/0002-element-cap-is-policy.md). |
 
-Four filings closed at 1.2.4 — the absolute `LINALG_EPS`, SVD via AᵀA, the f64
-transcendental accuracy group, and the f32 NaN/inf group — all in
-`issues/archived/` with resolution banners. The performance one is kept **open**
-rather than archived: an open item in an archived folder is how a backlog quietly
-disappears.
-
-Closed at 1.2.2 and kept as history: the `ganita_mat_least_squares` null write and
-`fmt_float`'s dropped carry (fixed upstream at cyrius 6.5.30). The repro
-`repros/2026-08-23-least-squares-unchecked-q-alloc.cyr` stays as a regression
-witness: exit 139 on 1.1.4 … 1.2.1, exit 0 from 1.2.2.
+Closed earlier and kept as history: the four other 1.2.3 filings (1.2.4), the
+`ganita_mat_least_squares` null write and `fmt_float`'s dropped carry (1.2.2), and
+the `f64_pow` domain (1.1.4). Two repros stay as regression witnesses:
+`repros/2026-08-23-least-squares-unchecked-q-alloc.cyr` (exit 139 on 1.1.4 … 1.2.1,
+0 from 1.2.2) and `repros/2026-09-16-f64-cbrt-missing.cyr` (exit 2 with the pow
+workaround as its candidate, 0 from 1.2.6).
 
 ## Known gaps
 
@@ -327,9 +367,9 @@ witness: exit 139 on 1.1.4 … 1.2.1, exit 0 from 1.2.2.
    does no fuzzing. It reports PASS, so the CI gate that runs it is vacuous until
    the harness is real. (`tests/ganita.bcyr` grew real f32 benchmarks at 1.2.0;
    only its `bench_noop` floor is scaffold.)
-2. **`math_advanced.cyr` is 4/13** — the remaining in-repo coverage gap now that
-   the f32 and linalg tiers are done. Its deep coverage lives upstream in
-   cyrius's `math` `.tcyr` suite.
+2. **`_compat.cyr` is 6/54 by name** — the largest honest-coverage gap, and the
+   file the roadmap deletes at the freeze. `math_advanced.cyr` is 14/20, and its
+   two unreferenced public functions are `ganita_f64_asin` and `ganita_f64_atan2`.
 3. **`lib/ganita.cyr` is ganita's own fold vendored back into ganita's own
    `lib/`** — new at this pin, because `lib sync --full` copies the whole
    snapshot and cyrius now carries the ganita fold. Nothing in `src/`,
@@ -337,9 +377,13 @@ witness: exit 139 on 1.1.4 … 1.2.1, exit 0 from 1.2.2.
    same symbols as `src/`: a last-definition-wins hazard waiting for someone to
    include it. Deleting it is not durable (`--full` re-adds it on every bump);
    the durable fix is upstream, a `lib sync` self-exclusion. bayan carries the
-   identical gap. At the 6.6.0 pin it holds ganita **1.2.0** — one release behind
+   identical gap. At the 6.6.4 pin it holds ganita **1.2.5** — one release behind
    `src/`, so it is also stale, not merely redundant.
-4. **`README.md` is stale** — still describes the pre-1.1.0 surface.
+4. **`ganita_f64_cbrt` spends most of its ~105 ns in two exact comparisons.** It is
+   1.1–1.15× the pow form it replaced, which is fine for tanmatra's use. If cube
+   roots ever become a hotspot, a floating-point residual filter could certify the
+   common case and leave the limb comparison to the rare close calls. The rounding
+   would stay exact; only the cost would move.
 
 ## Dependencies
 
@@ -352,13 +396,14 @@ No sibling `[deps.NAME]` entries, so `cyrius deps` writes no `cyrius.lock`.
 
 ## Consumers
 
-- **cyrius** — folds `dist/ganita.cyr` → `lib/ganita.cyr`. The 6.6.0 snapshot
-  carries ganita **1.2.0**, so the `f64_pow` domain fix (1.1.4) and the native f32
-  arithmetic tier (1.2.0) are both in. ⛔ **The refold is now worth scheduling.**
-  1.2.1 was header-only, but the 1.2.0 fold ships the `mat_least_squares` null
-  write under the plain `mat_least_squares` alias — so a cyrius consumer who never
-  heard of ganita can SIGSEGV on an in-contract call, which is exactly how naad
-  found it.
+- **cyrius** — folds `dist/ganita.cyr` → `lib/ganita.cyr`. The 6.6.4 snapshot
+  carries ganita **1.2.5**, so every fix through 1.2.4 is in (including the 1.2.2
+  least-squares null write that made the old 1.2.0 fold worth refolding). The next
+  refold brings `ganita_f64_cbrt` / `f64_cbrt` into the stdlib namespace, which is
+  how tanmatra's port expects to reach it, plus the 1.2.6 memory fixes.
+- **tanmatra** (atomic and nuclear physics, Rust → Cyrius port) — drove the 1.2.6
+  cube root. Its nuclear radius, Bethe–Weizsäcker and Thomas–Fermi terms all take
+  `A^(1/3)` and are asserted against golden values from Rust's `libm::cbrt`.
 - **ranga** (image-processing port) — drove the 1.1.0 f32 tier.
 - Downstream repos using matrix/linalg/advanced-math migrate to `ganita_*` on
   re-pin (aliases bridge the window).
@@ -366,5 +411,5 @@ No sibling `[deps.NAME]` entries, so `cyrius deps` writes no `cyrius.lock`.
 ## Next
 
 See [`roadmap.md`](roadmap.md). bayan (data formats) is the sibling carve, at
-**1.5.5** on the same **6.6.0** pin; Phase E (the stdlib data/math carve) closes
-with ganita.
+**1.5.6** on the **6.6.2** pin; Phase E (the stdlib data/math carve) closes with
+ganita.

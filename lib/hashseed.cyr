@@ -78,7 +78,14 @@ fn _hm_seed_get(): i64 {
         #ifdef CYRIUS_TARGET_AGNOS
         var t = syscall(SYS_TIME_UNIX);
         #else
-        var t = syscall(201, 0);
+        # v6.6.4: clock_gettime(CLOCK_REALTIME, &ts) — routed on EVERY target (aarch64
+        # 228→113, both Mach-O peers, PE GetTickCount64). x86 time(2)=201 is aarch64
+        # LISTEN(2): the getrandom-failure fallback seeded from a constant (-22, the very
+        # "published constant" the comment above says it must not be) and issued a
+        # write-class call on fd 0. Linux fills ts and returns 0; Darwin/PE RETURN the value.
+        var ts[16];
+        store64(&ts, 0);
+        var t = syscall(228, 0, &ts) + load64(&ts);
         #endif
         v = t * 2654435761 + 1099511628211;
     }

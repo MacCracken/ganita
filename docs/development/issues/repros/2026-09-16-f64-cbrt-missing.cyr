@@ -1,23 +1,29 @@
 # ganita has no f64 cube root, and the pow-built stand-in every consumer has to
 # write instead is neither exact on perfect cubes nor correctly rounded.
 #
-# Filed with docs/development/issues/2026-09-16-f64-cbrt-missing.md.
+# ✅ FIXED IN 1.2.6 -- this file is now a regression witness, not a bug report.
+# `candidate_cbrt` is swapped to ganita_f64_cbrt, exactly as the filing specified,
+# and the program exits 0. Through 1.2.5 there was no such function; the same
+# program with `candidate_cbrt` returning the guarded pow workaround exits 2 (the
+# perfect-cube and rounding groups), and that workaround is still reported below,
+# for the record, next to the bare pow form. Groups A-C are pinned inside the
+# suite as well (tests/ganita.tcyr, "f64 cbrt: correctly rounded, odd, exact on
+# every cube"); this stays because an exit code is the clearest possible
+# statement of what the defect WAS.
+#
+# Filed with docs/development/issues/archived/2026-09-16-f64-cbrt-missing.md.
 #
 # Build and run from the ganita repo root:
 #   cyrius build docs/development/issues/repros/2026-09-16-f64-cbrt-missing.cyr /tmp/cbrt
-#   /tmp/cbrt; echo "exit=$?"      # -> 2 today (perfect cubes, rounding), 0 once fixed
-#
-# From the repo root this builds under ganita's 6.6.2 pin. The same source built
-# under cyrius 6.6.4 prints identical counts and exits 2 as well.
+#   /tmp/cbrt; echo "exit=$?"      # -> 0 from 1.2.6 (2 with the guarded workaround as candidate)
 #
 # The exit code is the number of FAILING GROUPS for `candidate_cbrt`, not the
 # number of wrong answers: the perfect-cube group alone has well over 255 of
 # those, which an 8-bit exit status cannot carry. The counts are printed.
 #
-# When ganita_f64_cbrt lands, replace the body of `candidate_cbrt` with
-#     return ganita_f64_cbrt(x);
-# and expect exit 0. `naive_cbrt` is reported for the record only — it is what
-# a line-for-line port of `libm::cbrt(x)` to `f64_pow(x, 1.0/3.0)` produces.
+# `guarded_cbrt` is the f64 twin of what ganita_f32_cbrt did through 1.2.5, and
+# `naive_cbrt` is what a line-for-line port of `libm::cbrt(x)` to
+# `f64_pow(x, 1.0/3.0)` produces. Both are reported for the record only.
 #
 # Includes src/ directly rather than lib/ganita.cyr so it exercises the working
 # source. math_advanced has no matrix/linalg dependency.
@@ -40,8 +46,9 @@ fn d(n): i64 { return f64_from(n); }
 
 fn third(): i64 { return f64_div(f64_from(1), f64_from(3)); }
 
-# What a careful consumer writes today: the f64 twin of ganita_f32_cbrt —
-# zero / NaN / inf passed through, sign split so pow never sees a negative base.
+# What a careful consumer had to write through 1.2.5: the f64 twin of what
+# ganita_f32_cbrt did then — zero / NaN / inf passed through, sign split so pow
+# never sees a negative base.
 fn guarded_cbrt(x): i64 {
     if ((x & 0x7FFFFFFFFFFFFFFF) == 0) { return x; }
     if (_f64_is_nan_pat(x) == 1) { return x; }
@@ -55,11 +62,12 @@ fn guarded_cbrt(x): i64 {
 # What a line-for-line port writes: cbrt(x) -> pow(x, 1/3).
 fn naive_cbrt(x): i64 { return ganita_f64_pow(x, third()); }
 
-# ⚠ Swap point: `return ganita_f64_cbrt(x);` once it exists.
-fn candidate_cbrt(x): i64 { return guarded_cbrt(x); }
+# The swap point. Was `return guarded_cbrt(x);` until ganita_f64_cbrt existed (1.2.6).
+fn candidate_cbrt(x): i64 { return ganita_f64_cbrt(x); }
 
 fn cb(mode, x): i64 {
     if (mode == 0) { return candidate_cbrt(x); }
+    if (mode == 2) { return guarded_cbrt(x); }
     return naive_cbrt(x);
 }
 
@@ -140,10 +148,15 @@ fn main(): i64 {
     var a0 = group_special(0);
     var b0 = group_cubes(0);
     var c0 = group_rounding(0, t);
-    println("candidate_cbrt (today: guarded pow workaround)");
+    println("candidate_cbrt = ganita_f64_cbrt (1.2.6)");
     report("  A special values   : ", a0, 5);
     report("  B perfect cubes    : ", b0, 2000);
     report("  C correct rounding : ", c0, 12);
+
+    println("guarded_cbrt = the pow workaround through 1.2.5, for the record");
+    report("  A special values   : ", group_special(2), 5);
+    report("  B perfect cubes    : ", group_cubes(2), 2000);
+    report("  C correct rounding : ", group_rounding(2, t), 12);
 
     println("naive_cbrt = pow(x, 1/3), for the record");
     report("  A special values   : ", group_special(1), 5);

@@ -119,6 +119,12 @@ assert_eq(ganita_mat_new(0, 5), 0, "mat_new zero rows -> null");
 assert_eq(ganita_mat_new(4611686018427387904, 8), 0, "mat_new wrap-inducing dims -> null");
 # One element past the allocatable cap -> rejected without attempting a 256 MB+ alloc.
 assert_eq(ganita_mat_new(33554431, 1), 0, "mat_new over element cap -> null");
+# ADR 0002: the cap is a POLICY limit. The value is pinned so that changing it is a
+# decision rather than an edit, and it must stay at or below what one allocation
+# can hold, so the policy — not the allocator — is the limit a caller meets.
+assert_eq(GANITA_MAT_MAX_ELEMS, 33554430, "GANITA_MAT_MAX_ELEMS is the ADR 0002 policy value");
+assert_eq(GANITA_MAT_MAX_ELEMS <= (ALLOC_MAX - 16) / 8, 1,
+  "the policy cap is at or below the allocator's per-allocation ceiling (ADR 0002)");
 # A normal matrix is unaffected by the guard (fast path unchanged).
 var mg = ganita_mat_new(8, 8);
 assert_eq(ganita_mat_rows(mg), 8, "guarded mat_new still builds a valid 8x8");
@@ -1164,10 +1170,248 @@ assert_eq(f64_lt(f64_div(f64_abs(f64_sub(ganita_f64_acos(f64_sub(t_d(1), D50)), 
 assert_eq(t_dclose(ganita_f64_acos(f64_div(t_d(1), t_d(2))), f64_div(F64_PI, t_d(3))), 1,
   "acos(0.5) = pi/3 unchanged");
 
+test_group("f64 cbrt: correctly rounded, odd, exact on every cube (1.2.6)");
+# ⭐ Filed by tanmatra ahead of its Rust -> Cyrius port, which asserts golden values
+# generated from Rust's libm::cbrt. ganita had no f64 cube root, and the pow(x, 1/3)
+# stand-in a consumer had to write was wrong in the last bits for structural
+# reasons: 1/3 rounds DOWN, so every perfect cube came back low, and exp(y·ln x)
+# grows its error with |ln x| — 137 ulps at 1e-300. Groups A-C are the filing's
+# own, moved in from docs/development/issues/repros/2026-09-16-f64-cbrt-missing.cyr.
+var CB_SIGN = 0x8000000000000000;
+var CB_INF = 0x7FF0000000000000;
+
+# Group A — IEEE special values, sign of zero and of infinity preserved.
+assert_eq(ganita_f64_cbrt(0), 0, "cbrt(+0) = +0");
+assert_eq(ganita_f64_cbrt(CB_SIGN), CB_SIGN, "cbrt(-0) = -0 — the sign of zero survives (bare pow gave +0)");
+assert_eq(ganita_f64_cbrt(CB_INF), CB_INF, "cbrt(+inf) = +inf (bare pow gave NaN)");
+assert_eq(ganita_f64_cbrt(CB_INF | CB_SIGN), CB_INF | CB_SIGN, "cbrt(-inf) = -inf (bare pow gave NaN)");
+assert_eq(t_f64_is_nan(ganita_f64_cbrt(f64_div(t_d(0), t_d(0)))), 1, "cbrt(NaN) is NaN");
+
+# Group B — cbrt(±k³) = ±k EXACTLY. Every k³ below is under 2^53, so input and
+# answer are both exact doubles and exactly one bit pattern is right.
+var cb_bad = 0;
+var cbk = 1;
+while (cbk <= 1000) {
+    var cube = t_d(cbk * cbk * cbk);
+    if (ganita_f64_cbrt(cube) != t_d(cbk)) { cb_bad = cb_bad + 1; }
+    if (ganita_f64_cbrt(cube | CB_SIGN) != (t_d(cbk) | CB_SIGN)) { cb_bad = cb_bad + 1; }
+    cbk = cbk + 1;
+}
+assert_eq(cb_bad, 0, "cbrt(±k^3) == ±k exactly for every k = 1..1000 (the guarded pow form missed 1752 of 2000)");
+assert_eq(ganita_f64_cbrt(t_d(8)), t_d(2), "cbrt(8) == 2 exactly (pow: 1.9999999999999998, -1 ulp)");
+assert_eq(ganita_f64_cbrt(t_d(64)), t_d(4), "cbrt(64) == 4 exactly (pow: -2 ulp)");
+assert_eq(ganita_f64_cbrt(t_d(1728)), t_d(12), "cbrt(1728) == 12 exactly (pow: 11.999999999999995, -3 ulp)");
+assert_eq(ganita_f64_cbrt(t_d(0 - 27)), t_d(0 - 3), "cbrt(-27) == -3 exactly");
+# 208063 is the largest k with k^3 < 2^53, so this is the last exact cube.
+assert_eq(ganita_f64_cbrt(t_d(9007091372906047)), t_d(208063),
+  "cbrt(208063^3) == 208063 exactly — the largest cube whose input is exact");
+
+# Group C — correctly rounded results. Each expected pattern is the round-to-nearest
+# double of the exact cube root of the exact binary input, computed at 120
+# significant digits for the filing and re-derived with exact integer arithmetic.
+assert_eq(ganita_f64_cbrt(0x4000000000000000), 0x3FF428A2F98D728B, "cbrt(2) is correctly rounded");
+assert_eq(ganita_f64_cbrt(0x4008000000000000), 0x3FF7137449123EF6, "cbrt(3) is correctly rounded");
+assert_eq(ganita_f64_cbrt(0x4024000000000000), 0x40013C484138704F, "cbrt(10) is correctly rounded");
+assert_eq(ganita_f64_cbrt(0x404C000000000000), 0x400E9B5DBA58189E, "cbrt(56) is correctly rounded (tanmatra: Fe-56)");
+assert_eq(ganita_f64_cbrt(0x406A000000000000), 0x4017B3312382B4B5, "cbrt(208) is correctly rounded (tanmatra: Pb-208)");
+assert_eq(ganita_f64_cbrt(0x406DC00000000000), 0x4018C9E2DA25E5E4, "cbrt(238) is correctly rounded (tanmatra: U-238)");
+assert_eq(ganita_f64_cbrt(0x4071E00000000000), 0x401A5AA8345EF361,
+  "cbrt(286) is correctly rounded (pow's worst over n = 1..300: -2 ulp)");
+assert_eq(ganita_f64_cbrt(0x3FE0000000000000), 0x3FE965FEA53D6E3D, "cbrt(0.5) is correctly rounded");
+assert_eq(ganita_f64_cbrt(0x7E37E43C8800759C), 0x54B249AD2594C37D,
+  "cbrt(1e300) is correctly rounded (pow: -89 ulp; a naive Newton step's y^3 overflows here)");
+assert_eq(ganita_f64_cbrt(0x01A56E1FC2F8F359), 0x2B2BFF2EE48E0530, "cbrt(1e-300) is correctly rounded (pow: +137 ulp)");
+assert_eq(ganita_f64_cbrt(0x0010000000000000), 0x2AA428A2F98D728B,
+  "cbrt(DBL_MIN = 2^-1022) is correctly rounded (pow: +106 ulp)");
+assert_eq(ganita_f64_cbrt(0x0000000000000001), 0x2990000000000000,
+  "cbrt(2^-1074, the min subnormal) == 2^-358 exactly (pow: +66 ulp)");
+
+# The ends of the range, where an unsplit exponent overflows or underflows.
+assert_eq(ganita_f64_cbrt(0x7FEFFFFFFFFFFFFF), 0x554428A2F98D728B, "cbrt(DBL_MAX) is correctly rounded and finite");
+assert_eq(ganita_f64_cbrt(0x7FE0000000000000), 0x5540000000000000, "cbrt(2^1023) == 2^341 exactly");
+assert_eq(ganita_f64_cbrt(0x000FFFFFFFFFFFFF), 0x2AA428A2F98D728A, "cbrt(the largest subnormal) is correctly rounded");
+assert_eq(ganita_f64_cbrt(0x0000000000000003), 0x2997137449123EF6, "cbrt(3 * 2^-1074) is correctly rounded");
+# A root that rounds UP to the next power of two needs the next exponent — the one
+# significand, 2^53, that the final bit assembly handles separately.
+assert_eq(ganita_f64_cbrt(0x401FFFFFFFFFFFFF), 0x4000000000000000,
+  "cbrt(8 - 1 ulp) rounds up to exactly 2.0 (the carry into the exponent)");
+assert_eq(ganita_f64_cbrt(0x3FEFFFFFFFFFFFFF), 0x3FF0000000000000,
+  "cbrt(1 - 1 ulp) rounds up to exactly 1.0 — the same carry from the scaled branch");
+
+# Odd, bit for bit, across every exponent class: cbrt(-x) must be cbrt(x) with the
+# sign bit set. Checked over 4096 patterns from a fixed generator.
+# splitmix64's output function: a well-mixed 64-bit pattern from a counter.
+fn t_cb_mix(s): i64 {
+    var z = s * 0x9E3779B97F4A7C15;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EB;
+    return z ^ (z >> 31);
+}
+var cb_odd_bad = 0;
+var cbs = 1;
+while (cbs <= 4096) {
+    var cbx = t_cb_mix(cbs) & 0x7FFFFFFFFFFFFFFF;
+    if (ganita_f64_cbrt(cbx | CB_SIGN) != (ganita_f64_cbrt(cbx) | CB_SIGN)) {
+        if (t_f64_is_nan(cbx) == 0) { cb_odd_bad = cb_odd_bad + 1; }
+    }
+    cbs = cbs + 1;
+}
+assert_eq(cb_odd_bad, 0, "cbrt(-x) == cbrt(x) with the sign bit set, over 4096 patterns in every exponent class");
+
+# The rounding step is exact integer arithmetic. _f64_cbrt_cmp compares h^3 with
+# mant * 2^sh; these pin both signs, the equality case, and carries that cross
+# every limb boundary (2^35 +- 1 cubed spans limbs 0 through 4).
+assert_eq(_f64_cbrt_cmp(34359738368, 1, 105), 0, "_f64_cbrt_cmp: (2^35)^3 == 2^105 exactly");
+assert_eq(_f64_cbrt_cmp(34359738369, 1, 105), 1, "_f64_cbrt_cmp: (2^35 + 1)^3 > 2^105");
+assert_eq(_f64_cbrt_cmp(34359738367, 1, 105), 0 - 1, "_f64_cbrt_cmp: (2^35 - 1)^3 < 2^105");
+assert_eq(_f64_cbrt_cmp(18014398509481985, 9007199254740991, 109), 1,
+  "_f64_cbrt_cmp at the top of its contract: (2^54 + 1)^3 > (2^53 - 1) * 2^109");
+# The bisection fallback is unreachable through ganita_f64_cbrt by its bound, so it
+# is exercised directly: from the full significand range it must land on the same
+# significand the approximate-then-walk path returned.
+var cb_bis_bad = 0;
+cbs = 1;
+while (cbs <= 64) {
+    # bx is in [1, 2), so r = 0 and k = 0: its root's significand is the answer's.
+    var bx = (t_cb_mix(cbs + 5000) & 0x000FFFFFFFFFFFFF) | 0x3FF0000000000000;
+    var bmant = (bx & 0x000FFFFFFFFFFFFF) | 0x0010000000000000;
+    var got_sig = (ganita_f64_cbrt(bx) & 0x000FFFFFFFFFFFFF) | 0x0010000000000000;
+    if (_f64_cbrt_bisect(bmant, 107) != got_sig) { cb_bis_bad = cb_bis_bad + 1; }
+    cbs = cbs + 1;
+}
+assert_eq(cb_bis_bad, 0, "_f64_cbrt_bisect agrees with the walk on 64 inputs in [1, 2)");
+
+test_group("f32 cbrt: correctly rounded by construction (1.2.6)");
+# ganita_f32_cbrt now widens onto ganita_f64_cbrt. Every f32 perfect cube, both signs.
+var cb32_bad = 0;
+cbk = 1;
+while (cbk <= 255) {
+    var c32 = t_f32(cbk * cbk * cbk);
+    if (ganita_f32_cbrt(c32) != t_f32(cbk)) { cb32_bad = cb32_bad + 1; }
+    if (ganita_f32_cbrt(c32 | 0x80000000) != (t_f32(cbk) | 0x80000000)) { cb32_bad = cb32_bad + 1; }
+    cbk = cbk + 1;
+}
+assert_eq(cb32_bad, 0, "f32 cbrt(±k^3) == ±k exactly for every f32 cube, k = 1..255");
+# The tier is the narrowed f64 root, so the two must agree wherever the input is an f32.
+var cb32_path = 0;
+cbs = 1;
+while (cbs <= 1024) {
+    var fx = t_cb_mix(cbs + 9000) & 0x7F7FFFFF;
+    if (ganita_f32_cbrt(fx) != f32_from(ganita_f64_cbrt(f32_to(fx)))) { cb32_path = cb32_path + 1; }
+    cbs = cbs + 1;
+}
+assert_eq(cb32_path, 0, "ganita_f32_cbrt == narrow(ganita_f64_cbrt(widen x)) over 1024 finite patterns");
+# The pow form survived narrowing almost everywhere: an exhaustive sweep of all
+# 2,139,095,039 positive finite f32 inputs found it one ulp out on exactly 13 of
+# them, from the small and large ends where pow's error grows with |ln x|. These
+# four are from that list; the pow form fails every one.
+assert_eq(ganita_f32_cbrt(0x02A1B8E7), 0x2B2E5805, "f32 cbrt(2.37629526e-37) is correctly rounded (pow form: +1 ulp)");
+assert_eq(ganita_f32_cbrt(0x088353B5), 0x2D22A7BC, "f32 cbrt(7.90395514e-34) is correctly rounded (pow form: -1 ulp)");
+assert_eq(ganita_f32_cbrt(0x640353B5), 0x4BA2A7BC, "f32 cbrt(9.6902208e21) is correctly rounded (pow form: -1 ulp)");
+assert_eq(ganita_f32_cbrt(0xFDD26132), 0xD43E51F0,
+  "f32 cbrt(-3.49553183e37) is correctly rounded and negative (pow form: 1 ulp out)");
+
+test_group("performance backlog closed: inv / qr / pseudo_inv allocate what they keep (1.2.6)");
+# ⭐ The three items the 1.2.4 backlog left open. Each is pinned two ways: the
+# RESULT is unchanged (bit for bit, where the old arithmetic can be rebuilt here),
+# and the MEMORY a call takes from the bump allocator — which never frees — is what
+# the function actually keeps, not scratch it discarded.
+# The 3x3 permutation whose rows are I3's rotated, so LU must pivot on every column.
+fn t_perm3(): i64 {
+    return t_m3(t_d(0), t_d(1), t_d(0), t_d(0), t_d(0), t_d(1), t_d(1), t_d(0), t_d(0));
+}
+# A permutation's inverse is its transpose, exactly — and it drives the new
+# forward substitution through a different starting row for every column.
+assert_eq(ganita_mat_eq(ganita_mat_inv(t_perm3()), ganita_mat_transpose(t_perm3()), 0), 1,
+  "inv(P) == P^T bit for bit for a pivoting permutation (tolerance 0)");
+assert_eq(ganita_mat_eq(ganita_mat_mul(M3, ganita_mat_inv(M3)), I3, t_tol()), 1,
+  "3x3: A * inv(A) = I through the single-scratch solve");
+# mat_inv: two n x n matrices (the LU factor and the result) and three n-vectors
+# (pivots, the scratch column, the pivot inverse). Through 1.2.5 it also took an
+# n-vector per column inside lu_solve, plus two more — 8n^2 bytes it never kept.
+var INV_N = 32;
+var INV_A = ganita_mat_add(ganita_mat_identity(INV_N), ganita_mat_identity(INV_N));
+ganita_mat_set(INV_A, 0, INV_N - 1, t_d(1));
+var inv_u0 = alloc_used();
+var INV_R = ganita_mat_inv(INV_A);
+var inv_bytes = alloc_used() - inv_u0;
+assert_eq(INV_R != 0, 1, "inv of a 32x32 succeeds");
+assert_eq(inv_bytes <= 2 * (16 + 8 * INV_N * INV_N) + 3 * 8 * INV_N, 1,
+  "inv(32x32) allocates two matrices and three vectors — the per-column scratch is gone");
+assert_eq(ganita_mat_eq(ganita_mat_mul(INV_A, INV_R), ganita_mat_identity(INV_N), t_tol()), 1,
+  "32x32: A * inv(A) = I");
+
+# qr: the Q transpose is in place. The only allocation left is the reflector.
+var QRN = 12;
+var QRA = ganita_mat_new(QRN, QRN);
+var qri = 0;
+while (qri < QRN * QRN) {
+    store64(QRA + 16 + qri * 8, f64_div(t_d((t_cb_mix(qri + 777) >> 40) % 2001 - 1000), t_d(97)));
+    qri = qri + 1;
+}
+var QRQ = ganita_mat_new(QRN, QRN);
+var QRR = ganita_mat_new(QRN, QRN);
+var qr_u0 = alloc_used();
+assert_eq(ganita_mat_qr(QRA, QRQ, QRR), 0, "qr of a 12x12 returns 0");
+assert_eq(alloc_used() - qr_u0 <= 8 * QRN, 1,
+  "qr allocates only its reflector — no m x m transposed copy of Q");
+assert_eq(ganita_mat_eq(ganita_mat_mul(QRQ, QRR), QRA, t_tol()), 1, "12x12: Q * R = A with Q transposed in place");
+assert_eq(ganita_mat_eq(ganita_mat_mul(ganita_mat_transpose(QRQ), QRQ), ganita_mat_identity(QRN), t_tol()), 1,
+  "12x12: Q^T * Q = I with Q transposed in place");
+
+# pseudo_inv: rebuild the 1.2.5 arithmetic from the same SVD — transpose V^T, scale
+# V's columns, transpose U, multiply — and require the new result to match it BIT
+# FOR BIT. A tall, rank-deficient input (its last column is zero) so the
+# negligible-singular-value branch is taken as well.
+var PINV_A = ganita_mat_new(5, 3);
+var pir = 0;
+while (pir < 5) {
+    ganita_mat_set(PINV_A, pir, 0, t_d(pir + 1));
+    ganita_mat_set(PINV_A, pir, 1, t_d((pir * pir) % 7 - 3));
+    pir = pir + 1;
+}
+var PINV_U = ganita_mat_new(5, 3);
+var PINV_S = alloc(24);
+var PINV_VT = ganita_mat_new(3, 3);
+assert_eq(ganita_mat_svd(PINV_A, PINV_U, PINV_S, PINV_VT), 0, "svd of the rank-2 5x3 succeeds");
+var PINV_V = ganita_mat_transpose(PINV_VT);
+var pic = 0;
+while (pic < 3) {
+    var pif = t_d(0);
+    if (f64_gt(load64(PINV_S + pic * 8), f64_mul(LINALG_EPS, load64(PINV_S))) == 1) {
+        pif = f64_div(t_d(1), load64(PINV_S + pic * 8));
+    }
+    pir = 0;
+    while (pir < 3) {
+        ganita_mat_set(PINV_V, pir, pic, f64_mul(ganita_mat_get(PINV_V, pir, pic), pif));
+        pir = pir + 1;
+    }
+    pic = pic + 1;
+}
+var PINV_OLD = ganita_mat_mul(PINV_V, ganita_mat_transpose(PINV_U));
+var PINV_NEW = ganita_mat_pseudo_inv(PINV_A);
+assert_eq(ganita_mat_rows(PINV_NEW) == 3 && ganita_mat_cols(PINV_NEW) == 5, 1, "pseudo_inv of a 5x3 is 3x5");
+assert_eq(ganita_mat_eq(PINV_NEW, PINV_OLD, 0), 1,
+  "pseudo_inv is BIT-IDENTICAL to V * Sigma+ * U^T built with the transposes it no longer forms");
+assert_eq(ganita_mat_eq(ganita_mat_mul(ganita_mat_mul(PINV_A, PINV_NEW), PINV_A), PINV_A, t_tol()), 1,
+  "pseudo_inv: A A+ A = A for the rank-deficient 5x3");
+# The shared multiply kernel's transposed mode, directly: (A B)^T without forming A B.
+var KA = ganita_mat_new(3, 4);
+var KB = ganita_mat_new(4, 2);
+var kki = 0;
+while (kki < 12) { store64(KA + 16 + kki * 8, t_d(kki - 5)); kki = kki + 1; }
+kki = 0;
+while (kki < 8) { store64(KB + 16 + kki * 8, f64_div(t_d(kki + 1), t_d(3))); kki = kki + 1; }
+var KT = ganita_mat_new(2, 3);
+_ganita_mat_mul_into(KA, KB, KT, 1);
+assert_eq(ganita_mat_eq(KT, ganita_mat_transpose(ganita_mat_mul(KA, KB)), 0), 1,
+  "_ganita_mat_mul_into(transposed) == transpose(A * B), bit for bit, for a 3x4 * 4x2");
+
 test_group("back-compat aliases");
 var a2 = mat_new(4, 5);
 assert_eq(mat_rows(a2), 4, "alias mat_rows");
 assert_eq(mat_cols(a2), 5, "alias mat_cols");
 assert_eq(binomial(5, 2), 10, "alias binomial == canonical");
+assert_eq(f64_cbrt(t_d(27)), ganita_f64_cbrt(t_d(27)), "alias f64_cbrt == canonical (1.2.6)");
 
 var r = assert_summary();

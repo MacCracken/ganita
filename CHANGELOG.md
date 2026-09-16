@@ -4,6 +4,151 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.6] — 2026-09-16 — a correctly rounded cube root, and the backlog closed
+
+Closes both open filings. tanmatra's filing asked for an f64 cube root. The 1.2.3
+performance backlog had carried three items since 1.2.4, two thought to need a
+public API change and one a policy decision. Toolchain **6.6.2 → 6.6.4**. No public
+signature changed. **491 assertions** (was 433).
+
+### Added — `ganita_f64_cbrt`, correctly rounded for every f64
+
+⭐ ganita and the stdlib had no f64 cube root, so a consumer wrote `pow(x, 1/3)`,
+which is wrong in the last bits for structural reasons. `1/3` rounds **down**, so
+perfect cubes came back low: `cbrt(8) = 1.9999999999999998`, `cbrt(1728) =
+11.999999999999995`. And `exp(y·ln x)` turns half an ulp of error in the exponent
+into a relative error that grows with `|ln x|`: 137 ulps at 1e-300. Filed by
+**tanmatra** ahead of its Rust → Cyrius port, whose golden values come from Rust's
+`libm::cbrt`. The filing's repro, run with its candidate swapped as it specified:
+
+| Group | guarded `pow` workaround | `ganita_f64_cbrt` |
+|---|---|---|
+| A: ±0, ±inf, NaN, sign-exact | 0 / 5 wrong | 0 / 5 |
+| B: `cbrt(±k³) = ±k`, k = 1..1000 | **1752 / 2000** wrong | **0 / 2000** |
+| C: correctly rounded rows | **6 / 12** wrong | **0 / 12** |
+
+The filing's contract allowed "correctly rounded, or a stated bound under 1 ulp".
+This delivers the first. The result is odd and sign-exact, handles `±0`, `±inf` and
+NaN, and never forms an intermediate that can overflow or underflow:
+
+- **Split** — `|x| = m·2^(3k)` with `m` in `[1, 8)`, a subnormal scaled by 2^54
+  first. The `2^k` is a bit operation, which is the whole far-from-1 error class
+  gone.
+- **Approximate** — a Chebyshev line for `cbrt` on `[1, 2)`, then two Halley steps
+  on `y³ = m`. That lands within 1.17 ulp.
+- **Round, exactly** — the root is above the midpoint `(2Y+1)·2^-53` iff
+  `(2Y+1)³ < mant·2^(107+r)`. Both sides are integers, compared in 26-bit limbs
+  (`_f64_cbrt_cmp`). The approximation only decides *how many* comparisons run: two
+  for ~92% of inputs, three for the rest. The walk is capped and hands over to
+  bisection (`_f64_cbrt_bisect`), so termination does not rest on the bound either.
+
+Checked against an exact integer oracle on **5,838,393 inputs**: every perfect cube
+below 2^53 with its ±1 neighbours, every power of two with its neighbours,
+3,000,000 random bit patterns, 1,000,000 random subnormals and 1,000,000 random
+significands in `[1, 8)`. **0 mismatches.**
+Cost: ~105 ns per call, **1.1–1.15×** the guarded `pow` form it replaces.
+`f64_cbrt` joins `_compat.cyr` beside `f64_pow`, as the filing asked.
+
+### Changed — `ganita_f32_cbrt` widens onto `ganita_f64_cbrt`
+
+It was `sign(x)·pow(|x|, 1/3)`. It is now the narrowed f64 root, and so **correctly
+rounded for every f32**. That was checked **exhaustively**: over all 2,139,095,039
+positive finite f32 values, no f64 result lands exactly on an f32 midpoint, so
+narrowing cannot misround, and every negative input mirrors its positive bit for bit.
+The filing expected the f32 tests to stay green, and they did — its perfect cubes
+never moved. The same sweep found the pow form **one ulp out on exactly 13 inputs**
+(26 with negatives), all at the small and large ends where pow's error grows. Those
+are the only f32 results that change, and four of them are now assertions. The
+guards for zero, NaN and infinity stay; they are cheaper than the call.
+
+### Optimized — the performance backlog, closed without an API change
+
+Measured against 1.2.5 in one process on identical inputs. Old and new ran side by
+side on 400 random cases — square, tall, singular and rank-deficient — with **0 bit
+differences** in any result, and each comparison was mutation-verified.
+
+| | time | bytes taken from the allocator per call |
+|---|---|---|
+| `mat_inv` 60×60 | **1.17–1.20×** | 87,872 → 59,072 |
+| `mat_inv` 120×120 | **1.18×** | 348,512 → 233,312 |
+| `mat_qr` 120×120 | unchanged (±1%) | **116,176 → 960** |
+| `mat_qr` 200×40 | unchanged | **321,616 → 1,600** |
+| `pseudo_inv` 40×40 | unchanged | 90,352 → 64,720 |
+| `pseudo_inv` 200×40 | unchanged | 296,432 → 219,600 |
+| `mat_mul` 120×120 | unchanged (±1%) | unchanged |
+
+The allocator never frees, so bytes a call throws away are bytes the process never
+gets back. That is the whole cost `qr` and `pseudo_inv` were paying.
+
+- **`ganita_mat_inv`** no longer calls `ganita_mat_lu_solve` n times, each call
+  allocating its own scratch — 8n² bytes discarded per inverse. One scratch column
+  serves every column. Forward substitution starts at the row where `P·e_k` keeps its
+  1, since every entry above it is exactly zero; the old code substituted densely
+  against the unit vector. Back substitution runs in place. **Also fixed:** the old
+  loop ignored `lu_solve`'s return, so a failed scratch allocation copied a stale
+  solution into the inverse and returned success.
+- **`ganita_mat_qr`** transposes its square Q **in place**. It used to build a whole
+  transposed copy, copy it back and discard it — a second m×m allocation, and an
+  allocation-failure return for what is only a permutation.
+- **`ganita_mat_pseudo_inv`** forms neither V nor Uᵀ. It scales V^T's rows, which are
+  V's columns, and the multiply kernel stores `(U·Σ⁺V^T)^T` directly. The products
+  and their summation order match the old path's exactly.
+- `ganita_mat_mul`'s pointer walk moved into **`_ganita_mat_mul_into(a, b, c,
+  transposed)`**, so the library's one open-coded row-and-column pointer walk still
+  exists exactly once. The output stride is chosen per row, and the plain
+  multiply pays nothing per element for the transposed form.
+
+No `ganita_mat_transpose` call is left in `linalg.cyr`.
+
+### Decided — `GANITA_MAT_MAX_ELEMS` stays a policy limit (ADR 0002)
+
+The third backlog item was a policy question, and
+[ADR 0002](docs/adr/0002-element-cap-is-policy.md) answers it. The cap **stays at
+33,554,430** (256 MiB of elements), one eighth of what one allocation can hold.
+Nothing here can finish on a matrix that size anyway: a square at the cap is ~9.5
+minutes of `mat_mul` and ~11 hours of `eigen_sym`. The allocator never frees, so a
+decomposition's working set is a multiple of it. And no consumer has asked for
+more. Two assertions pin it: the value, and `GANITA_MAT_MAX_ELEMS <= (ALLOC_MAX -
+16) / 8`, so a future stdlib that shrinks the allocator fails the pin bump instead
+of silently becoming the binding limit. The ADR also says when to revisit it.
+
+### Changed — toolchain 6.6.2 → 6.6.4
+
+`lib/` re-vendored with `cyrius lib sync --full`: 110 files, 22 changed, 0 differ from
+the snapshot. The pin bump alone was green before any source change. The finished
+release was then gated twice: once on the installed toolchain, and once on the
+published 6.6.4 release tarball (sha256 matching its `.sha256`), unpacked into an
+isolated `CYRIUS_HOME`. Both runs were green, the second on the whole gate including
+`lib/` against the tarball's snapshot.
+
+The `f64_exp(±inf) = NaN` defect ganita filed upstream was fixed at cyrius 6.6.1. The
+guards in `sinh`/`cosh` and the f32 `exp`/`exp2` stay: they cost one compare, and
+`dist/ganita.cyr` is also consumed under stdlib pins older than the fix.
+
+### Tests and gates
+
+- **433 → 491 assertions**: the filing's groups A–C; the ends of the range; the carry
+  that rounds `cbrt(8 − ulp)` up to exactly 2.0; bit-exact oddness over 4096 patterns;
+  direct checks of the limb comparison (both signs, equality, top of contract) and
+  the bisection fallback; every f32 cube; the f32 rows the pow form misrounded; and,
+  for the backlog, `inv(P) = P^T` bit for bit, the bytes `inv` and `qr` take,
+  `pseudo_inv` bit-identical to the old composition, and the kernel's transposed
+  mode.
+- **Mutation-verified**: 15 mutations across cube root, f32 root, inverse, QR,
+  pseudo-inverse and kernel, and **14 caught**. The survivor is equivalent by design:
+  forcing the bisection fallback returns the same answers.
+- Word-boundary coverage **56% → 58%** (92/158) and the CI floor ratchets with it;
+  the tool's figure is 94% (133/141).
+- `tests/ganita.bcyr` gains `mat_inv 60x60` and a cube-root pair: the new function
+  against the pow baseline.
+
+### Closed
+
+Both filings moved to `docs/development/issues/archived/` with resolution banners,
+and `docs/development/issues/` has no open items. The cbrt repro stays in `repros/`
+as a regression witness: it exits 0, and still reports the guarded and bare `pow`
+forms for the record.
+
 ## [1.2.5] - 2026-09-12
 
 ### Changed
@@ -142,7 +287,7 @@ hoisted out of its k-loop; `sinh`/`cosh` evaluate one `exp` instead of two.
 
 ### Still open
 
-[`performance-backlog`](docs/development/issues/2026-09-07-performance-backlog.md)
+[`performance-backlog`](docs/development/issues/archived/2026-09-07-performance-backlog.md)
 stays in `issues/` rather than `archived/` — an open item in an archived folder is
 how a backlog quietly disappears. What remains: `mat_inv`'s per-column scratch and
 the discarded transposes both need a **public API change**, and raising
@@ -800,7 +945,7 @@ porting from C is otherwise quietly off by one on every tie.
 (should be `0`) and `pow(-2, 2)` is NaN (should be `4`); `ganita_f32_pow`
 inherits both. This is the f64 tier, out of scope for an f32 test pass, so it is
 **filed rather than changed**:
-[2026-08-19](docs/development/issues/2026-08-19-f64-pow-zero-and-negative-base.md).
+[2026-08-19](docs/development/issues/archived/2026-08-19-f64-pow-zero-and-negative-base.md).
 
 The suite carries a **self-expiring** `f32: known domain gaps` group asserting
 the current NaN behaviour, so the gap is measured rather than merely known —

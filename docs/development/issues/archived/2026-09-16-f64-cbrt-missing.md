@@ -1,5 +1,38 @@
 # No f64 cube root — the `pow(x, 1/3)` stand-in is wrong on perfect cubes and far from 1
 
+> ✅ **RESOLVED in ganita 1.2.6** (2026-09-16). `ganita_f64_cbrt` is **correctly
+> rounded for every f64, subnormals included** — the strong form of guarantee 3,
+> not a bound — with `f64_cbrt` in `_compat` and `ganita_f32_cbrt` re-pointed at it.
+> All four guarantees hold.
+>
+> - **How.** The exponent is split exactly (`|x| = m·2^(3k)`, `m` in `[1, 8)`, a
+>   subnormal scaled by 2^54 first), as proposed. `cbrt(m)` is approximated by a
+>   Chebyshev line and two Halley steps, which lands within 1.17 ulp. The rounding
+>   is then decided **exactly**: the root lies above the midpoint `(2Y+1)·2^-53`
+>   iff `(2Y+1)³ < mant·2^(107+r)`, and both sides are compared as integers in 26-bit
+>   limbs. The approximation cannot reach the result. It only decides how many
+>   comparisons run: two for about 92% of inputs, three for the rest. The walk is
+>   capped and falls back to bisection, so termination does not rest on the bound
+>   either.
+> - **The repro exits 0** with `candidate_cbrt` swapped exactly as specified. It
+>   stays in `repros/` as the regression witness, and still reports the guarded
+>   workaround (1752/2000, 6/12) and bare `pow` for the record.
+> - **Groups A–C are in `tests/ganita.tcyr`**, together with the ends of the range,
+>   the carry that rounds `cbrt(8 − ulp)` up to exactly 2.0, bit-exact oddness over
+>   4096 patterns, and direct checks of the limb comparison and the bisection
+>   fallback. Mutation-verified.
+> - **Checked against an exact integer oracle on 5,838,393 inputs**: every perfect
+>   cube below 2^53 with its ±1 neighbours, every power of two with its neighbours,
+>   3,000,000 random bit patterns and 1,000,000 random subnormals. **0 mismatches.**
+> - **`ganita_f32_cbrt` is correctly rounded for every f32**, checked exhaustively
+>   over all 2,139,095,039 positive finite f32 values: no f64 result lands on an f32
+>   midpoint, and negatives mirror positives bit for bit. This filing's closing note
+>   was right that its tests could not see the problem, but the problem was real.
+>   The pow form was one ulp out on **exactly 13** of those inputs, all at the ends
+>   of the range; four of them are now assertions.
+> - **Cost**: ~105 ns per call on the reference host, 1.1–1.15× the guarded pow
+>   form it replaces (`tests/ganita.bcyr`, both rows).
+
 **Filed by**: tanmatra (math audit ahead of its Rust → Cyrius port)
 **Against**: `src/math_advanced.cyr` (new function), `src/_compat.cyr` (alias),
 `src/math_f32.cyr` (`ganita_f32_cbrt` re-point)
@@ -11,7 +44,7 @@ folded `lib/ganita.cyr` (1.2.5) carries the same `pow`.
 substitute is silently inexact: wrong on 88% of perfect cubes (the same failure
 class as `pow(7,2) → 48.99…`, fixed in 1.2.4) and off by up to 137 ulps at the
 ends of the double range. No crash, no diagnostic.
-**Repro**: [`repros/2026-09-16-f64-cbrt-missing.cyr`](repros/2026-09-16-f64-cbrt-missing.cyr)
+**Repro**: [`repros/2026-09-16-f64-cbrt-missing.cyr`](../repros/2026-09-16-f64-cbrt-missing.cyr)
 — exits with the number of failing groups: **2 today, 0 when fixed.**
 **Upstream**: not filed. The function belongs here; cyrius gains it through
 `lib/ganita.cyr` on the next fold, as `f64_pow` did.

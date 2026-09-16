@@ -325,23 +325,24 @@ fn ganita_f32_hypot(x, y): i64 {
     return f32_from(ganita_f64_hypot(f32_to(x), f32_to(y)));
 }
 
-# cbrt(x) = sign(x) * |x|^(1/3). There is no f64 cbrt in ganita or the stdlib, so it is
-# built from pow — and the sign split is REQUIRED, not decorative: `pow` goes through
-# exp(y*ln x) and ln of a negative is undefined, so a bare pow returns garbage for every
-# negative input while looking fine for the positives a naive test would use.
+# Cube root, CORRECTLY ROUNDED in single precision, odd and sign-exact.
+#
+# ⭐ WIDENS ONTO ganita_f64_cbrt (1.2.6), which is correctly rounded — and that makes
+# this one correctly rounded too, not merely close. Narrowing a correctly rounded
+# double can misround only if that double lies EXACTLY on a single-precision
+# midpoint (a midpoint strictly between it and the true root would be a closer
+# double). None does: all 2,139,095,039 positive finite f32 inputs were checked
+# exhaustively for it at 1.2.6, and negatives mirror them bit for bit. Through 1.2.5
+# this was sign(x)·pow(|x|, 1/3), because there was no f64 cube root to call.
+# Narrowing rounded pow's error away on all but 13 of those inputs — every perfect
+# cube among them — which is why the tests never saw it.
 fn ganita_f32_cbrt(x): i64 {
-    # cbrt(±0) = ±0. Without this the zero falls into pow -> exp(third * ln 0),
-    # and ln(0) = -inf makes that NaN — so cbrt(0) returned NaN, which no caller
-    # expects and which a positives-only test never sees. Sign of zero preserved.
+    # ±0, NaN and ±inf never need the call. These guards predate the f64 routine,
+    # which handles all three the same way, and are kept because they are cheaper
+    # than the widen-call-narrow round trip. cbrt(0) returning NaN (1.1.2) and
+    # cbrt(±inf) returning NaN (1.2.4) were both real defects of the pow form.
     if (x & 0x7FFFFFFF == 0) { return x & 0xFFFFFFFF; }
-    # cbrt(±inf) = ±inf, and cbrt(NaN) = NaN. Both used to fall into the pow
-    # path and come back as a negative quiet NaN.
     if (_f32_is_nan(x) == 1) { return x & 0xFFFFFFFF; }
     if ((x & 0x7FFFFFFF) == 0x7F800000) { return x & 0xFFFFFFFF; }
-    var xf = f32_to(x);
-    var third = f64_div(f64_from(1), f64_from(3));
-    if (x & 0x80000000 != 0) {
-        return f32_from(f64_neg(ganita_f64_pow(f64_abs(xf), third)));
-    }
-    return f32_from(ganita_f64_pow(xf, third));
+    return f32_from(ganita_f64_cbrt(f32_to(x)));
 }

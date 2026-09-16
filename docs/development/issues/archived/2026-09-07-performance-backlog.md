@@ -1,5 +1,39 @@
 # Performance backlog, and the `GANITA_MAT_MAX_ELEMS` raise
 
+> ✅ **RESOLVED in ganita 1.2.6** (2026-09-16). The three items 1.2.4 left open are
+> closed, and the two it expected to need a public API change needed none: no
+> public signature changed.
+>
+> - **`mat_inv`'s per-column scratch.** `ganita_mat_inv` no longer calls
+>   `ganita_mat_lu_solve` once per column. One scratch column serves all n solves.
+>   Forward substitution starts at the row where `P·e_k` keeps its 1, since every
+>   entry above it is exactly zero, and back substitution runs in place. **1.17–1.20×**
+>   faster at 60×60 and 120×120, **8n² fewer bytes** per call (348,512 → 233,312 at
+>   120×120), and results bit-identical. It also closes a quiet defect: the old loop
+>   ignored `lu_solve`'s return, so a failed scratch allocation copied a stale
+>   solution into the inverse and reported success. `lu_solve` itself is untouched.
+> - **Transposes materialised and discarded.** No `ganita_mat_transpose` call is
+>   left in `linalg.cyr`. `qr` transposes its square Q in place: 116,176 → 960 bytes
+>   per call at 120×120, and the reflector is the only allocation left. `pseudo_inv`
+>   scales V^T's rows and has the multiply kernel store `(U·Σ⁺V^T)^T` directly, 26–28%
+>   fewer bytes. Both fixes are to memory, which the bump allocator never gets back;
+>   time is unchanged to within 1%, and so are the results, bit for bit. The
+>   multiply's pointer arithmetic still exists exactly once, now as
+>   `_ganita_mat_mul_into` with a `transposed` flag, and `ganita_mat_mul` is
+>   unchanged to within 1%.
+> - **Raising `GANITA_MAT_MAX_ELEMS`.** Decided rather than deferred: it **stays at
+>   33,554,430 as a policy limit**, recorded in
+>   [ADR 0002](../../../adr/0002-element-cap-is-policy.md) with the conditions for
+>   revisiting it. The value, and the fact that it sits at or below what one
+>   allocation can hold, are pinned by assertions.
+>
+> Old and new ran side by side on 400 random cases — square, tall, singular and
+> rank-deficient — with **0 bit differences** across `inv`, `qr`, `pseudo_inv` and
+> `mul`, and each comparison was mutation-verified. The 1.2.4 banner this replaces
+> is kept below for the record.
+>
+> <details><summary>The 1.2.4 status (superseded)</summary>
+>
 > ⚠️ **PARTIALLY RESOLVED — THIS FILING STAYS OPEN.** Five of six items landed in
 > ganita 1.2.4 (2026-09-08) and are measured below; what remains is one policy
 > decision and two items that need a public API change, so the file is kept in
@@ -39,6 +73,8 @@
 >   and it multiplies by 8 the memory a single call can demand of every existing
 >   consumer. This is a policy question about whether ganita should cap below the
 >   allocator, not a defect.
+>
+> </details>
 
 
 **Filed by**: ganita's 1.2.3 P(-1) sweep (performance lens — every claim below was

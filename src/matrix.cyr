@@ -28,12 +28,14 @@
 #   - one such matrix is 2 GiB, i.e. the ENTIRE ALLOC_MAX, so allocating it
 #     succeeds only by leaving nothing for the working factors every
 #     decomposition here needs;
-#   - ganita_mat_eigen_sym is O(n^4) per sweep, so matrices within an order of
+#   - every decomposition here is O(n^3), so matrices within an order of
 #     magnitude of the cap are already computationally out of reach;
 #   - and it silently multiplies by 8 the memory a single call can demand of
 #     every existing consumer.
-# The number below is a deliberate policy limit, not a derivation. Raising it is
-# tracked separately — see docs/audit/2026-09-07-v1.2.3-audit.md.
+# The number below is a deliberate POLICY limit, not a derivation — decided at
+# 1.2.6 and recorded in docs/adr/0002-element-cap-is-policy.md, which also says
+# when to revisit it. tests/ganita.tcyr pins the value, and pins that it stays at
+# or below what a single allocation can hold.
 var GANITA_MAT_MAX_ELEMS = 33554430;
 
 # Allocate WITHOUT the zero fill — internal use only.
@@ -211,20 +213,44 @@ fn ganita_mat_mul(a, b): i64 {
     var n = ganita_mat_cols(b);
     var c = _ganita_mat_new_raw(m, n);
     if (c == 0) { return 0; }
-    # ⚡ Raw pointers in the accumulation loop (1.2.4). ganita_mat_get re-reads
-    # the column count from the header and recomputes the whole offset on every
-    # call, and this loop calls it TWICE per multiply-accumulate — the measured
-    # cost was 2x to 3.7x over a hoisted base. This is the one place in the
-    # module where that is worth open-coding, because it is the only O(m*n*k)
-    # loop; everywhere else the accessors stay, since a per-element saving that
-    # nobody can measure is not worth an off-by-one that writes out of bounds.
-    #
-    # a_row walks A's row i contiguously (stride 8). b_col walks B's column j
-    # (stride n*8). c_ptr walks C's row i contiguously.
+    _ganita_mat_mul_into(a, b, c, 0);
+    return c;
+}
+
+# The accumulation loop of A·B, written into a caller-allocated C — internal
+# use only. A is m×k and B is k×n, and the CALLER has already checked both
+# (ganita_mat_mul's gates above are the model); nothing is re-validated here.
+#   transposed = 0: C is m×n and receives A·B.
+#   transposed = 1: C is n×m and receives (A·B)^T — the same sums in the same
+#                   order, stored across the diagonal, so a caller that wants a
+#                   product's transpose never materialises the product or
+#                   either operand's transpose (ganita_mat_pseudo_inv, 1.2.6).
+#
+# ⚡ Raw pointers in the accumulation loop (1.2.4). ganita_mat_get re-reads the
+# column count from the header and recomputes the whole offset on every call,
+# and this loop would call it TWICE per multiply-accumulate — the measured cost
+# was 2x to 3.7x over a hoisted base. This is the one loop in the library where
+# that is worth open-coding, because the O(m*n*k) multiply is the only loop of
+# its size; everywhere else the accessors stay, since a per-element saving that
+# nobody can measure is not worth an off-by-one that writes out of bounds. It is
+# a kernel rather than the body of ganita_mat_mul so that there is still exactly
+# ONE copy of this pointer arithmetic.
+#
+# a_row walks A's row i contiguously (stride 8). bp walks B's column j
+# (stride n*8). cp walks where product entry (i, j) is stored: along C's row i
+# (stride 8), or down C's column i when transposed (stride m*8) — chosen once
+# per row, so the transposed form costs the plain one nothing per element.
+fn _ganita_mat_mul_into(a, b, c, transposed): i64 {
+    var m = ganita_mat_rows(a);
+    var k = ganita_mat_cols(a);
+    var n = ganita_mat_cols(b);
+    var c_step = 8;
+    if (transposed == 1) { c_step = m * 8; }
     var i = 0;
     while (i < m) {
         var a_row = a + 16 + i * k * 8;
-        var c_ptr = c + 16 + i * n * 8;
+        var cp = c + 16 + i * n * 8;
+        if (transposed == 1) { cp = c + 16 + i * 8; }
         var j = 0;
         while (j < n) {
             var sum = f64_from(0);
@@ -237,12 +263,13 @@ fn ganita_mat_mul(a, b): i64 {
                 bp = bp + n * 8;
                 p = p + 1;
             }
-            store64(c_ptr + j * 8, sum);
+            store64(cp, sum);
+            cp = cp + c_step;
             j = j + 1;
         }
         i = i + 1;
     }
-    return c;
+    return 0;
 }
 
 # Transpose: returns new matrix, or 0 if it cannot be allocated (propagates

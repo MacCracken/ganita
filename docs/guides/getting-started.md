@@ -24,10 +24,10 @@ cyrius distlib --all                      # regenerate dist/ganita.cyr
 | `src/linalg.cyr` | decompositions and solvers, built on `matrix.cyr` |
 | `src/math_advanced.cyr` | f64 transcendental + number theory, self-contained over f64 builtins |
 | `src/math_f32.cyr` | the single-precision scalar tier |
-| `src/_compat.cyr` | 53 deprecated aliases — **must stay last**, it references every `ganita_*` symbol |
+| `src/_compat.cyr` | 54 back-compat aliases — **must stay last**, it references every `ganita_*` symbol |
 | `src/main.cyr` | full-bundle compile smoke (exits 42) |
 | `src/test.cyr` | the `[build].test` entry |
-| `tests/ganita.tcyr` | the suite — 260 assertions |
+| `tests/ganita.tcyr` | the suite — its current assertion count is in [`state.md`](../development/state.md) |
 | `tests/ganita.bcyr` | benchmarks |
 | `tests/ganita.fcyr` | fuzz harness |
 | `dist/ganita.cyr` | the bundled fold artifact — generated, but committed |
@@ -77,7 +77,7 @@ decompositions, and the f32 bit-pattern contract.
    reimplementation. Where practical, mutate the code the assertion covers and
    confirm it fails — an assertion that passes either way is not a test.
 7. **Run the gate**, all of it. `cyrius fmt --check` per file, `lint`, `vet`,
-   `build` with zero warnings, `test`, `fuzz`, `bench`, `coverage --min 80`,
+   `build` with zero warnings, `test`, `fuzz`, `bench`, both coverage floors,
    `distlib --all --check`, `consumer-check.sh`, and `cyrius audit` exiting 0.
    [`CONTRIBUTING.md`](../../CONTRIBUTING.md) has the commands.
 8. **Regenerate `dist/`** with `cyrius distlib --all` and commit it, or CI fails on

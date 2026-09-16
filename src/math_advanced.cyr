@@ -218,6 +218,204 @@ fn ganita_f64_pow(base, exp): i64 {
 }
 
 # ================================================================
+# Cube root
+# ================================================================
+#
+# Added at 1.2.6 for tanmatra's Rust -> Cyrius port, which asserts golden values
+# generated from Rust's libm::cbrt. Before it the only cube root was
+# `pow(x, 1/3)`, which is wrong in the last bits for structural reasons rather
+# than bad luck: 1/3 rounds DOWN, so every perfect cube came back low
+# (cbrt(8) = 1.9999999999999998, cbrt(1728) = 11.999999999999995), and
+# exp(y·ln x) turns half an ulp of error in the EXPONENT into a relative error
+# proportional to |ln x| — 137 ulps at 1e-300. Filed with a repro in
+# docs/development/issues/archived/2026-09-16-f64-cbrt-missing.md.
+
+# 2^54 — scales a subnormal into the normal range, exactly, before its exponent
+# is split.
+var _F64_2P54 = 0x4350000000000000;
+# The Chebyshev line A + B·f for cbrt(f) on [1, 2), within 0.9% everywhere.
+var _F64_CBRT_SEED_A = 0x3FE80F7C664572CF;    # 0.7518903729902265
+var _F64_CBRT_SEED_B = 0x3FD073DCDCFBC427;    # 0.25707170086303893
+# 2^(1/3) and 2^(2/3), correctly rounded: the seed's scale when m = 2f or 4f.
+var _F64_CBRT2 = 0x3FF428A2F98D728B;
+var _F64_CBRT4 = 0x3FF965FEA53D6E3D;
+
+# Sign of h³ − mant·2^sh as -1, 0 or +1, EXACTLY, for h < 2^55, mant < 2^53 and
+# 104 <= sh < 110. The integers are up to 165 bits wide, so they are carried in
+# 26-bit limbs: every limb product is below 2^52 and no column sums more than
+# three of them, so nothing here comes near the i64 range. This comparison is
+# the entire rounding decision in ganita_f64_cbrt.
+fn _f64_cbrt_cmp(h, mant, sh): i64 {
+    var mk = 0x3FFFFFF;
+    var h0 = h & mk;
+    var h1 = (h >> 26) & mk;
+    var h2 = h >> 52;
+    # s = h², normalised into limbs s0..s4.
+    var s0 = h0 * h0;
+    var s1 = 2 * h0 * h1;
+    var s2 = 2 * h0 * h2 + h1 * h1;
+    var s3 = 2 * h1 * h2;
+    var s4 = h2 * h2;
+    s1 = s1 + (s0 >> 26);
+    s0 = s0 & mk;
+    s2 = s2 + (s1 >> 26);
+    s1 = s1 & mk;
+    s3 = s3 + (s2 >> 26);
+    s2 = s2 & mk;
+    s4 = s4 + (s3 >> 26);
+    s3 = s3 & mk;
+    # t = s·h = h³, normalised into limbs t0..t6.
+    var t0 = s0 * h0;
+    var t1 = s0 * h1 + s1 * h0;
+    var t2 = s0 * h2 + s1 * h1 + s2 * h0;
+    var t3 = s1 * h2 + s2 * h1 + s3 * h0;
+    var t4 = s2 * h2 + s3 * h1 + s4 * h0;
+    var t5 = s3 * h2 + s4 * h1;
+    var t6 = s4 * h2;
+    t1 = t1 + (t0 >> 26);
+    t0 = t0 & mk;
+    t2 = t2 + (t1 >> 26);
+    t1 = t1 & mk;
+    t3 = t3 + (t2 >> 26);
+    t2 = t2 & mk;
+    t4 = t4 + (t3 >> 26);
+    t3 = t3 & mk;
+    t5 = t5 + (t4 >> 26);
+    t4 = t4 & mk;
+    t6 = t6 + (t5 >> 26);
+    t5 = t5 & mk;
+    # mant·2^sh has nothing below limb 4: sh = 104 + b with b < 6, and
+    # mant·2^b < 2^59 fills limbs 4, 5 and 6.
+    var mb = mant << (sh - 104);
+    var n4 = mb & mk;
+    var n5 = (mb >> 26) & mk;
+    var n6 = mb >> 52;
+    if (t6 != n6) {
+        if (t6 > n6) { return 1; }
+        return 0 - 1;
+    }
+    if (t5 != n5) {
+        if (t5 > n5) { return 1; }
+        return 0 - 1;
+    }
+    if (t4 != n4) {
+        if (t4 > n4) { return 1; }
+        return 0 - 1;
+    }
+    if ((t3 | t2 | t1 | t0) != 0) { return 1; }
+    return 0;
+}
+
+# The correctly rounded significand of cbrt(mant·2^(sh-159)) by bisection over
+# [2^52, 2^53]: the smallest Y whose upper midpoint (2Y+1)·2^-53 is not below the
+# root. At most 53 exact comparisons, whatever the input. ganita_f64_cbrt falls
+# back to this only if its approximation is ever further out than its bound
+# says it can be, so that its termination never rests on that bound.
+fn _f64_cbrt_bisect(mant, sh): i64 {
+    var lo = 0x0010000000000000;
+    var hi = 0x0020000000000000;
+    while (lo < hi) {
+        var mid = lo + (hi - lo) / 2;
+        if (_f64_cbrt_cmp(mid + mid + 1, mant, sh) < 0) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+# Cube root, CORRECTLY ROUNDED for every f64, subnormals included.
+# Odd and sign-exact: cbrt(-x) is cbrt(x) with the sign bit set, cbrt(±0) = ±0,
+# cbrt(±inf) = ±inf, cbrt(NaN) = NaN. Exact on every perfect cube whose root is
+# representable, which correct rounding implies.
+#
+# THREE STEPS, and only the last one decides the answer:
+#
+#   SPLIT — |x| = m·2^(3k) with m in [1, 8), so cbrt(x) = cbrt(m)·2^k and the
+#     2^k is a bit operation. Nothing below sees the exponent, so the error that
+#     grew with |ln x| in pow(x, 1/3) has nowhere to come from, and m³-sized
+#     intermediates cannot overflow or underflow at either end of the range.
+#   APPROXIMATE — a line through cbrt on [1, 2) (within 0.9%), scaled by
+#     2^(r/3), then two Halley steps on y³ = m. Convergence is cubic, so the
+#     truncation error is gone after the second step and what is left is
+#     rounding: under 1.17 ulp, from 2/3 ulp through the computed y³ and 1/2 ulp
+#     in the final subtraction.
+#   ROUND — with Y the significand of y as an integer (y = Y·2^-52), the root
+#     lies above Y's upper midpoint (2Y+1)·2^-53 exactly when
+#     (2Y+1)³ < mant·2^(107+r), where mant is x's 53-bit significand. Both sides
+#     are integers, compared exactly by _f64_cbrt_cmp. Walk Y up while that holds
+#     and down while the mirror test holds: the root then lies between Y's two
+#     midpoints, which is the definition of round-to-nearest. There is no tie to
+#     break — (2Y±1)³ is odd and the right-hand side is even.
+#
+# The approximation therefore decides how FAST this is, never what it returns:
+# by its bound the walk moves at most one step, and in practice about 8% of
+# inputs take that step. The walk is still capped, and hands over to
+# _f64_cbrt_bisect past the cap, so that no approximation — however broken a
+# later edit might make it — can turn the walk into an unbounded loop.
+fn ganita_f64_cbrt(x): i64 {
+    var sign = x & 0x8000000000000000;
+    var ax = x & 0x7FFFFFFFFFFFFFFF;
+    # ±0, ±inf and NaN come back as they went in, sign bit included.
+    if (ax == 0) { return x; }
+    if (ax >= 0x7FF0000000000000) { return x; }
+
+    # SPLIT. e is the unbiased exponent, in [-1074, 1023] once a subnormal has
+    # been scaled up by 2^54. Adding 1077 = 3·359 makes the dividend positive, so
+    # the integer / and % below are floor division with no sign cases.
+    var e = ((ax >> 52) & 0x7FF) - 1023;
+    if (((ax >> 52) & 0x7FF) == 0) {
+        ax = f64_mul(ax, _F64_2P54);
+        e = ((ax >> 52) & 0x7FF) - 1023 - 54;
+    }
+    var q = e + 1077;
+    var k = q / 3 - 359;
+    var r = q % 3;
+    var frac = ax & 0x000FFFFFFFFFFFFF;
+    var m = ((1023 + r) << 52) | frac;
+
+    # APPROXIMATE. f = x's significand in [1, 2); m = f·2^r.
+    var f = 0x3FF0000000000000 | frac;
+    var y = f64_add(_F64_CBRT_SEED_A, f64_mul(_F64_CBRT_SEED_B, f));
+    if (r == 1) { y = f64_mul(y, _F64_CBRT2); }
+    if (r == 2) { y = f64_mul(y, _F64_CBRT4); }
+    # Halley: y <- y - y·(y³ - m) / (2y³ + m). 0.9% -> 5e-7 -> below rounding.
+    var it = 0;
+    while (it < 2) {
+        var y3 = f64_mul(f64_mul(y, y), y);
+        y = f64_sub(y, f64_div(f64_mul(y, f64_sub(y3, m)), f64_add(f64_add(y3, y3), m)));
+        it = it + 1;
+    }
+
+    # ROUND. y is positive and near [1, 2], so its bit pattern orders like its
+    # value; clamp to the significand range, whose ends are 1.0 and 2.0.
+    var yi = 0x0010000000000000;
+    if (y >= 0x4000000000000000) {
+        yi = 0x0020000000000000;
+    } else {
+        if (y >= 0x3FF0000000000000) { yi = 0x0010000000000000 | (y & 0x000FFFFFFFFFFFFF); }
+    }
+    var mant = 0x0010000000000000 | frac;
+    var sh = 107 + r;
+    var steps = 0;
+    while ((steps < 4) && (_f64_cbrt_cmp(yi + yi + 1, mant, sh) < 0)) {
+        yi = yi + 1;
+        steps = steps + 1;
+    }
+    while ((steps < 4) && (_f64_cbrt_cmp(yi + yi - 1, mant, sh) > 0)) {
+        yi = yi - 1;
+        steps = steps + 1;
+    }
+    if (steps >= 4) { yi = _f64_cbrt_bisect(mant, sh); }
+
+    # cbrt(m) in [1, 2) rounds to at most 2.0, which is the one significand that
+    # needs the next exponent. 1023 + k is in [665, 1364]: always a normal double.
+    if (yi == 0x0020000000000000) { return ((1024 + k) << 52) | sign; }
+    return ((1023 + k) << 52) | (yi & 0x000FFFFFFFFFFFFF) | sign;
+}
+
+# ================================================================
 # Inverse trigonometry
 # ================================================================
 #

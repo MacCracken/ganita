@@ -635,6 +635,14 @@ fn dynlib_open(path): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return 0;
     #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    # v6.6.4: an x86_64-only loader (R_X86_64_* reloc types, ld-linux-x86-64.so.2) —
+    # declined BY DECISION. ⚠ Land this WITH the ESYSXLAT 5→80 row, never the row alone:
+    # with the row alone this fn turned fail-closed (raw fstat(5) ran as setxattr → EFAULT)
+    # into fail-OPEN — it mmap'd an aarch64 .so, walked its relocs against x86 constants and
+    # handed back a handle (measured under qemu). CHANGELOG [6.6.4]
+    return 0;
+    #endif
     # Check if already loaded
     var existing = _dynlib_find_loaded(path);
     if (existing != 0) { return existing; }
@@ -666,6 +674,15 @@ fn dynlib_open(path): i64 {
 
     # Validate ELF header
     if (_elf_check_magic(hdr) == 0) {
+        cyr_munmap(hdr, file_size);
+        syscall(3, fd);
+        return 0;
+    }
+    # v6.6.4: the loader-side belt to the arch decline's braces — this loader applies
+    # R_X86_64_* relocations, so an object for any other machine (e_machine @18 != 62
+    # EM_X86_64) is refused even on an x86 host; the x86 build "loaded" an aarch64 .so
+    # with every reloc skipped before this check existed.
+    if (load16(hdr + 18) != 62) {
         cyr_munmap(hdr, file_size);
         syscall(3, fd);
         return 0;
@@ -889,16 +906,32 @@ fn dynlib_bootstrap_tls(): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return 0;
     #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    # v6.6.4: arch_prctl(ARCH_SET_FS) is x86-only; the raw 158 reached aarch64 as
+    # getgroups(0x1002, tls), which SUCCEEDS (rc = ngroups) and fills the buffer with gids
+    # — so a process with zero supplementary groups got rc == 0 and a bogus "TLS installed"
+    # pointer back. Declined because the surrounding loader is x86_64-only, not because an
+    # aarch64 TLS install is impossible: lib/thread_local.cyr's _tlocal_install already does
+    # `msr TPIDR_EL0` for the native path. CHANGELOG [6.6.4]
+    return 0;
+    #endif
     var tls = alloc(4096);
     if (tls == 0) { return 0; }
     var i = 0;
     while (i < 4096) { store8(tls + i, 0); i = i + 1; }
     store64(tls, tls);            # tcb->self
     store64(tls + 16, tls);       # NPTL self-pointer
-    # arch_prctl(ARCH_SET_FS=0x1002, tls) — syscall 158
+    # arch_prctl(ARCH_SET_FS=0x1002, tls) — x86_64 syscall 158, and x86-only: the aarch64
+    # arm declined above, and this guard keeps the raw number out of arch-neutral code (the
+    # raw_syscall_literals_routed gate).
+    #ifdef CYRIUS_ARCH_X86
     var rc = syscall(158, 0x1002, tls);
     if (rc != 0) { return 0; }
     return tls;
+    #endif
+    #ifndef CYRIUS_ARCH_X86
+    return 0;
+    #endif
 }
 
 # Populate `__libc_stack_end` (exported from ld-linux) with a sensible

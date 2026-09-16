@@ -528,26 +528,73 @@ fn ganita_mat_inv(m): i64 {
     var sign = ganita_mat_lu(m, lu, piv);
     if (sign == 0) { return 0; }
 
-    var inv = ganita_mat_new(n, n);
+    # Every element is written below — column k in full on pass k.
+    var inv = _ganita_mat_new_raw(n, n);
     if (inv == 0) { return 0; }
-    var col = alloc(n * 8);
-    if (col == 0) { return 0; }
-    var x = alloc(n * 8);
-    if (x == 0) { return 0; }
+
+    # ⚡ ONE SCRATCH COLUMN, AND NO IDENTITY COLUMN AT ALL (1.2.6).
+    #
+    # Through 1.2.5 this built e_k and called ganita_mat_lu_solve on it n times.
+    # lu_solve allocates its own n-element forward-substitution scratch on every
+    # call, and the allocator is a bump allocator with no free, so an inverse
+    # leaked 8n² bytes of scratch it never reused — as much again as the result.
+    # It also forward-substituted DENSELY against a unit vector, although the
+    # answer's leading entries are known to be zero.
+    #
+    # L·y = P·e_k has its single 1 in row s, where piv[s] == k. Every y_i above s
+    # is therefore exactly zero and y_s is exactly one, so forward substitution
+    # starts at s and its inner sums start at column s. Back substitution U·x = y
+    # then runs in place in the same buffer: x_i reads only y_i and the x_j with
+    # j > i, and those slots already hold x by the time row i is reached.
+    #
+    # Bit-identical to the 1.2.5 result for finite input: the skipped terms were
+    # all products with an exact zero, and subtracting a signed zero from +0.0 or
+    # from 1.0 leaves it unchanged.
+    var w = alloc(n * 8);
+    if (w == 0) { return 0; }
+    # row_of[k] = the row s with piv[s] == k: where P·e_k keeps its 1.
+    var row_of = alloc(n * 8);
+    if (row_of == 0) { return 0; }
+    var i = 0;
+    while (i < n) {
+        store64(row_of + load64(piv + i * 8) * 8, i);
+        i = i + 1;
+    }
+
     var k = 0;
     while (k < n) {
-        # Build identity column k
-        var i = 0;
-        while (i < n) { store64(col + i * 8, f64_from(0)); i = i + 1; }
-        store64(col + k * 8, f64_from(1));
-
-        ganita_mat_lu_solve(lu, piv, col, x);
-
-        # Copy solution into column k of inv
+        var s = load64(row_of + k * 8);
+        # Forward: L·y = P·e_k, from row s.
         i = 0;
-        while (i < n) {
-            ganita_mat_set(inv, i, k, load64(x + i * 8));
+        while (i < s) {
+            store64(w + i * 8, f64_from(0));
             i = i + 1;
+        }
+        store64(w + s * 8, f64_from(1));
+        i = s + 1;
+        while (i < n) {
+            var fsum = f64_from(0);
+            var j = s;
+            while (j < i) {
+                fsum = f64_sub(fsum, f64_mul(ganita_mat_get(lu, i, j), load64(w + j * 8)));
+                j = j + 1;
+            }
+            store64(w + i * 8, fsum);
+            i = i + 1;
+        }
+        # Back: U·x = y, in place, straight into column k.
+        i = n - 1;
+        while (i >= 0) {
+            var bsum = load64(w + i * 8);
+            var j2 = i + 1;
+            while (j2 < n) {
+                bsum = f64_sub(bsum, f64_mul(ganita_mat_get(lu, i, j2), load64(w + j2 * 8)));
+                j2 = j2 + 1;
+            }
+            var xi = f64_div(bsum, ganita_mat_get(lu, i, i));
+            store64(w + i * 8, xi);
+            ganita_mat_set(inv, i, k, xi);
+            i = i - 1;
         }
         k = k + 1;
     }
@@ -779,12 +826,22 @@ fn ganita_mat_qr(m, out_q, out_r): i64 {
         k = k + 1;
     }
 
-    # Q accumulated H_k...H_1 — transpose to get Q where A = QR
-    var qt = ganita_mat_transpose(out_q);
-    if (qt == 0) { return 0 - 1; }
+    # Q accumulated H_k...H_1 — transpose to get Q where A = QR.
+    #
+    # ⚡ IN PLACE (1.2.6). Q is square, so its transpose is a swap across the
+    # diagonal. Through 1.2.5 this materialised a whole m×m transposed copy,
+    # copied it back element by element and discarded it: a second m×m
+    # allocation that the bump allocator never reclaims, and an allocation-
+    # failure return for what is only a permutation of values already in hand.
     i = 0;
-    while (i < q_total) {
-        store64(out_q + 16 + i * 8, load64(qt + 16 + i * 8));
+    while (i < rows) {
+        var jt = i + 1;
+        while (jt < rows) {
+            var tq = ganita_mat_get(out_q, i, jt);
+            ganita_mat_set(out_q, i, jt, ganita_mat_get(out_q, jt, i));
+            ganita_mat_set(out_q, jt, i, tq);
+            jt = jt + 1;
+        }
         i = i + 1;
     }
     return 0;
@@ -1506,37 +1563,42 @@ fn ganita_mat_pseudo_inv(m): i64 {
 
     # Pseudo-inverse = V * Sigma_inv * U^T.
     #
-    # ⚡ Sigma_inv is a DIAGONAL, so applying it is a column scaling — O(n^2).
-    # Through 1.2.3 this built it as a dense n x n matrix and called
-    # ganita_mat_mul, paying a full O(n^3) matrix multiply to multiply by a
-    # diagonal. The matrix is gone; V's columns are scaled in place instead.
+    # ⚡ Sigma_inv is a DIAGONAL, so applying it is a scaling — O(n^2). Through
+    # 1.2.3 this built it as a dense n x n matrix and called ganita_mat_mul,
+    # paying a full O(n^3) matrix multiply to multiply by a diagonal.
+    #
+    # ⚡ AND NOTHING IS TRANSPOSED (1.2.6). Through 1.2.5 this materialised V as
+    # transpose(V^T) and U^T as transpose(U) — an n×n and an n×m matrix, each
+    # consumed once by the multiply and discarded, which a bump allocator never
+    # reclaims. Both are unnecessary: scaling ROW j of V^T is scaling column j of
+    # V, and V·Sigma_inv·U^T = (U · Sigma_inv·V^T)^T, which the multiply kernel
+    # stores directly as a transpose. Same products, same summation order — the
+    # result is bit-identical to 1.2.5's.
     #
     # A singular value is treated as zero RELATIVE to the largest one, which is
     # the standard rank tolerance — see ganita_mat_svd.
     var pinv_tol = f64_mul(LINALG_EPS, load64(sigma));
 
-    # V = transpose of V^T
-    var v = ganita_mat_transpose(vt);
-    if (v == 0) { return 0; }
-    var ut = ganita_mat_transpose(u);
-    if (ut == 0) { return 0; }
-
-    # Scale column j of V by 1/sigma_j, or zero it where sigma_j is negligible.
+    # Scale row j of V^T by 1/sigma_j, or zero it where sigma_j is negligible.
     var i = 0;
     while (i < cols) {
         var sv = load64(sigma + i * 8);
         var f = f64_from(0);
         if (f64_gt(sv, pinv_tol) == 1) { f = f64_div(f64_from(1), sv); }
-        var r2 = 0;
-        while (r2 < cols) {
-            ganita_mat_set(v, r2, i, f64_mul(ganita_mat_get(v, r2, i), f));
-            r2 = r2 + 1;
+        var c2 = 0;
+        while (c2 < cols) {
+            ganita_mat_set(vt, i, c2, f64_mul(ganita_mat_get(vt, i, c2), f));
+            c2 = c2 + 1;
         }
         i = i + 1;
     }
 
-    # (V * Sigma_inv) * U^T
-    return ganita_mat_mul(v, ut);
+    # (U · Sigma_inv·V^T)^T, n×m. u is m×n and vt is n×n, so the shapes the
+    # kernel requires hold by construction.
+    var pinv = _ganita_mat_new_raw(cols, rows);
+    if (pinv == 0) { return 0; }
+    _ganita_mat_mul_into(u, vt, pinv, 1);
+    return pinv;
 }
 
 # Numerical rank: count of singular values above tolerance.

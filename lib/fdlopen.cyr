@@ -418,6 +418,11 @@ fn fdlopen_helper_available(): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return 0;
     #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    # v6.6.4: fdlopen_init* already return -6 off x86-Linux; the availability gate must
+    # agree, or a consumer (lib/tls.cyr:218) sees "available" and then fails to init.
+    return 0;
+    #endif
     var pathbuf = alloc(512);
     if (pathbuf == 0) { return 0; }
     var pl = _fdlopen_helper_path(pathbuf, 512);
@@ -458,6 +463,13 @@ fn fdlopen_state_size(): i64 { return 256; }
 fn _fdlopen_mmap_elf(path, out_info): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return 0 - 1;   # Linux-host-only (raw open/fstat/mmap mis-dispatch on agnos)
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    # v6.6.4: an x86_64-Linux facility (ld-linux-x86-64.so.2 + the x86 asm trampoline in
+    # _fdlopen_enter_ldso) — declined BY DECISION, not accidentally dead. Its raw fstat(5)
+    # reached aarch64 as setxattr and failed closed; now that 5→80 is routed the load would
+    # proceed into x86-only code. CHANGELOG [6.6.4]
+    return 0 - 1;
     #endif
     var fd = syscall(2, path, 0, 0);   # O_RDONLY
     if (fd < 0) { return 0 - 1; }
@@ -893,6 +905,13 @@ fn _fdlopen_verify_trusted(path): i64 {
     # trust check would read the wrong words — a security predicate silently misreading
     # mode/uid is strictly worse than one that fails. fdlopen is an ELF/Linux facility, so
     # decline rather than port the offsets.
+    return 0;
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    # v6.6.4: same reasoning as the macOS arm. aarch64-Linux struct stat puts st_mode @16
+    # and st_uid @24, so the @24/@28 reads below would be st_uid/st_gid; and the raw
+    # lstat(6) that used to reach the kernel as lsetxattr (fail-closed) is now routed to
+    # fstatat(AT_SYMLINK_NOFOLLOW), so without this the check would SUCCEED and misread.
     return 0;
     #endif
     var st[144];

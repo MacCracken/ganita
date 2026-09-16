@@ -18,7 +18,7 @@ cyrius lint src/*.cyr         # always exits 0; gate on the reported counts
 cyrius vet src/main.cyr
 cyrius build src/main.cyr build/ganita   # must emit zero `warning:` lines
 cyrius test && cyrius fuzz && cyrius bench
-cyrius coverage --min 80
+cyrius coverage --min 94       # and ./scripts/coverage-honest.sh 58 — the floors ci.yml gates on
 cyrius distlib --all --check && cyrius distlib --all
 ./scripts/consumer-check.sh /tmp/consumer-check
 cyrius audit                  # must exit 0 — it audits docs in tests/ too

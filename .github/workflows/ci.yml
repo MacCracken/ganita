@@ -186,7 +186,7 @@ jobs:
       # is the number to plan against; the tool's is the number to ratchet.
       # Both must pass. Raise this whenever real coverage lands.
       - name: Reference coverage floor (word-boundary)
-        run: ./scripts/coverage-honest.sh 56
+        run: ./scripts/coverage-honest.sh 58
 
       # --- Distribution: ganita's actual product is dist/, not build/ ---------
 

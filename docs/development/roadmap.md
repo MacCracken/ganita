@@ -19,9 +19,10 @@ The point at which `ganita_*` becomes load-bearing and cannot change.
 - [x] At least one downstream consumer green (cyrius, via the `dist/ganita.cyr` fold)
 - [x] CHANGELOG complete from 1.0.0 onward
 - [x] Benchmark baseline captured (`scripts/bench-history.sh` → `bench-history.csv`)
-- [ ] **Test coverage adequate for the surface area** — `cyrius coverage` is at the
-      80 % floor, but `math_advanced.cyr` is 4/13 and `matrix.cyr` 10/14. The floor
-      is a floor, not the target.
+- [ ] **Test coverage adequate for the surface area** — `cyrius coverage` reports
+      94 %, but it counts substrings; counted on word boundaries the repo is at 58 %
+      (1.2.6), and `_compat.cyr` at 6/54 is most of the gap. The floor is a floor,
+      not the target.
 - [ ] **`_compat.cyr` removed** — 53 deprecated aliases still ship, and they are
       exported into cyrius's stdlib namespace by the fold. Needs the consumers to
       re-pin first.

@@ -22,3 +22,4 @@ Decisions about ganita — what we chose, the context, and the consequences we a
 | ADR | Title | Status |
 |---|---|---|
 | [0001](0001-failure-vocabulary.md) | One failure vocabulary across the matrix and linalg surface | Accepted |
+| [0002](0002-element-cap-is-policy.md) | `GANITA_MAT_MAX_ELEMS` is a policy limit, kept below the allocator's | Accepted |

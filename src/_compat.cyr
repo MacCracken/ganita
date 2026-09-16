@@ -90,6 +90,9 @@ fn f64_cosh(x): i64 { return ganita_f64_cosh(x); }
 fn f64_tanh(x): i64 { return ganita_f64_tanh(x); }
 # Deprecated alias for `ganita_f64_pow()`. Migration window only.
 fn f64_pow(base, exp): i64 { return ganita_f64_pow(base, exp); }
+# Alias for `ganita_f64_cbrt()` (1.2.6), next to `f64_pow` so the fold exports both
+# under the stdlib's f64_* names. Requested with the function; leaves with this file.
+fn f64_cbrt(x): i64 { return ganita_f64_cbrt(x); }
 # Deprecated alias for `ganita_f64_asin()`. Migration window only.
 fn f64_asin(x): i64 { return ganita_f64_asin(x); }
 # Deprecated alias for `ganita_f64_acos()`. Migration window only.
