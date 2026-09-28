@@ -92,7 +92,7 @@ Deliberately not in ganita, so that nobody adds them by accident:
 
 ---
 
-## Moving the cyrius pin to 6.6.6
+## Moving the cyrius pin (done at 1.2.7: 6.6.4 → 6.6.7)
 
 **Done at 1.2.7 — the pin moved straight to `cyrius = "6.6.7"`** (the sequence below,
 followed as written: `lib/` re-vendored to the 111-file 6.6.7 snapshot, `dist/`

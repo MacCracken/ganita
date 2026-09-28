@@ -39,9 +39,10 @@ cyrius's `tests/tcyr/crossos/f64_pow_domain.tcyr` pins it on the ARM hosts.
 
 ### Changed
 
-- Two stale comments said the stdlib's `f64_exp` returns NaN for an infinite
-  argument (sinh, `ganita_f32_exp`). It has not since cyrius 6.6.1; the guards stay,
-  the comments now say why.
+- Three stale comments said the stdlib's `f64_exp` returns NaN for an infinite
+  argument (the `math_advanced` header's INFINITY policy, sinh, `ganita_f32_exp`),
+  the header calling its guards "a workaround, not a fix". It has not since cyrius
+  6.6.1; the guards stay, the comments now say why.
 
 ## [1.2.6] — 2026-09-16 — a correctly rounded cube root, and the backlog closed
 

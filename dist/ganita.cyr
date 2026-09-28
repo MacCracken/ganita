@@ -2013,10 +2013,12 @@ fn ganita_mat_condition(m): i64 {
 #     for inputs whose ANSWER is perfectly representable. hypot's entire reason
 #     for existing is not to do this, and it did. Closed by scaling out the
 #     larger magnitude first, or by an asymptotic form in the large regime.
-#   INFINITY — stdlib's f64_exp returns NaN for an infinite argument, so every
-#     function here that reaches for it returned NaN where the true value is a
-#     defined infinity. Closed by handling the infinite case before the general
-#     path. This one is a workaround, not a fix: the fix belongs upstream.
+#   INFINITY — an infinite argument has a defined answer (an infinity, ±1, 0),
+#     and the general path must not be trusted to reach it through intermediate
+#     arithmetic (inf - inf, inf / inf are NaN). Closed by answering the infinite
+#     case explicitly before the general path. When 1.2.4 added these guards the
+#     stdlib's f64_exp also returned NaN for ±inf; that was fixed upstream at
+#     cyrius 6.6.1, and the guards stay because the reason above still holds.
 #
 # Filed with reproductions in
 # docs/development/issues/archived/2026-09-07-f64-transcendental-accuracy.md.
