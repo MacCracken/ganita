@@ -2,10 +2,17 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-09-16 (1.2.6 — a correctly rounded cube root, the backlog
-> closed, toolchain 6.6.4).
+> Last refreshed: 2026-09-27 (1.2.7 — `pow` follows the C99 Annex F table,
+> toolchain 6.6.7).
 
 ## Version
+
+**1.2.7** — **`pow` follows the C99 Annex F table.** `ganita_f64_pow` (and the
+`f64_pow` / `ganita_f32_pow` names over it) returned NaN for every infinite base or
+exponent that missed the integral fast path, and for `pow(1, NaN)` / `pow(±1, ±inf)`;
+a zero base lost its sign. The whole special-value table is now answered before the
+`exp(y·ln x)` path. Found by the cyrius 6.6.8 audit. Toolchain **6.6.4 → 6.6.7**, `lib/`
+re-vendored (**111** files). No public signature changed. **521 assertions** (was 491).
 
 **1.2.6** — **a correctly rounded cube root, and the backlog closed.** Both open
 filings closed, no public signature changed. **`ganita_f64_cbrt`** (filed by
@@ -120,18 +127,12 @@ initial carve out of cyrius stdlib (2026-06-10, cyrius v6.1.26).
 
 ## Toolchain
 
-- **Cyrius pin**: `6.6.4` (`cyrius.cyml [package].cyrius`, since 1.2.6).
-  `cyrius version` reports `manifest-pin: 6.6.4` with no drift line, and no
-  `./lib/ shadows version-pinned ...` warning — `cyrius lib sync --full`
-  re-copied all 110 files from the 6.6.4 snapshot (22 changed since 6.6.2).
-- **`lib/` matches the pin exactly**: 110 files, 0 differ. Verify by comparing
+- **Cyrius pin**: `6.6.7` (`cyrius.cyml [package].cyrius`, since 1.2.7).
+  `cyrius version` reports `manifest-pin: 6.6.7` with no drift line —
+  `cyrius lib sync --full` re-copied all 111 files from the 6.6.7 snapshot.
+- **`lib/` matches the pin exactly**: 111 files, 0 differ. Verify by comparing
   the trees against `~/.cyrius/versions/<pin>/lib`, not by trusting
   `cyrius lib sync --full`'s exit code.
-- **Gated against the 6.6.4 release tarball** (sha256 `c2a540c9…2fab`, matching the
-  published `.sha256`), installed into an isolated `CYRIUS_HOME` as described below:
-  the whole gate is green there, as it is on the local install. The tarball's `lib/`
-  is identical to the local snapshot. Of the binaries the two share, only the
-  bootstrap seed `cybs` differs, and nothing here uses it.
 - **The `f64_exp(±inf) = NaN` defect ganita filed was fixed upstream at 6.6.1.**
   ganita's guards in `sinh`/`cosh` and the f32 `exp`/`exp2` stay: they cost a
   compare, and `dist/ganita.cyr` is also consumed under older stdlib pins.

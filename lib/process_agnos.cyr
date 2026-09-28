@@ -88,15 +88,27 @@ fn exec_vec(args): i64 {
     return sys_waitpid(pid);
 }
 
-# Capture variant — unsupported on agnos (no stdout redirect): runs the
-# program (its output goes to the terminal) and reports 0 captured bytes.
-fn exec_capture(args, buf, buflen): i64 {
+# Capture variant with the exit status — capture itself is unsupported on agnos (no
+# stdout redirect), so it runs the program (output goes to the terminal), reports 0
+# captured bytes, and stores the exit code in status_out[0] (-1 when nothing ran;
+# status_out[1] = 0). A caller that requires output therefore sees NONE and must treat
+# that as a failure, not as "the tool had nothing to say". CHANGELOG [6.6.7]
+fn exec_capture_status(args, buf, buflen, status_out): i64 {
+    store64(status_out, 0 - 1);
+    store64(status_out + 8, 0);
     var argc = vec_len(args);
     if (argc < 1) { return 0 - 1; }
     var pid = _agnos_spawn_path(vec_get(args, 0));
     if (pid < 0) { return 0 - 1; }
-    sys_waitpid(pid);
+    store64(status_out, sys_waitpid(pid));
     return 0;                       # capture unsupported on agnos
+}
+
+# Capture variant — unsupported on agnos (no stdout redirect): runs the
+# program (its output goes to the terminal) and reports 0 captured bytes.
+fn exec_capture(args, buf, buflen): i64 {
+    var _st[16];
+    return exec_capture_status(args, buf, buflen, &_st);
 }
 
 # Run with an env block — agnos can't pass envp, so identical to exec_vec.

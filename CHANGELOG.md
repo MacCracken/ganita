@@ -4,6 +4,45 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.7] — 2026-09-27 — `pow` follows the C99 Annex F table
+
+Toolchain **6.6.4 → 6.6.7** (the vendored `lib/` is the full 6.6.7 snapshot). No
+public signature changed. **521 assertions** (was 491).
+
+### Fixed — `ganita_f64_pow` (and `f64_pow`, `ganita_f32_pow`) on infinities, NaN and ±0
+
+`pow` returned NaN for every infinite base or exponent that missed the integral fast
+path, and the NaN check ran ahead of the `pow(1, y) = 1` rule. Silently: a defined
+IEEE-754 result replaced by NaN, no diagnostic. Found by the cyrius 6.6.8 audit
+(filed there as `audit:ganita-pow-infinity-and-nan-semantics`).
+
+| call | before | C99 Annex F |
+|---|---|---|
+| `pow(+inf, 0.5)`, `pow(-inf, 0.5)` | NaN | +inf |
+| `pow(2, +inf)`, `pow(0.5, -inf)` | NaN | +inf |
+| `pow(0.5, +inf)`, `pow(2, -inf)`, `pow(inf, -0.5)` | NaN | +0 |
+| `pow(1, NaN)`, `pow(1, ±inf)`, `pow(-1, ±inf)` | NaN | 1 |
+| `pow(-0, 3)` / `pow(-0, -3)` | +0 / +inf | -0 / -inf |
+
+`ganita_f64_pow` now answers the whole table explicitly before the `exp(y·ln x)`
+path: `pow(x, ±0) = 1` and `pow(+1, y) = 1` for every x and y (NaN included), then
+NaN, then a zero base (its sign survives an odd integral exponent), an infinite
+exponent (only `|x|` against 1 matters), and an infinite base (the sign of `y` picks
+inf or 0; an odd integral `y` keeps `-inf`'s sign). The 1.1.4 comment that called
+the `-0` rows untestable was wrong: a bit-pattern literal always produced `-0`.
+
+On aarch64, `pow(2, 1100)` returned **-1.5e-285** and `pow(2, -1100)` -2^948: past
+the integral path's 1024 bound the general path calls `f64_exp`, whose aarch64
+polyfill wrapped the `2^n` exponent into the sign bit. That half is fixed in the
+toolchain (cyrius 6.6.8's fdlibm `exp`/`ln`); the rows here pin it on x86, and
+cyrius's `tests/tcyr/crossos/f64_pow_domain.tcyr` pins it on the ARM hosts.
+
+### Changed
+
+- Two stale comments said the stdlib's `f64_exp` returns NaN for an infinite
+  argument (sinh, `ganita_f32_exp`). It has not since cyrius 6.6.1; the guards stay,
+  the comments now say why.
+
 ## [1.2.6] — 2026-09-16 — a correctly rounded cube root, and the backlog closed
 
 Closes both open filings. tanmatra's filing asked for an f64 cube root. The 1.2.3

@@ -1540,6 +1540,7 @@ fn tls_native_set_verify(ctx, mode): i64 {
 # (.78: was a single root; now a set so system bundles + multi-root PEM work.)
 var TLS_CA_MAX_ROOTS = 300;
 
+# Install the trust-root set from a PEM (or DER, is_der != 0) bundle — see the block above.
 fn tls_native_set_ca_bundle(ctx, pem_bundle, bundle_len, is_der): i64 {
     if (ctx == 0) { return TLS_ERR_INVALID_PARAM; }
     if (pem_bundle == 0) { return TLS_ERR_INVALID_PARAM; }
@@ -1607,6 +1608,7 @@ fn tls_native_set_ca_bundle(ctx, pem_bundle, bundle_len, is_der): i64 {
 var _tn_ca_buf = 0;      # cached bundle bytes
 var _tn_ca_len = 0;      # 0 = not loaded · >0 = bytes · -1 = looked, none readable
 
+# Install the platform's system CA bundle (cached per process) — see the block above.
 fn tls_native_set_ca_system(ctx): i64 {
     if (ctx == 0) { return TLS_ERR_INVALID_PARAM; }
     if (_tn_ca_len == (0 - 1)) { return TLS_ERR_IO; }

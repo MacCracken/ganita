@@ -200,7 +200,9 @@ fn async_accept(rt, listen_fd): i64 {
     return 0;
 }
 
-# recv task (agnos): a plain blocking read inline — no epoll. v6.4.39.
+# recv task (agnos): a plain blocking read inline — no epoll. v6.4.39. (A socket fd blocks
+# under the peer's recv deadline; a pipe/channel fd blocks on agnos 1.57.8+ — sys_read passes
+# a4 = 0 — and answers -2 "nothing yet" on an older kernel.)
 fn _async_recv_task(ctx): i64 {
     return sys_read(load64(ctx + 8), load64(ctx + 16), load64(ctx + 24));
 }
@@ -238,24 +240,26 @@ fn async_resolve(rt, ns_addr, ns_port, host): i64 {
 }
 
 # Sleep for `ms` milliseconds. AGNOS has a real sleep primitive (#41,
-# sys_sleep_ms — halts until the 100 Hz tick), so this is a faithful sleep,
-# not a stub. Guard ms<=0 (sys_sleep_ms caps at 1 h on the kernel side).
+# sys_sleep_ms — since agnos 1.57.7 it blocks only the caller in a kernel wait),
+# so this is a faithful sleep, not a stub. Guard ms<=0 (the kernel caps at 1 h).
 fn async_sleep_ms(ms): i64 {
     if (ms <= 0) { return 0; }
     sys_sleep_ms(ms);
     return 0;
 }
 
-# Non-blocking read on Linux; on agnos fds are blocking and there is no fcntl,
-# so this is a plain blocking read (the cooperative loop tolerates blocking on
-# the single-core model).
+# Non-blocking read on Linux; on agnos there is no fcntl, so this is sys_read, which BLOCKS:
+# sys_read passes a4 = 0, and agnos 1.57.8+ then waits on an empty pipe/channel until data or
+# EOF (the keyboard since 1.57.7). ⚠ A pre-1.57.8 kernel answers -2 (WOULD_BLOCK) for an
+# empty pipe/channel instead — "nothing yet", not EOF. (The cooperative loop tolerates
+# blocking on the single-core model.) CHANGELOG [6.6.7]
 fn async_read(fd, buf, len): i64 {
     return sys_read(fd, buf, len);
 }
 
 # Wait for `fd` to become readable. AGNOS has no epoll for arbitrary fds and
-# its reads block until data, so the subsequent read already blocks — this is a
-# no-op that returns immediately.
+# its reads block until data (agnos 1.57.8+, see async_read), so the subsequent read
+# already blocks — this is a no-op that returns immediately.
 fn async_await_readable(fd): i64 {
     return 0;
 }

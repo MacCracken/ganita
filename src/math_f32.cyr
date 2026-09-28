@@ -241,8 +241,8 @@ fn ganita_f32_sqrt(x): i64 { return f32_from(f64_sqrt(f32_to(x))); }
 # symmetry and the removal of per-call-site `f32_from(f64_x(f32_to(v)))` boilerplate from
 # every consumer, not new numerics.
 # e raised to x. exp(+inf) = +inf, exp(-inf) = 0, exp(NaN) = NaN.
-# stdlib's f64_exp returns NaN for an infinite argument, so the infinite cases
-# are handled here rather than forwarded. The fix belongs upstream.
+# The non-finite cases are answered here without widening: an f32 NaN keeps its
+# payload that way, and the answer does not depend on the f64 routine.
 fn ganita_f32_exp(x): i64 {
     if (_f32_is_nan(x) == 1) { return x & 0xFFFFFFFF; }
     if ((x & 0x7FFFFFFF) == 0x7F800000) {

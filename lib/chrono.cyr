@@ -11,6 +11,51 @@ include "lib/atomic.cyr"
 var CLOCK_REALTIME = 0;
 var CLOCK_MONOTONIC = 1;
 
+# Windows monotonic nanoseconds from QueryPerformanceCounter.
+#
+# ⛔ v6.6.5 — THE TWO ROUTES ARE SPELLED RAW HERE ON PURPOSE. The first cut of this bite
+# called `sys_qpc_ns()` from lib/syscalls_windows.cyr, which made chrono.cyr STOP BEING
+# SELF-SUFFICIENT: this file includes only atomic.cyr, every other clock arm in it is a
+# bare `syscall(...)` builtin, and a consumer whose `[deps] stdlib` lists "chrono" without
+# "syscalls" therefore stopped building for PE with `undefined function 'sys_qpc_ns'`.
+# Nothing in-repo caught it (every in-repo consumer pulls lib/syscalls.cyr) and the
+# vendoring closure cannot rescue it either — `_distlib_union_declared_stdlib` derives its
+# edges from literal `include "lib/X.cyr"` lines, and there is no chrono→syscalls edge to
+# derive. Pinned by tests/gates/toolchain/bench_timer_floor_measured.sh axis E, which
+# cross-builds a chrono-only consumer for PE. CHANGELOG [6.6.5].
+#
+# 0xF038 = 61496 → kernel32!QueryPerformanceCounter(LARGE_INTEGER*)
+# 0xF039 = 61497 → kernel32!QueryPerformanceFrequency(LARGE_INTEGER*)
+# Both return the Win32 BOOL and write a 64-bit count at the pointer argument.
+#
+# The ns conversion is SPLIT so it cannot overflow: a raw `count * 1e9` wraps i64 after
+# ~29 years of uptime at a 10 MHz counter. A non-positive frequency (impossible on any
+# supported Windows) falls back to GetTickCount64 × 1e6 — coarse beats wrong-scaled and
+# silent. Mirrors lib/syscalls_windows.cyr's sys_qpc_ns; the two are pinned to agree by
+# the same gate axis.
+var _chrono_qpf_hz = 0;
+#ifdef CYRIUS_TARGET_AGNOS
+var _chrono_agnos_ms40 = 0;   # 1 once #95 has answered < 0 — see clock_now_ns
+#endif
+fn _chrono_qpc_ns(): i64 {
+    #ifdef CYRIUS_TARGET_WIN
+    var c[16];
+    if (_chrono_qpf_hz == 0) {
+        store64(&c, 0);
+        syscall(61497, &c);                  # QueryPerformanceFrequency(&hz)
+        _chrono_qpf_hz = load64(&c);
+    }
+    if (_chrono_qpf_hz <= 0) {
+        return syscall(228, 1, &c) * 1000000;    # GetTickCount64 ms -> ns
+    }
+    store64(&c, 0);
+    syscall(61496, &c);                      # QueryPerformanceCounter(&count)
+    var t = load64(&c);
+    return (t / _chrono_qpf_hz) * 1000000000 + ((t % _chrono_qpf_hz) * 1000000000) / _chrono_qpf_hz;
+    #endif
+    return 0;
+}
+
 # Get current time in nanoseconds (monotonic clock).
 #
 # ⛔ v6.6.1 — AGNOS NOW READS #95 (uptime_us, rdtsc), NOT #40 (uptime_ms, timer_ticks).
@@ -28,26 +73,52 @@ var CLOCK_MONOTONIC = 1;
 #
 # v6.2.6 bound it to #40 and that was correct WHEN WRITTEN — #95 did not exist yet.
 # Resolution improves as a side effect: µs rather than the 10 ms tick.
+#
+# ⛔ #95 ANSWERS -1 WHEN TSC CALIBRATION WAS REFUSED, and that is PERMANENT for the boot (and
+# ALWAYS under mirshi, which does not emulate #95). Multiplying the sentinel gave -1000 ns and
+# clock_now_ms truncated it to exactly 0 — a clock that stood still, so every
+# `while (clock_now_ms() - t0 < N)` wait on such a boot spun forever. So: #95 first, and on
+# the first negative answer LATCH to #40 (since agnos 1.57.7 #40 rides the calibrated TSC and
+# on a refused boot it is ticks x10, degraded but advancing). The latch, not a per-call retry:
+# one ENOSYS line under mirshi instead of one per read, one syscall per read instead of two,
+# and it cannot jump BACKWARDS from ms-since-boot to µs-since-calibration on a TSC_SELFTEST
+# kernel where #95 can turn valid mid-run. An idempotent scalar every thread computes the
+# same way, like _chrono_qpf_hz above. ⚠ On agnos <= 1.57.6 a foreground program on a
+# refused boot has NO working clock at all (#40 is frozen at IF=0). CHANGELOG [6.6.7]
 fn clock_now_ns(): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
-    return sys_uptime_us() * 1000;
+    if (_chrono_agnos_ms40 == 0) {
+        var us = sys_uptime_us();
+        if (us >= 0) { return us * 1000; }
+        _chrono_agnos_ms40 = 1;
+    }
+    return sys_uptime_ms() * 1000000;
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
     var ts[16];
     #ifdef CYRIUS_TARGET_MACOS
     # v6.2.13 (issue 2026-06-16): the **arm64** Mach-O backend routes syscall(228)
     # to libSystem `_clock_gettime_nsec_np(clock_id)`, which RETURNS the ns count
-    # in the return register — it does NOT fill the `&ts` timespec — and Darwin's
-    # CLOCK_MONOTONIC is **6**, not Linux's 1. So take the return value (ns) with
-    # the Darwin id; `&ts` is just the 3rd-arg placeholder the route expects.
+    # in the return register — it does NOT fill the `&ts` timespec. So take the
+    # return value (ns) with the Darwin id; `&ts` is just the 3rd-arg placeholder
+    # the route expects.
     # (x86-macOS does not route 228 → clock stays dead there; that arch is HELD.)
-    return syscall(228, 6, &ts);
+    #
+    # ⚠ v6.6.5: id **4** (CLOCK_MONOTONIC_RAW → mach_continuous_time), not 6. Darwin's
+    # CLOCK_MONOTONIC (6) is `gettimeofday - boottime` in Apple's Libc
+    # (gen/clock_gettime.c) and its `clock_getres` is NSEC_PER_USEC — MICROSECOND
+    # resolution, which is the 1,000 ns tick measured on ecb and ach. lib/sakshi.cyr and
+    # src/backend/common/runtime.cyr `_prof_clock_ns` already passed 4. CHANGELOG [6.6.5].
+    return syscall(228, 4, &ts);
     #endif
     #ifdef CYRIUS_TARGET_WIN
-    # v6.2.13: on Windows syscall(228) routes to kernel32!GetTickCount64, which
-    # RETURNS ms since boot in the return register (not `&ts`). ×1e6 = ns. This is
-    # the monotonic source (uptime; never wraps in practice).
-    return syscall(228, CLOCK_MONOTONIC, &ts) * 1000000;
+    # v6.6.5: QueryPerformanceCounter (PE reroutes 0xF038/0xF039), ~100 ns tick.
+    # v6.2.13 bound this to syscall(228) → kernel32!GetTickCount64, whose counter
+    # advances in **15 ms** steps — so every duration under 15 ms measured as 0 or as
+    # one whole tick, on every cyrius program on Windows. QPC is the monotonic source
+    # (since system start; never wraps in practice). Spelled raw in `_chrono_qpc_ns`
+    # above so this module stays self-sufficient — see the note there.
+    return _chrono_qpc_ns();
     #endif
     #ifndef CYRIUS_TARGET_MACOS
     #ifndef CYRIUS_TARGET_WIN

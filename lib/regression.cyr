@@ -165,12 +165,201 @@ fn regression_file_contains_substr(path, substr): i64 {
 
 # ── Process: pipe-source-to-binary ──────────────────────────
 
+#ifndef CYRIUS_TARGET_AGNOS
+# ⛔ v6.6.6 — EVERY CHILD THIS MODULE SPAWNS IS BOUNDED, AND NONE OUTLIVES ITS PARENT.
+#
+# Every fork+exec verb below waited with a BLOCKING `sys_waitpid(pid, &st, 0)` and no
+# deadline, and set no death signal. So ONE hung child hung the caller for ever —
+# measured in the 6.6.6 repair release: a single .tcyr wedged `check.sh` (the check
+# driver runs each test through `regression_exec_capture_status` -> `_exec_capture_clean`)
+# with no output and no way out but killing the run, which then REPARENTED the test to
+# PID 1 where it kept burning a core. That is exactly the defect
+# `tests/gates/toolchain/test_runner_bounded.sh` has pinned for the `cyrius test` runner
+# since v6.5.19; the check driver never got the same treatment.
+#
+# Two halves, and the second is the one a timeout alone cannot buy: a DEADLINE (poll
+# WNOHANG, then SIGKILL) and PR_SET_PDEATHSIG in the child so the KERNEL reaps it when
+# the parent dies — a SIGKILLed parent runs no cleanup, ever, so nothing parent-side can
+# reach the child. CHANGELOG [6.6.6]
+
+# Deadline in MILLISECONDS for a child this module spawns. `CYRIUS_CHECK_TIMEOUT` is in
+# SECONDS, mirroring `CYRIUS_TEST_TIMEOUT` for the `cyrius test` runner. Default 120 s:
+# three orders of magnitude above a .tcyr and well over an order above the slowest compile
+# in the suite, so it can only fire on something genuinely stuck. Set it to 0 to disable
+# the deadline (then a hang is a hang again — which is what this exists to stop).
+fn _regression_timeout_ms(): i64 {
+    var v = getenv("CYRIUS_CHECK_TIMEOUT");
+    if (v == 0) { return 120000; }
+    var s = atoi(v);
+    if (s < 0) { return 120000; }
+    return s * 1000;
+}
+
+# The LONG bound, for children whose runtime is not this process's business: ssh/scp
+# (network, minutes for a Windows self-host) and externally-driven gate scripts. BOUNDED
+# is the property, not "fast"; 900 s is the bound, and the whole of check.sh runs in ~13
+# minutes, so nothing legitimate is near it. `CYRIUS_CHECK_LONG_TIMEOUT` overrides, in
+# seconds.
+fn _regression_long_timeout_ms(): i64 {
+    var v = getenv("CYRIUS_CHECK_LONG_TIMEOUT");
+    if (v == 0) { return 900000; }
+    var s = atoi(v);
+    if (s < 0) { return 900000; }
+    return s * 1000;
+}
+
+# Called in the CHILD, between fork and execve. PR_SET_PDEATHSIG = 1, SIGKILL = 9; it
+# survives execve for a non-setuid binary, so the exec'd program inherits it. Linux only —
+# prctl is not a Darwin/BSD syscall and is not routed on PE. The getppid re-check closes
+# the race where the parent died between the fork and the prctl, in which case the death
+# signal has already been delivered to nobody and will never fire.
+fn _regression_child_guard(ppid_before): i64 {
+    #ifdef CYRIUS_TARGET_LINUX
+    sys_prctl(1, 9, 0, 0, 0);
+    if (syscall(SYS_GETPPID) != ppid_before) { sys_exit(1); }
+    #endif
+    return 0;
+}
+
+# ⛔ v6.6.6 — AND THE RUNNER ARMS ONE FOR ITSELF, which is the case the guard above cannot
+# reach. `_regression_child_guard` protects every child THIS module forks. Nothing
+# protected the check DRIVER, because this module does not fork it: `scripts/check.sh`
+# spawns `build/cyrius_check`, and a POSIX shell cannot set PR_SET_PDEATHSIG for a child it
+# is about to exec. So a SIGKILLed check.sh left the driver running — OBSERVED at PPID=1,
+# nine minutes old, still grinding through a suite nobody was watching.
+#
+# ⭐ WHY SELF-ARMING AND NOT A WATCHDOG. A watchdog is another process, and another process
+# can be SIGKILLed too — the failure mode is identical one level up, and the whole reason
+# this defect exists is that a SIGKILLed process runs no cleanup, ever. Self-arming asks
+# the KERNEL to deliver SIGKILL when this process's parent dies, however it dies; nothing
+# in user space has to survive for it to work. Same reasoning as the child guard, applied
+# to a process nobody forked on our behalf.
+#
+# ⚠ Residual, and it is inherent: if the parent is already gone before this runs, there is
+# no death to signal. The getppid re-check catches the parent dying DURING the call (the
+# signal was delivered to nobody and will never fire again, so exit now); it cannot catch a
+# parent that died before the first getppid. The window is a few instructions at startup.
+# Linux only — prctl is not a Darwin/BSD syscall and is not routed on PE. CHANGELOG [6.6.6]
+fn _regression_die_with_parent(): i64 {
+    #ifdef CYRIUS_TARGET_LINUX
+    var ppid0 = syscall(SYS_GETPPID);
+    sys_prctl(1, 9, 0, 0, 0);
+    if (syscall(SYS_GETPPID) != ppid0) { sys_exit(1); }
+    #endif
+    return 0;
+}
+
+# Wait for `pid`, but not for ever. Returns 1 if the child was reaped normally (`stbuf` holds
+# its status), 0 if the deadline forced a SIGKILL, and -1 if waitpid failed before either —
+# then `stbuf` was NEVER WRITTEN and must not be decoded (a parent that inherited
+# SIGCHLD = SIG_IGN has its children auto-reaped, and waitpid fails ECHILD). The twin of
+# lib/process.cyr's `_proc_wait_deadline`. CHANGELOG [6.6.7]
+# A waitpid error in the timed loop still KILLS before returning: a bare return there is an
+# ABANDONMENT path, the very thing a deadline exists to prevent — the correction
+# cbt/build.cyr's `run_binary_timed` took at v6.5.51 after it was measured leaking children
+# under load.
+fn _regression_wait_deadline(pid, stbuf, timeout_ms): i64 {
+    if (timeout_ms <= 0) {
+        var bw = sys_waitpid(pid, stbuf, 0);
+        while (bw == 0 - 4) { bw = sys_waitpid(pid, stbuf, 0); }   # EINTR
+        if (bw == pid) { return 1; }
+        return 0 - 1;
+    }
+    var waited = 0;
+    var slice = 1;
+    while (waited < timeout_ms) {
+        var w = sys_waitpid(pid, stbuf, 1);
+        if (w == pid) { return 1; }
+        if (w < 0) { sys_kill(pid, 9); sys_waitpid(pid, stbuf, 0); return 0 - 1; }
+        syscall(7, 0, 0, slice);
+        waited = waited + slice;
+        if (waited >= 50) { slice = 10; }
+        if (waited >= 2000) { slice = 50; }
+    }
+    sys_kill(pid, 9);
+    sys_waitpid(pid, stbuf, 0);
+    return 0;
+}
+
+# ⛔ v6.6.6 — THE PIPE, NOT ONLY THE WAIT. `_regression_wait_deadline` bounds the WAIT; the
+# verbs below reach it only AFTER they have finished pumping the child's pipe, and those
+# pumps were unbounded `while` loops. A child that holds its end open and neither reads nor
+# writes therefore blocked the runner BEFORE the deadline could run — the write side on the
+# ~1 MB `src/main.cyr` pipes as soon as the 64 KB pipe buffer fills, the read side for ever.
+# Found by the review of bite 8c, which is why this landed a commit later than the wait.
+#
+# Both helpers take the deadline as an IDLE one: no progress for `timeout_ms` and they give
+# up, leaving the caller's bounded wait to kill the child. That is the right shape here —
+# a compiler still emitting bytes is working, and the total is bounded anyway because the
+# read side stops at `cap` and the write side at `n`. `timeout_ms <= 0` is the historical
+# unbounded pump. CHANGELOG [6.6.6]
+
+# poll(2) one fd. `events` is POLLIN (1) or POLLOUT (4). >0 ready (POLLHUP/POLLERR come back
+# whether or not you asked, which is what ends a drain when the child exits), 0 timed out,
+# <0 syscall error. syscall 7 is translated by the backend (Darwin poll, aarch64 ppoll).
+fn _regression_poll_fd(fd, events, timeout_ms): i64 {
+    var pfd[8];
+    store32(&pfd,     fd);
+    store16(&pfd + 4, events);
+    store16(&pfd + 6, 0);
+    return syscall(7, &pfd, 1, timeout_ms);
+}
+
+# Write all `n` bytes of `buf` to `fd`, waiting at most `timeout_ms` for the child to make
+# room each time. Returns the bytes actually written — short means the child stopped
+# draining (the caller then closes the fd and its bounded wait deals with the child).
+#
+# ⚠ THE CHUNK IS THE WHOLE TRICK, AND THE FIRST CUT OF THIS FUNCTION DID NOT HAVE IT — it
+# polled and then wrote all `n` remaining bytes, which STILL BLOCKS FOR EVER: a blocking
+# write of more than the pipe can hold does not come back with a short count, it waits until
+# the whole thing is delivered. POLLOUT on a pipe promises only PIPE_BUF (4096) bytes of
+# room, so after a ready poll a chunk of at most 4096 cannot block — and a 1 MB write after
+# the same ready poll blocks on byte 65537. Axis 2d of
+# tests/gates/toolchain/check_driver_bounded.sh caught exactly that and is the reason the
+# axis exists. The unbounded path (`timeout_ms <= 0`) keeps writing in one go, as before.
+fn regression_pipe_write_all(fd, buf, n, timeout_ms): i64 {
+    var written = 0;
+    var chunk_cap = n;
+    if (timeout_ms > 0) { chunk_cap = 4096; }   # PIPE_BUF — what POLLOUT actually promises
+    while (written < n) {
+        if (timeout_ms > 0) {
+            if (_regression_poll_fd(fd, 4, timeout_ms) <= 0) { return written; }
+        }
+        var chunk = n - written;
+        if (chunk > chunk_cap) { chunk = chunk_cap; }
+        var w = sys_write(fd, buf + written, chunk);
+        if (w <= 0) { return written; }
+        written = written + w;
+    }
+    return written;
+}
+
+# Drain `fd` into `buf` (at most `cap`), waiting at most `timeout_ms` for each next chunk.
+# Returns the bytes read.
+fn regression_pipe_read_all(fd, buf, cap, timeout_ms): i64 {
+    var total = 0;
+    var rgo = 1;
+    while (rgo == 1) {
+        if (timeout_ms > 0) {
+            if (_regression_poll_fd(fd, 1, timeout_ms) <= 0) { rgo = 0; }
+        }
+        if (rgo == 1) {
+            var n = sys_read(fd, buf + total, cap - total);
+            if (n <= 0) { rgo = 0; }
+            else {
+                total = total + n;
+                if (total >= cap) { rgo = 0; }
+            }
+        }
+    }
+    return total;
+}
+
 # Pipe `src_path`'s bytes to `bin_path`'s stdin. Captures stdout
 # to `out_path` (pass 0 for /dev/null) and discards stderr.
 # Returns WEXITSTATUS or 128+sig on signal; -1 on syscall
 # failure. Fork+exec with explicit envp (caller supplies; pass
 # `0`-terminated array for empty env).
-#ifndef CYRIUS_TARGET_AGNOS
 fn regression_pipe_to_bin_capture(bin_path, src_path, out_path, envp): i64 {
     var src_cap = 1048576;
     var src_buf = alloc(src_cap);
@@ -191,12 +380,14 @@ fn regression_pipe_to_bin_capture(bin_path, src_path, out_path, envp): i64 {
     var rfd = load32(&pipefd);
     var wfd = load32(&pipefd + 4);
 
+    var _rg_ppid = sys_getpid();
     var pid = sys_fork();
     if (pid < 0) {
         sys_close(rfd); sys_close(wfd); sys_close(out_fd);
         return 0 - 1;
     }
     if (pid == 0) {
+        _regression_child_guard(_rg_ppid);
         sys_close(wfd);
         sys_dup2(rfd, 0);
         sys_close(rfd);
@@ -212,15 +403,16 @@ fn regression_pipe_to_bin_capture(bin_path, src_path, out_path, envp): i64 {
     }
     sys_close(rfd);
     sys_close(out_fd);
-    var written = 0;
-    while (written < src_n) {
-        var w = sys_write(wfd, src_buf + written, src_n - written);
-        if (w <= 0) { written = src_n; }
-        else { written = written + w; }
-    }
+    regression_pipe_write_all(wfd, src_buf, src_n, _regression_timeout_ms());
     sys_close(wfd);
     var stbuf[4];
-    sys_waitpid(pid, &stbuf, 0);
+    # v6.6.6: -2 is the module's documented TIMEOUT code (see the calling conventions at
+    # the top). Without this the deadline's SIGKILL is indistinguishable from a genuine
+    # one — both read 137 — and "the test crashed" is a very different report from "the
+    # test never finished".
+    var reaped = _regression_wait_deadline(pid, &stbuf, _regression_timeout_ms());
+    if (reaped == 0) { return 0 - 2; }
+    if (reaped < 0) { return 0 - 1; }   # never observed: no status to decode
     var status = load32(&stbuf);
     if (WIFEXITED(status) == 1) { return WEXITSTATUS(status); }
     if (WIFSIGNALED(status) == 1) { return 128 + WTERMSIG(status); }
@@ -246,9 +438,11 @@ fn regression_pipe_to_bin(bin_path, src_path, envp): i64 {
 #   -1         fork/exec failure
 #   -2         timeout (child SIGKILL'd)
 fn regression_run_with_timeout(bin_path, timeout_ms, envp): i64 {
+    var _rg_ppid = sys_getpid();
     var pid = sys_fork();
     if (pid < 0) { return 0 - 1; }
     if (pid == 0) {
+        _regression_child_guard(_rg_ppid);
         var dn0 = sys_open("/dev/null", 0, 0);
         if (dn0 >= 0) { sys_dup2(dn0, 0); sys_close(dn0); }
         var dn1 = sys_open("/dev/null", 1, 0);
@@ -281,6 +475,23 @@ fn regression_run_with_timeout(bin_path, timeout_ms, envp): i64 {
 
 # ── Process: exec + capture ───────────────
 
+# Decode a `_regression_wait_deadline` outcome into `status_out`'s two slots: [0] exit code
+# · 128+sig · -2 the DEADLINE (v6.6.6: not the 137 its own SIGKILL produces — "it never
+# finished" is not "it crashed") · -1 not observed (6.6.7: waitpid never reaped the child, so
+# `st` is not a status and is NOT decoded); [1] = 1 iff a signal killed it. CHANGELOG [6.6.7]
+fn _regression_store_status(status_out, reaped, st): i64 {
+    var code = 0 - 1;
+    var sig = 0;
+    if (reaped == 1) {
+        if (WIFEXITED(st) == 1) { code = WEXITSTATUS(st); }
+        if (WIFSIGNALED(st) == 1) { code = 128 + WTERMSIG(st); sig = 1; }
+    }
+    if (reaped == 0) { code = 0 - 2; }
+    store64(status_out, code);
+    store64(status_out + 8, sig);
+    return 0;
+}
+
 # Run `bin_path` (no args), capture stdout into `buf[0..buflen)`,
 # discard stderr. Returns bytes captured (>= 0) or 0 on
 # fork/open failure. envp threaded through.
@@ -293,10 +504,13 @@ fn regression_run_with_timeout(bin_path, timeout_ms, envp): i64 {
 # CO-02: the check.sh tcyr gate waited but never read status, so a tcyr that
 # crashed before its summary, or exited nonzero after "0 failed", was recorded
 # as PASS. `regression_exec_capture` keeps its bytes-only public contract below.
+# [0] is also -2 when the deadline killed the child and -1 when its end was never observed
+# (`_regression_store_status`; 6.6.7).
 fn regression_exec_capture_status(bin_path, buf, buflen, envp, status_out): i64 {
     var out_path = _regression_tmp_path("audit_xc_");
     var out_fd = sys_open(out_path, 577, 420);
     if (out_fd < 0) { store64(status_out, 0 - 1); store64(status_out + 8, 0); return 0; }
+    var _rg_ppid = sys_getpid();
     var pid = sys_fork();
     if (pid < 0) {
         sys_close(out_fd); sys_unlink(out_path);
@@ -304,6 +518,7 @@ fn regression_exec_capture_status(bin_path, buf, buflen, envp, status_out): i64 
         return 0;
     }
     if (pid == 0) {
+        _regression_child_guard(_rg_ppid);
         sys_dup2(out_fd, 1);
         sys_close(out_fd);
         var dn_r = sys_open("/dev/null", 0, 0);
@@ -318,14 +533,8 @@ fn regression_exec_capture_status(bin_path, buf, buflen, envp, status_out): i64 
     }
     sys_close(out_fd);
     var stbuf[4];
-    sys_waitpid(pid, &stbuf, 0);
-    var status = load32(&stbuf);
-    var code = 0 - 1;
-    var sig = 0;
-    if (WIFEXITED(status) == 1) { code = WEXITSTATUS(status); }
-    if (WIFSIGNALED(status) == 1) { code = 128 + WTERMSIG(status); sig = 1; }
-    store64(status_out, code);
-    store64(status_out + 8, sig);
+    var reaped = _regression_wait_deadline(pid, &stbuf, _regression_timeout_ms());
+    _regression_store_status(status_out, reaped, load32(&stbuf));
     var total = file_read_all(out_path, buf, buflen);
     sys_unlink(out_path);
     if (total < 0) { return 0; }
@@ -343,9 +552,11 @@ fn regression_exec_capture(bin_path, buf, buflen, envp): i64 {
 # Run `bin_path` (no args), discard stdout + stderr. Returns
 # WEXITSTATUS or 128+sig.
 fn regression_exec_run(bin_path, envp): i64 {
+    var _rg_ppid = sys_getpid();
     var pid = sys_fork();
     if (pid < 0) { return 0 - 1; }
     if (pid == 0) {
+        _regression_child_guard(_rg_ppid);
         var dn0 = sys_open("/dev/null", 0, 0);
         if (dn0 >= 0) { sys_dup2(dn0, 0); sys_close(dn0); }
         var dn1 = sys_open("/dev/null", 1, 0);
@@ -359,7 +570,13 @@ fn regression_exec_run(bin_path, envp): i64 {
         sys_exit(127);
     }
     var stbuf[4];
-    sys_waitpid(pid, &stbuf, 0);
+    # v6.6.6: -2 is the module's documented TIMEOUT code (see the calling conventions at
+    # the top). Without this the deadline's SIGKILL is indistinguishable from a genuine
+    # one — both read 137 — and "the test crashed" is a very different report from "the
+    # test never finished".
+    var reaped = _regression_wait_deadline(pid, &stbuf, _regression_timeout_ms());
+    if (reaped == 0) { return 0 - 2; }
+    if (reaped < 0) { return 0 - 1; }   # never observed: no status to decode
     var status = load32(&stbuf);
     if (WIFEXITED(status) == 1) { return WEXITSTATUS(status); }
     if (WIFSIGNALED(status) == 1) { return 128 + WTERMSIG(status); }
@@ -372,9 +589,11 @@ fn regression_exec_with_arg_capture(bin_path, arg, buf, buflen, envp): i64 {
     var out_path = _regression_tmp_path("audit_xa_");
     var out_fd = sys_open(out_path, 577, 420);
     if (out_fd < 0) { return 0; }
+    var _rg_ppid = sys_getpid();
     var pid = sys_fork();
     if (pid < 0) { sys_close(out_fd); sys_unlink(out_path); return 0; }
     if (pid == 0) {
+        _regression_child_guard(_rg_ppid);
         sys_dup2(out_fd, 1);
         sys_close(out_fd);
         var dn_r = sys_open("/dev/null", 0, 0);
@@ -390,7 +609,7 @@ fn regression_exec_with_arg_capture(bin_path, arg, buf, buflen, envp): i64 {
     }
     sys_close(out_fd);
     var stbuf[4];
-    sys_waitpid(pid, &stbuf, 0);
+    _regression_wait_deadline(pid, &stbuf, _regression_timeout_ms());
     var total = file_read_all(out_path, buf, buflen);
     sys_unlink(out_path);
     if (total < 0) { return 0; }
@@ -400,14 +619,30 @@ fn regression_exec_with_arg_capture(bin_path, arg, buf, buflen, envp): i64 {
 # Variant of `regression_exec_with_arg_capture` that captures
 # BOTH stdout and stderr into the same buffer. Used when the
 # tool emits diagnostics to stderr but the gate wants to scan
-# them (e.g. cyrlint warnings).
+# them (e.g. cyrlint warnings). The exit status is DISCARDED — a gate that
+# counts markers in the output uses the `_status` form, so the count and the
+# "it finished" verdict come from the SAME run.
 fn regression_exec_with_arg_capture_both(bin_path, arg, buf, buflen, envp): i64 {
+    var st[16];
+    return regression_exec_with_arg_capture_both_status(bin_path, arg, buf, buflen, envp, &st);
+}
+
+# `regression_exec_with_arg_capture_both` that also REPORTS HOW THE CHILD ENDED, in
+# `status_out`'s two slots (`_regression_store_status`; -1 also when nothing could be
+# spawned). ⛔ 6.6.7: the check driver's cyrlint fixture gates verified one run and counted
+# markers in a SECOND, unchecked one — a second run that crashed or was cut at the deadline
+# produced no markers, and the "marker ABSENT" rows passed on it. CHANGELOG [6.6.7]
+fn regression_exec_with_arg_capture_both_status(bin_path, arg, buf, buflen, envp, status_out): i64 {
+    store64(status_out, 0 - 1);
+    store64(status_out + 8, 0);
     var out_path = _regression_tmp_path("audit_xa_");
     var out_fd = sys_open(out_path, 577, 420);
     if (out_fd < 0) { return 0; }
+    var _rg_ppid = sys_getpid();
     var pid = sys_fork();
     if (pid < 0) { sys_close(out_fd); sys_unlink(out_path); return 0; }
     if (pid == 0) {
+        _regression_child_guard(_rg_ppid);
         sys_dup2(out_fd, 1);
         sys_dup2(out_fd, 2);
         sys_close(out_fd);
@@ -422,7 +657,8 @@ fn regression_exec_with_arg_capture_both(bin_path, arg, buf, buflen, envp): i64 
     }
     sys_close(out_fd);
     var stbuf[4];
-    sys_waitpid(pid, &stbuf, 0);
+    var reaped = _regression_wait_deadline(pid, &stbuf, _regression_timeout_ms());
+    _regression_store_status(status_out, reaped, load32(&stbuf));
     var total = file_read_all(out_path, buf, buflen);
     sys_unlink(out_path);
     if (total < 0) { return 0; }
@@ -492,9 +728,11 @@ fn regression_ssh_target(env_name, default_name): i64 {
 # `echo alive` works on Linux + macOS + Windows-PowerShell.
 #ifndef CYRIUS_TARGET_AGNOS
 fn regression_ssh_skip_check(target): i64 {
+    var _rg_ppid = sys_getpid();
     var pid = sys_fork();
     if (pid < 0) { return 0; }
     if (pid == 0) {
+        _regression_child_guard(_rg_ppid);
         var dn0 = sys_open("/dev/null", 0, 0);
         if (dn0 >= 0) { sys_dup2(dn0, 0); sys_close(dn0); }
         var dn1 = sys_open("/dev/null", 1, 0);
@@ -517,7 +755,7 @@ fn regression_ssh_skip_check(target): i64 {
         sys_exit(127);
     }
     var stbuf[4];
-    sys_waitpid(pid, &stbuf, 0);
+    _regression_wait_deadline(pid, &stbuf, _regression_long_timeout_ms());
     var status = load32(&stbuf);
     if (WIFEXITED(status) == 1) {
         if (WEXITSTATUS(status) == 0) { return 1; }
@@ -531,9 +769,11 @@ fn regression_ssh_skip_check(target): i64 {
 # `-q` for quiet (suppresses progress meter on stderr).
 fn regression_scp_to(target, local_path, remote_path, envp): i64 {
     var dest = _regression_join3(target, ":", remote_path);
+    var _rg_ppid = sys_getpid();
     var pid = sys_fork();
     if (pid < 0) { return 0 - 1; }
     if (pid == 0) {
+        _regression_child_guard(_rg_ppid);
         var dn = sys_open("/dev/null", 1, 0);
         if (dn >= 0) { sys_dup2(dn, 1); sys_close(dn); }
         var argv[48];   # N BYTES (CLAUDE.md buffer contract): 5 ptrs = 40 B
@@ -547,7 +787,7 @@ fn regression_scp_to(target, local_path, remote_path, envp): i64 {
         sys_exit(127);
     }
     var stbuf[4];
-    sys_waitpid(pid, &stbuf, 0);
+    _regression_wait_deadline(pid, &stbuf, _regression_long_timeout_ms());
     var status = load32(&stbuf);
     if (WIFEXITED(status) == 1) { return WEXITSTATUS(status); }
     return 0 - 1;
@@ -558,9 +798,11 @@ fn regression_scp_to(target, local_path, remote_path, envp): i64 {
 # failure). Used by SSH-cluster gates that only care about the
 # exit code.
 fn regression_ssh_remote_exit(target, command, envp): i64 {
+    var _rg_ppid = sys_getpid();
     var pid = sys_fork();
     if (pid < 0) { return 0 - 1; }
     if (pid == 0) {
+        _regression_child_guard(_rg_ppid);
         var dn0 = sys_open("/dev/null", 0, 0);
         if (dn0 >= 0) { sys_dup2(dn0, 0); sys_close(dn0); }
         var dn1 = sys_open("/dev/null", 1, 0);
@@ -577,7 +819,7 @@ fn regression_ssh_remote_exit(target, command, envp): i64 {
         sys_exit(127);
     }
     var stbuf[4];
-    sys_waitpid(pid, &stbuf, 0);
+    _regression_wait_deadline(pid, &stbuf, _regression_long_timeout_ms());
     var status = load32(&stbuf);
     if (WIFEXITED(status) == 1) { return WEXITSTATUS(status); }
     return 0 - 1;
@@ -589,9 +831,11 @@ fn regression_ssh_remote_exit(target, command, envp): i64 {
 fn regression_ssh_remote_exec_capture(target, command, out_path, envp): i64 {
     var out_fd = sys_open(out_path, 577, 420);
     if (out_fd < 0) { return 0 - 1; }
+    var _rg_ppid = sys_getpid();
     var pid = sys_fork();
     if (pid < 0) { sys_close(out_fd); return 0 - 1; }
     if (pid == 0) {
+        _regression_child_guard(_rg_ppid);
         var dn0 = sys_open("/dev/null", 0, 0);
         if (dn0 >= 0) { sys_dup2(dn0, 0); sys_close(dn0); }
         sys_dup2(out_fd, 1);
@@ -609,7 +853,7 @@ fn regression_ssh_remote_exec_capture(target, command, out_path, envp): i64 {
     }
     sys_close(out_fd);
     var stbuf[4];
-    sys_waitpid(pid, &stbuf, 0);
+    _regression_wait_deadline(pid, &stbuf, _regression_long_timeout_ms());
     var status = load32(&stbuf);
     if (WIFEXITED(status) == 1) { return WEXITSTATUS(status); }
     return 0 - 1;
@@ -646,9 +890,11 @@ fn regression_exec_in_dir3(work_dir, bin_path, arg1, arg2, arg3, out_path, envp)
         out_fd = sys_open(out_path, 577, 420);
     }
     if (out_fd < 0) { return 0 - 1; }
+    var _rg_ppid = sys_getpid();
     var pid = sys_fork();
     if (pid < 0) { sys_close(out_fd); return 0 - 1; }
     if (pid == 0) {
+        _regression_child_guard(_rg_ppid);
         var dn0 = sys_open("/dev/null", 0, 0);
         if (dn0 >= 0) { sys_dup2(dn0, 0); sys_close(dn0); }
         sys_dup2(out_fd, 1);
@@ -668,7 +914,7 @@ fn regression_exec_in_dir3(work_dir, bin_path, arg1, arg2, arg3, out_path, envp)
     }
     sys_close(out_fd);
     var stbuf[4];
-    sys_waitpid(pid, &stbuf, 0);
+    _regression_wait_deadline(pid, &stbuf, _regression_timeout_ms());
     var status = load32(&stbuf);
     if (WIFEXITED(status) == 1) { return WEXITSTATUS(status); }
     return 0 - 1;

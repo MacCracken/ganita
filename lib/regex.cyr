@@ -20,6 +20,7 @@
 # and fuzz/.
 private
 
+# Match C string `text` against glob `pattern` (`*` any run, `?` any one byte); 1 or 0.
 public fn glob_match(pattern, text): i64 {
     var pi = 0;
     var ti = 0;

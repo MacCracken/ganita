@@ -94,8 +94,10 @@ Deliberately not in ganita, so that nobody adds them by accident:
 
 ## Moving the cyrius pin to 6.6.6
 
-**Current pin: `cyrius = "6.6.4"`.** Nothing must change first in ganita's own source —
-but the bump is **not** a one-line edit here, see *Verify* below.
+**Done at 1.2.7 — the pin moved straight to `cyrius = "6.6.7"`** (the sequence below,
+followed as written: `lib/` re-vendored to the 111-file 6.6.7 snapshot, `dist/`
+regenerated). The notes are kept for the next bump. Nothing had to change first in
+ganita's own source — but the bump is **not** a one-line edit here, see *Verify* below.
 
 **What was checked** (7 `.cyr` under `src/`; vendored `lib/` excluded):
 

@@ -41,6 +41,164 @@ include "lib/process_agnos.cyr"
 #ifndef CYRIUS_TARGET_WIN
 #ifndef CYRIUS_TARGET_AGNOS
 
+# ⛔ v6.6.6 — NO CHILD THIS MODULE SPAWNS OUTLIVES ITS PARENT, AND EVERY CHILD IT WAITS
+# FOR CAN BE BOUNDED.
+#
+# Every verb below was fork + execve + BLOCKING `sys_waitpid(pid, &st, 0)` — with, in the
+# capturing ones, an equally unbounded `sys_read` loop on the child's pipe IN FRONT of the
+# wait — and none of them set a death signal. So one hung child hung the caller for ever,
+# and killing the caller REPARENTED that child to PID 1, where it kept burning a core.
+# MEASURED in the 6.6.6 repair release against `exec_capture` on a spinning fixture: the
+# parent was still blocked after 6 s, and SIGKILLing it left the child alive at PPID=1.
+#
+# This is the same defect `lib/regression.cyr` was fixed for in this release, and it reaches
+# THIS module through the SAME runner: `programs/checks/main.cyr` includes process.cyr, and
+# three of its gates shell out through here (cyrfmt once per fixture, cyrdoc over all of
+# `lib/`, and a `/bin/sh -c` qemu boot). Fixing one module told us nothing about the other —
+# which is why the census in `tests/gates/toolchain/check_driver_bounded.sh` now DERIVES the
+# files it reads from the driver's own `include` lines instead of naming them.
+#
+# TWO HALVES, and they are not interchangeable:
+#   * PR_SET_PDEATHSIG in the child — UNCONDITIONAL, because a SIGKILLed parent runs no
+#     cleanup, ever, so nothing parent-side can reach the child. The kernel has to do it.
+#   * a DEADLINE — OPT-IN, and OFF by default. This is the general-purpose process module,
+#     not a test runner: `lib/sigil.cyr` drives `cryptsetup luksFormat` / `veritysetup
+#     format` through `run_capture` and `cbt/deps.cyr` drives git through `exec_capture`, so
+#     a default timeout would kill legitimate long work. An embedder that wants a bound asks
+#     for one — `proc_set_timeout_ms(120000)` — which is what the check driver now does.
+#     0 keeps the historical behaviour exactly.
+# CHANGELOG [6.6.6]
+var _PROC_DEADLINE_MS = 0;
+
+# errno ETIMEDOUT. The Result-shaped verbs (`run`, `wait_pid`) report a deadline as
+# `Err(PROC_ETIMEDOUT)`; the i64-shaped `exec_*` verbs report it as `-2`, matching
+# lib/regression.cyr's documented timeout code. The byte-count CAPTURING verbs
+# (`exec_capture`, `exec_capture_str`, `run_capture`) cannot carry a status at all: they
+# return the bytes they did capture, so a crash, a refusal, a deadline kill and a clean run
+# with short output all look the same from the return value.
+# ⛔ "The caller checks the output" is NOT a substitute — the audit walkers did exactly that
+# (they parsed the tool's summary trailer) and read a MISSING trailer as zero findings, so a
+# crashed, hung, refusing or absent cyrlint scored clean. A caller that has to tell those
+# apart uses `exec_capture_status`, which reports the exit code, the signal and the deadline.
+# CHANGELOG [6.6.7]
+var PROC_ETIMEDOUT = 110;
+# errno ECHILD. `run` / `wait_pid` report `Err(PROC_ECHILD)` when waitpid never reaped the
+# child (e.g. the process inherited SIGCHLD = SIG_IGN), so the exit status is UNKNOWN — not a
+# decoded stack word. The i64-shaped `exec_*` verbs report the same case as -1.
+# CHANGELOG [6.6.7]
+var PROC_ECHILD = 10;
+
+# Bound every child this module WAITS for to `ms` milliseconds; 0 = wait for ever (the
+# default, and the pre-6.6.6 behaviour). Returns the previous value, so a caller can set a
+# short bound around one call and put the old one back. POSIX only: process_win.cyr /
+# process_agnos.cyr do not define this, so a call on those targets fails to COMPILE rather
+# than silently not bounding anything.
+fn proc_set_timeout_ms(ms): i64 {
+    var prev = _PROC_DEADLINE_MS;
+    _PROC_DEADLINE_MS = ms;
+    return prev;
+}
+
+# The deadline in force, in ms. Every wait below passes this rather than reading the global,
+# so a future per-call override is a parameter change and not a new code path.
+fn proc_timeout_ms(): i64 {
+    return _PROC_DEADLINE_MS;
+}
+
+# Called in the CHILD, between fork and execve. PR_SET_PDEATHSIG = 1, SIGKILL = 9; it
+# survives execve for a non-setuid binary, so the exec'd program inherits it. Linux only —
+# prctl is not a Darwin/BSD syscall and is not routed on PE. The getppid re-check closes the
+# race where the parent died between the fork and the prctl: the death signal was then
+# delivered to nobody and will never fire, so the child exits itself.
+fn _proc_child_guard(ppid_before): i64 {
+    #ifdef CYRIUS_TARGET_LINUX
+    sys_prctl(1, 9, 0, 0, 0);
+    if (syscall(SYS_GETPPID) != ppid_before) { sys_exit(1); }
+    #endif
+    return 0;
+}
+
+# Wait for `pid`, but not for ever. Returns 1 if the child was reaped normally (`stbuf` holds
+# its status), 0 if the deadline forced a SIGKILL, and -1 if waitpid failed before either —
+# then `stbuf` was NEVER WRITTEN and must not be decoded. That is not hypothetical: a caller
+# that inherited SIGCHLD = SIG_IGN (it survives execve) has its children auto-reaped by the
+# kernel, so waitpid blocks until they exit and then fails ECHILD; decoding the untouched
+# stack word there reported a failed child as "exit 0". CHANGELOG [6.6.7]
+# `timeout_ms <= 0` is the historical blocking wait (EINTR retried). A waitpid error in the
+# timed loop still KILLS before returning: a bare return there is an ABANDONMENT path, the
+# very thing a deadline exists to prevent — the correction cbt/build.cyr's
+# `run_binary_timed` took at v6.5.51.
+# `syscall(7, 0, 0, slice)` is poll(NULL, 0, ms), i.e. a portable millisecond sleep (the
+# backend translates 7 to Darwin poll / aarch64 ppoll).
+fn _proc_wait_deadline(pid, stbuf, timeout_ms): i64 {
+    if (timeout_ms <= 0) {
+        var bw = sys_waitpid(pid, stbuf, 0);
+        while (bw == 0 - 4) { bw = sys_waitpid(pid, stbuf, 0); }   # EINTR
+        if (bw == pid) { return 1; }
+        return 0 - 1;
+    }
+    var waited = 0;
+    var slice = 1;
+    while (waited < timeout_ms) {
+        var w = sys_waitpid(pid, stbuf, 1);
+        if (w == pid) { return 1; }
+        if (w < 0) { sys_kill(pid, 9); sys_waitpid(pid, stbuf, 0); return 0 - 1; }
+        syscall(7, 0, 0, slice);
+        waited = waited + slice;
+        if (waited >= 50) { slice = 10; }
+        if (waited >= 2000) { slice = 50; }
+    }
+    sys_kill(pid, 9);          # the deadline fired and WE killed it: 0 is the truth even
+    sys_waitpid(pid, stbuf, 0); # if an auto-reap leaves this reap nothing to collect
+    return 0;
+}
+
+# poll(POLLIN) one fd. >0 readable (or hung up / errored — poll reports POLLHUP and POLLERR
+# whether or not you asked for them, which is what ends the read loop when the child exits),
+# 0 timed out, <0 syscall error.
+fn _proc_poll_in(fd, timeout_ms): i64 {
+    var pfd[8];
+    store32(&pfd,     fd);
+    store16(&pfd + 4, 1);   # POLLIN
+    store16(&pfd + 6, 0);   # revents
+    return syscall(7, &pfd, 1, timeout_ms);
+}
+
+# Drain `fd` into `buf` (at most `buflen`), never blocking longer than `timeout_ms` WITHOUT
+# PROGRESS. The deadline is an IDLE one by design and the distinction is worth stating: a
+# child that keeps producing output is working, and killing it at a wall-clock limit would
+# break `cbt/deps.cyr`'s git and sigil's cryptsetup; a child that produces nothing and does
+# not exit is the hang this exists to stop. The total is bounded regardless because the loop
+# also stops at `buflen`. `timeout_ms <= 0` is the historical unbounded drain.
+# Set by `_proc_read_pipe`: 1 when it stopped because the idle deadline expired (or poll
+# failed), 0 when it reached EOF or filled the buffer. After a cut the child is abandoned
+# mid-output — it is then killed at the wait deadline, or dies of SIGPIPE on its next write,
+# and either way the capture is incomplete. `exec_capture_status` reports that as the
+# deadline (-2), not as the SIGPIPE "crash" the reader itself caused. CHANGELOG [6.6.7]
+var _proc_read_cut = 0;
+
+fn _proc_read_pipe(fd, buf, buflen, timeout_ms): i64 {
+    var total = 0;
+    var rgo = 1;
+    _proc_read_cut = 0;
+    while (rgo == 1) {
+        if (timeout_ms > 0) {
+            # <= 0 covers BOTH the timeout and a poll error (EINTR included): in either case
+            # we stop reading, and the caller's bounded wait deals with the child.
+            if (_proc_poll_in(fd, timeout_ms) <= 0) { rgo = 0; _proc_read_cut = 1; }
+        }
+        if (rgo == 1) {
+            var n = sys_read(fd, buf + total, buflen - total);
+            if (n <= 0) { rgo = 0; }
+            else {
+                total = total + n;
+                if (total >= buflen) { rgo = 0; }
+            }
+        }
+    }
+    return total;
+}
+
 # Build argv array and execve. Called in child after fork. Does not return.
 # argv[40] = 5 × 8 B (cmd + up to 2 args + NUL + 1 slot headroom); envp[16] =
 # 2 × 8 B (envp[0] + NUL). var buf[N] is N BYTES per CLAUDE.md buffer contract;
@@ -61,11 +219,14 @@ fn _exec3(cmd, arg1, arg2): i64 {
 
 # Run a command and wait for it. Returns Result(exit_code).
 fn run(cmd, arg1, arg2): Result {
+    var _pg_ppid = sys_getpid();
     var pid = sys_fork();
     if (pid < 0) { return Err(0 - pid); }
-    if (pid == 0) { _exec3(cmd, arg1, arg2); }
+    if (pid == 0) { _proc_child_guard(_pg_ppid); _exec3(cmd, arg1, arg2); }
     var status_buf[4];
-    sys_waitpid(pid, &status_buf, 0);
+    var reaped = _proc_wait_deadline(pid, &status_buf, proc_timeout_ms());
+    if (reaped == 0) { return Err(PROC_ETIMEDOUT); }
+    if (reaped < 0) { return Err(PROC_ECHILD); }
     var status = load32(&status_buf);
     if (WIFEXITED(status) == 1) { return Ok(WEXITSTATUS(status)); }
     if (WIFSIGNALED(status) == 1) { return Ok(128 + WTERMSIG(status)); }
@@ -81,6 +242,7 @@ fn run_capture(cmd, arg1, arg2, buf, buflen): Result {
     var read_fd = load32(&pipefd);
     var write_fd = load32(&pipefd + 4);
 
+    var _pg_ppid = sys_getpid();
     var pid = sys_fork();
     if (pid < 0) {
         sys_close(read_fd);
@@ -88,6 +250,7 @@ fn run_capture(cmd, arg1, arg2, buf, buflen): Result {
         return Err(0 - pid);
     }
     if (pid == 0) {
+        _proc_child_guard(_pg_ppid);
         sys_close(read_fd);
         sys_dup2(write_fd, 1);
         sys_close(write_fd);
@@ -96,24 +259,23 @@ fn run_capture(cmd, arg1, arg2, buf, buflen): Result {
         _exec3(cmd, arg1, arg2);
     }
     sys_close(write_fd);
-    var total = 0;
-    var rgo = 1;
-    while (rgo == 1) {
-        var n = sys_read(read_fd, buf + total, buflen - total);
-        if (n <= 0) { rgo = 0; }
-        else {
-            total = total + n;
-            if (total >= buflen) { rgo = 0; }
-        }
-    }
+    var total = _proc_read_pipe(read_fd, buf, buflen, proc_timeout_ms());
     sys_close(read_fd);
     var status_buf[4];
-    sys_waitpid(pid, &status_buf, 0);
+    _proc_wait_deadline(pid, &status_buf, proc_timeout_ms());
     return Ok(total);
 }
 
 # Spawn a command in the background (don't wait).
 # Returns Result(child_pid).
+#
+# fork-guard-exempt: THE CHILD IS MEANT TO OUTLIVE THIS CALL. This is the one verb here
+# whose contract is "keep running after I return", so PR_SET_PDEATHSIG would break it — a
+# consumer that launches a daemon and exits would have the daemon killed by the kernel. The
+# caller owns the child's lifetime (`wait_pid`, which IS bounded when a deadline is set).
+# The census in tests/gates/toolchain/check_driver_bounded.sh reads this marker, so the
+# exemption is one line in one place rather than a file the census stops looking at.
+# CHANGELOG [6.6.6]
 fn spawn(cmd, arg1, arg2): Result {
     var pid = sys_fork();
     if (pid < 0) { return Err(0 - pid); }
@@ -124,8 +286,12 @@ fn spawn(cmd, arg1, arg2): Result {
 # Wait for a specific pid. Returns Result(exit_code).
 fn wait_pid(pid): Result {
     var status_buf[4];
-    var r = sys_waitpid(pid, &status_buf, 0);
-    if (r < 0) { return Err(0 - r); }
+    # v6.6.6: bounded when the embedder set a deadline, an unchanged blocking wait when it
+    # did not (the default). A caller that spawn()ed a long-running child and set a deadline
+    # gets that child KILLED here — which is the point of asking for one.
+    var reaped = _proc_wait_deadline(pid, &status_buf, proc_timeout_ms());
+    if (reaped == 0) { return Err(PROC_ETIMEDOUT); }
+    if (reaped < 0) { return Err(PROC_ECHILD); }
     var status = load32(&status_buf);
     if (WIFEXITED(status) == 1) { return Ok(WEXITSTATUS(status)); }
     if (WIFSIGNALED(status) == 1) { return Ok(128 + WTERMSIG(status)); }
@@ -190,23 +356,58 @@ fn exec_vec(args): i64 {
     store64(argv + argc * 8, 0);
     var envp = alloc(8);
     store64(envp, 0);
+    var _pg_ppid = sys_getpid();
     var pid = sys_fork();
     if (pid < 0) { return 0 - 1; }
     if (pid == 0) {
+        _proc_child_guard(_pg_ppid);
         sys_execve(cmd, argv, envp);
         sys_exit(127);
     }
     var stbuf[4];
-    sys_waitpid(pid, &stbuf, 0);
+    # v6.6.6: -2 is the timeout code (module header). Without it the deadline's own SIGKILL
+    # is indistinguishable from the child crashing, and "it never finished" is a very
+    # different report from "it died".
+    var reaped = _proc_wait_deadline(pid, &stbuf, proc_timeout_ms());
+    if (reaped == 0) { return 0 - 2; }
+    if (reaped < 0) { return 0 - 1; }
     var st = load32(&stbuf);
     if (WIFEXITED(st) == 1) { return WEXITSTATUS(st); }
     return 0 - 1;
 }
 
-# Run command with cstr args vec and capture stdout. Returns bytes
-# read. buf must be pre-allocated.
-# v5.10.44: cstr-only; Str pushers use `exec_capture_str`.
-fn exec_capture(args, buf, buflen): i64 {
+# Decode a wait(2) status word into `status_out`'s two i64 slots (the shape
+# lib/regression.cyr's `regression_exec_capture_status` uses): [0] = exit code (0..255),
+# 128+sig on a signal death, -2 when `reaped` == 0 (the deadline killed it), -1 when
+# `reaped` < 0 (waitpid never reaped the child, so `st` is not a status and is NOT decoded);
+# [1] = 1 iff a signal killed the child (a crash — `exit(139)` and SIGSEGV both read 139 in
+# slot 0).
+fn _proc_store_status(status_out, reaped, st): i64 {
+    var code = 0 - 1;
+    var sig = 0;
+    if (reaped == 1) {
+        if (WIFEXITED(st) == 1) { code = WEXITSTATUS(st); }
+        if (WIFSIGNALED(st) == 1) { code = 128 + WTERMSIG(st); sig = 1; }
+    }
+    if (reaped == 0) { code = 0 - 2; }
+    store64(status_out, code);
+    store64(status_out + 8, sig);
+    return 0;
+}
+
+# Run command with cstr args vec, capture stdout, and REPORT HOW IT ENDED. Returns bytes
+# read (-1 when nothing could be spawned). `status_out` points to TWO i64 slots:
+#   [0] exit code 0..255 · 128+sig on a signal death · -2 deadline kill (proc_set_timeout_ms)
+#       · -1 nothing ran (empty argv, pipe or fork failure) OR the end was never observed
+#       (waitpid did not reap the child — e.g. an inherited SIGCHLD = SIG_IGN auto-reaped
+#       it). A path execve cannot run is the child's own exit 127.
+#   [1] 1 iff a signal killed the child, else 0.
+# Use this, not `exec_capture`, whenever "the tool failed" must not read as "the tool said
+# nothing" (see the ETIMEDOUT note above). Same argv shape as exec_capture (cstr).
+# CHANGELOG [6.6.7]
+fn exec_capture_status(args, buf, buflen, status_out): i64 {
+    store64(status_out, 0 - 1);
+    store64(status_out + 8, 0);
     var argc = vec_len(args);
     if (argc < 1) { return 0 - 1; }
     var cmd = vec_get(args, 0);
@@ -220,12 +421,14 @@ fn exec_capture(args, buf, buflen): i64 {
     var envp = alloc(8);
     store64(envp, 0);
     var pipefd[16];
-    sys_pipe(&pipefd);
+    if (sys_pipe(&pipefd) < 0) { return 0 - 1; }
     var rfd = load32(&pipefd);
     var wfd = load32(&pipefd + 4);
+    var _pg_ppid = sys_getpid();
     var pid = sys_fork();
     if (pid < 0) { sys_close(rfd); sys_close(wfd); return 0 - 1; }
     if (pid == 0) {
+        _proc_child_guard(_pg_ppid);
         sys_close(rfd);
         sys_dup2(wfd, 1);
         sys_close(wfd);
@@ -235,17 +438,26 @@ fn exec_capture(args, buf, buflen): i64 {
         sys_exit(127);
     }
     sys_close(wfd);
-    var total = 0;
-    var rgo = 1;
-    while (rgo == 1) {
-        var n = sys_read(rfd, buf + total, buflen - total);
-        if (n <= 0) { rgo = 0; }
-        else { total = total + n; if (total >= buflen) { rgo = 0; } }
-    }
+    var total = _proc_read_pipe(rfd, buf, buflen, proc_timeout_ms());
+    var cut = _proc_read_cut;
     sys_close(rfd);
     var stbuf[4];
-    sys_waitpid(pid, &stbuf, 0);
+    store32(&stbuf, 0 - 1);   # never a stale stack word, even if a path below forgets
+    var reaped = _proc_wait_deadline(pid, &stbuf, proc_timeout_ms());
+    # The reader gave up at the deadline: report THAT — unless waitpid never saw the child,
+    # which is "unknown" (-1), never a guessed -2.
+    if (cut == 1) { if (reaped == 1) { reaped = 0; } }
+    _proc_store_status(status_out, reaped, load32(&stbuf));
     return total;
+}
+
+# Run command with cstr args vec and capture stdout. Returns bytes
+# read. buf must be pre-allocated. The exit status is DISCARDED — use
+# `exec_capture_status` when a failed run must not read as short output.
+# v5.10.44: cstr-only; Str pushers use `exec_capture_str`.
+fn exec_capture(args, buf, buflen): i64 {
+    var _st[16];
+    return exec_capture_status(args, buf, buflen, &_st);
 }
 
 # Run command with cstr args vec + cstr env vec.
@@ -271,16 +483,20 @@ fn exec_env(args, env): i64 {
         evi = evi + 1;
     }
     store64(envp + envc * 8, 0);
+    var _pg_ppid = sys_getpid();
     var pid = sys_fork();
     if (pid < 0) { return 0 - 1; }
     if (pid == 0) {
+        _proc_child_guard(_pg_ppid);
         var devnull = sys_open("/dev/null", 1, 0);   # 1 = O_WRONLY (mirrors run_capture)
         if (devnull >= 0) { sys_dup2(devnull, 2); sys_close(devnull); }
         sys_execve(cmd, argv, envp);
         sys_exit(127);
     }
     var stbuf[4];
-    sys_waitpid(pid, &stbuf, 0);
+    var reaped = _proc_wait_deadline(pid, &stbuf, proc_timeout_ms());
+    if (reaped == 0) { return 0 - 2; }
+    if (reaped < 0) { return 0 - 1; }
     var st = load32(&stbuf);
     if (WIFEXITED(st) == 1) { return WEXITSTATUS(st); }
     return 0 - 1;
@@ -320,14 +536,18 @@ fn exec_vec_str(args): i64 {
     store64(argv + argc * 8, 0);
     var envp = alloc(8);
     store64(envp, 0);
+    var _pg_ppid = sys_getpid();
     var pid = sys_fork();
     if (pid < 0) { return 0 - 1; }
     if (pid == 0) {
+        _proc_child_guard(_pg_ppid);
         sys_execve(cmd, argv, envp);
         sys_exit(127);
     }
     var stbuf[4];
-    sys_waitpid(pid, &stbuf, 0);
+    var reaped = _proc_wait_deadline(pid, &stbuf, proc_timeout_ms());
+    if (reaped == 0) { return 0 - 2; }
+    if (reaped < 0) { return 0 - 1; }
     var st = load32(&stbuf);
     if (WIFEXITED(st) == 1) { return WEXITSTATUS(st); }
     return 0 - 1;
@@ -352,9 +572,11 @@ fn exec_capture_str(args, buf, buflen): i64 {
     sys_pipe(&pipefd);
     var rfd = load32(&pipefd);
     var wfd = load32(&pipefd + 4);
+    var _pg_ppid = sys_getpid();
     var pid = sys_fork();
     if (pid < 0) { sys_close(rfd); sys_close(wfd); return 0 - 1; }
     if (pid == 0) {
+        _proc_child_guard(_pg_ppid);
         sys_close(rfd);
         sys_dup2(wfd, 1);
         sys_close(wfd);
@@ -364,16 +586,10 @@ fn exec_capture_str(args, buf, buflen): i64 {
         sys_exit(127);
     }
     sys_close(wfd);
-    var total = 0;
-    var rgo = 1;
-    while (rgo == 1) {
-        var n = sys_read(rfd, buf + total, buflen - total);
-        if (n <= 0) { rgo = 0; }
-        else { total = total + n; if (total >= buflen) { rgo = 0; } }
-    }
+    var total = _proc_read_pipe(rfd, buf, buflen, proc_timeout_ms());
     sys_close(rfd);
     var stbuf[4];
-    sys_waitpid(pid, &stbuf, 0);
+    _proc_wait_deadline(pid, &stbuf, proc_timeout_ms());
     return total;
 }
 
@@ -398,16 +614,20 @@ fn exec_env_str(args, env): i64 {
         evi = evi + 1;
     }
     store64(envp + envc * 8, 0);
+    var _pg_ppid = sys_getpid();
     var pid = sys_fork();
     if (pid < 0) { return 0 - 1; }
     if (pid == 0) {
+        _proc_child_guard(_pg_ppid);
         var devnull = sys_open("/dev/null", 1, 0);   # 1 = O_WRONLY (mirrors run_capture)
         if (devnull >= 0) { sys_dup2(devnull, 2); sys_close(devnull); }
         sys_execve(cmd, argv, envp);
         sys_exit(127);
     }
     var stbuf[4];
-    sys_waitpid(pid, &stbuf, 0);
+    var reaped = _proc_wait_deadline(pid, &stbuf, proc_timeout_ms());
+    if (reaped == 0) { return 0 - 2; }
+    if (reaped < 0) { return 0 - 1; }
     var st = load32(&stbuf);
     if (WIFEXITED(st) == 1) { return WEXITSTATUS(st); }
     return 0 - 1;
@@ -472,14 +692,18 @@ fn exec_cmd(cmdline): i64 {
     store64(&argv + 24, 0);
     var envp = _read_environ_envp();
     if (envp == 0) { envp = alloc(8); store64(envp, 0); }
+    var _pg_ppid = sys_getpid();
     var pid = sys_fork();
     if (pid < 0) { return 0 - 1; }
     if (pid == 0) {
+        _proc_child_guard(_pg_ppid);
         sys_execve("/bin/sh", &argv, envp);
         sys_exit(127);
     }
     var stbuf[4];
-    sys_waitpid(pid, &stbuf, 0);
+    var reaped = _proc_wait_deadline(pid, &stbuf, proc_timeout_ms());
+    if (reaped == 0) { return 0 - 2; }
+    if (reaped < 0) { return 0 - 1; }
     var st = load32(&stbuf);
     if (WIFEXITED(st) == 1) { return WEXITSTATUS(st); }
     return 0 - 1;

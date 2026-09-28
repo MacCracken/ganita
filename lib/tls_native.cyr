@@ -70,6 +70,13 @@ include "lib/keccak.cyr"
 # (the v6.0.53 CI SIGILL in tls_native_scaffold). include-once dedupes.
 include "lib/thread.cyr"
 include "lib/thread_local.cyr"
+# sigil's sidecar also lists sys, chrono and random, and a bundle strips its own includes, so
+# a hand list that omits them compiles with undefined fns — ud2 stubs, not link errors:
+# sys_uname (sys), clock_now_ms / sleep_ms / clock_epoch_secs (chrono), random_bytes (random).
+# Before sigil, like the leaves above. CHANGELOG [6.6.7]
+include "lib/sys.cyr"
+include "lib/chrono.cyr"
+include "lib/random.cyr"
 include "lib/sigil.cyr"
 
 # ================================================================

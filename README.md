@@ -13,13 +13,14 @@ Written in [Cyrius](https://github.com/MacCracken/cyrius).
 
 ## Status
 
-**1.2.6** — a correctly rounded cube root, and the performance backlog closed. See
+**1.2.7** — `pow` follows the C99 Annex F table (infinities, NaN, ±0). See
 [`CHANGELOG.md`](CHANGELOG.md) for the full history and
 [`docs/development/state.md`](docs/development/state.md) for the live snapshot.
 Recent releases in brief:
 
 | | |
 |---|---|
+| **1.2.7** | `pow` answers the C99 Annex F special values (was NaN for every infinite base/exponent off the integral path, and for `pow(1, NaN)`); toolchain 6.6.7 |
 | **1.2.6** | `ganita_f64_cbrt`, correctly rounded for every f64 (and so every f32); `inv`/`qr`/`pseudo_inv` stop discarding scratch; element cap settled by ADR 0002; toolchain 6.6.4 |
 | **1.2.5** | toolchain 6.6.0 → 6.6.2 |
 | **1.2.4** | relative tolerances, one-sided Jacobi SVD, exact integer `pow`, f32 comparators; mat_mul 3.34× |

@@ -45,13 +45,18 @@ var _FHM_TOMB = 255;
 # Compute H2 (metadata hash): top 7 bits of hash, +1 to avoid 0x00
 fn _fhm_h2(h): i64 { return ((h >> 57) & 0x7F) + 1; }
 
-# Create a new fast hashmap (capacity must be multiple of 16, minimum 16)
+# Create a new fast hashmap (capacity must be multiple of 16, minimum 16).
+# Returns 0 when an allocation is refused (6.6.7 — it stored through them unchecked).
 fn fhm_new(): i64 {
     var m = alloc(40);
+    if (m == 0) { return 0; }
     var cap = 16;
     var meta = alloc(cap);
+    if (meta == 0) { return 0; }
     var keys = alloc(cap * 8);
+    if (keys == 0) { return 0; }
     var vals = alloc(cap * 8);
+    if (vals == 0) { return 0; }
     memset(meta, 0, cap);
     store64(m, meta);
     store64(m + 8, keys);
@@ -187,7 +192,8 @@ fn fhm_get_or(m, key, default_val): i64 {
 # Alias for fhm_count
 fn fhm_size(m): i64 { return load64(m + 32); }
 
-# Set key-value pair
+# Set key-value pair. Returns 0, or -1 when the table had to grow and the grow's allocation
+# was refused — the map is then UNCHANGED (the old table stays live). CHANGELOG [6.6.7]
 fn fhm_set(m, key, val): i64 {
     var meta = load64(m);
     var keys = load64(m + 8);
@@ -196,7 +202,7 @@ fn fhm_set(m, key, val): i64 {
     var count = load64(m + 32);
     # Grow at 87.5% load (14/16 per group)
     if (count * 8 >= cap * 7) {
-        _fhm_grow(m);
+        if (_fhm_grow(m) < 0) { return 0 - 1; }
         meta = load64(m);
         keys = load64(m + 8);
         vals = load64(m + 16);
@@ -233,7 +239,10 @@ fn fhm_set(m, key, val): i64 {
     return 0;
 }
 
-# Grow the table (double capacity)
+# Grow the table (double capacity). Returns 0, or -1 when an allocation is refused.
+# ⚠ All three arrays are allocated and CHECKED before `m` is touched, so a refused grow
+# leaves the old table fully intact. They were unchecked, so a refusal memset through 0.
+# CHANGELOG [6.6.7]
 fn _fhm_grow(m): i64 {
     var old_meta = load64(m);
     var old_keys = load64(m + 8);
@@ -241,8 +250,11 @@ fn _fhm_grow(m): i64 {
     var old_cap = load64(m + 24);
     var new_cap = old_cap * 2;
     var new_meta = alloc(new_cap);
+    if (new_meta == 0) { return 0 - 1; }
     var new_keys = alloc(new_cap * 8);
+    if (new_keys == 0) { return 0 - 1; }
     var new_vals = alloc(new_cap * 8);
+    if (new_vals == 0) { return 0 - 1; }
     memset(new_meta, 0, new_cap);
     store64(m, new_meta);
     store64(m + 8, new_keys);

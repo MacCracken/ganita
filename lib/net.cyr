@@ -240,9 +240,12 @@ fn sock_reuse(fd): i64 {
 fn sock_set_recv_timeout(fd, secs, usecs): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     # AGNOS has no SO_RCVTIMEO (and NSYS_SETSOCKOPT=54 mis-dispatches to agnos
-    # #54=SYS_UDP_UNBIND). The recv deadline is enforced by the syscall peer's
-    # _agnos_sock_recv_block poll instead; no-op here. v6.2.7.
-    return 0;
+    # #54=SYS_UDP_UNBIND). The syscall peer's _agnos_sock_recv_block enforces the
+    # deadline, so record it there, per socket: a timed-out read returns -11 (EAGAIN)
+    # like SO_RCVTIMEO. ⚠ secs = usecs = 0 restores the peer's 30 s default rather
+    # than meaning "never" as on Linux — an agnos socket read is always bounded.
+    # (This was a no-op that ignored `secs` until v6.6.7.) CHANGELOG [6.6.7]
+    return _agnos_sock_set_tmo(&_agnos_sock_rcvto_us, fd, secs * 1000000 + usecs);
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
     # Linux struct timeval is {tv_sec, tv_usec} — both i64 on 64-bit
@@ -270,9 +273,13 @@ fn sock_set_recv_timeout(fd, secs, usecs): i64 {
 # worker inside write(). Same struct timeval layout / per-target dispatch.
 fn sock_set_send_timeout(fd, secs, usecs): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
-    # AGNOS has no SO_SNDTIMEO (NSYS_SETSOCKOPT=54 mis-dispatches). The send
-    # deadline is enforced by the syscall peer's poll path; no-op here. v6.2.7.
-    return 0;
+    # AGNOS has no SO_SNDTIMEO (NSYS_SETSOCKOPT=54 mis-dispatches). The syscall
+    # peer's sys_write socket route bounds a STALL with it: sock_send#48 returns 0
+    # after ~8 s with no ACK progress, and _agnos_sock_send_all retries until this
+    # deadline, then returns the partial count (or -1). secs = usecs = 0 restores the
+    # 30 s default. (This comment used to claim a "poll path" that did not exist and
+    # the call ignored `secs`, until v6.6.7.) CHANGELOG [6.6.7]
+    return _agnos_sock_set_tmo(&_agnos_sock_sndto_us, fd, secs * 1000000 + usecs);
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
     var tv = alloc(16);
@@ -295,9 +302,16 @@ fn sock_set_send_timeout(fd, secs, usecs): i64 {
 fn sock_bind(fd, addr, port) : Result {
     #ifdef CYRIUS_TARGET_AGNOS
     # AGNOS merges bind+listen into sock_listen(#56); bind just stashes the port
-    # for sock_listen to issue with. addr is ignored — the kernel binds the
-    # single NIC, ip is unused. v6.2.22.
-    _agnos_listen_stash_port(fd, port);
+    # AND the address class for sock_listen to issue with. 127/8 → a LOOPBACK-only
+    # listener; 0.0.0.0 or this host's address → ANY; any other address → Err(99)
+    # (EADDRNOTAVAIL — this host does not have it). A bad port → Err(22) (EINVAL).
+    # ⛔ CVE-48 (v6.6.7): `addr` used to be IGNORED, so a 127.0.0.1 server listened
+    # on the network. On an agnos kernel older than 1.57.7 the loopback class is
+    # refused at sock_listen — the server does not start, which is the safe answer.
+    var ip = _agnos_bswap32(addr);
+    var cls = _agnos_listen_class(ip);
+    if (cls < 0) { return Err(99); }
+    if (_agnos_listen_stash(fd, port, cls, ip) < 0) { return Err(22); }
     return Ok(0);
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
@@ -315,7 +329,9 @@ fn sock_listen(fd, backlog) : Result {
     # bind+listen → a listen_id, stored in the fd's adapter slot). backlog is
     # advisory on AGNOS — the kernel's 8-conn-slot table caps it. v6.2.22.
     var r = _agnos_listen_start(fd);
-    if (r < 0) { return Err(1); }   # port in use / kernel conn table full
+    # port in use / kernel conn table full / unbound — or a LOOPBACK bind on an agnos
+    # older than 1.57.7, which has no address classes: refused, never widened (CVE-48).
+    if (r < 0) { return Err(1); }
     return Ok(0);
     #endif
     #ifndef CYRIUS_TARGET_AGNOS

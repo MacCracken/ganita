@@ -1,15 +1,8 @@
-# audit_walk.cyr — shared fmt/lint walkers for cyrius audit + check.
+# audit_walk.cyr — shared fmt/lint/doc walkers for `cyrius audit` + the check driver.
 #
-# Cyrius port of scripts/lib/audit-walk.sh shipped at v5.9.1 as the
-# first slot of the v5.9.x sovereignty pass (bash-toolchain → cyrius
-# conversion). Used by programs/checks/ (the cyrius-native audit
-# dispatcher that replaces scripts/check.sh).
-#
-# scripts/lib/audit-walk.sh stays bash for now — it is still consumed
-# by the bash scripts/cyrius dispatcher (also queued for cyrius
-# conversion at v5.9.5; the two scripts retire together as one unit
-# because audit-walk's logic doesn't move until both consumers are
-# cyrius-native).
+# Consumers: programs/checks/ (the check driver's fmt + lint suites) and cbt/commands.cyr
+# (`cyrius audit`). This is the only implementation — the bash twin it was ported from,
+# scripts/lib/audit-walk.sh, had no caller left and was deleted at 6.6.7.
 #
 # Public functions:
 #   audit_fmt_walk(cyrfmt_path, dirs_vec)
@@ -20,7 +13,25 @@
 #   audit_lint_walk(cyrlint_path, dirs_vec)
 #       Run cyrlint on every non-symlink, non-distlib-bundle *.cyr
 #       file in the given dirs. Sets globals AW_LINT_TOTAL (warning
-#       count), AW_LINT_SKIPPED.
+#       count), AW_LINT_SKIPPED, and AW_LINT_ERRORS / AW_LINT_ERROR_FILES
+#       (files cyrlint did not finish on — see "FAIL CLOSED" below).
+#
+#   audit_doc_walk(cyrdoc_path, dirs_vec)
+#       Run `cyrdoc --check` likewise. Sets AW_DOC_TOTAL (undocumented
+#       public fns), AW_DOC_SKIPPED, AW_DOC_ERRORS / AW_DOC_ERROR_FILES.
+#
+#   audit_print_errors(notes_vec)
+#       Print an AW_*_ERROR_FILES list, one "path: reason" per line, capped.
+#
+# ⛔ FAIL CLOSED (6.6.7). The lint and doc walkers used to take the tool's summary trailer
+# as their ONLY signal, through a capture verb that threw the exit status away, and a
+# missing trailer parsed as ZERO. So a cyrlint that crashed, hung, refused the file
+# (`file too large to lint`, `cannot read file` on an empty .cyr — both rc 1, no trailer)
+# or did not exist at all scored "0 warnings", and `cyrius audit` printed "ok: lint clean"
+# over rekha's 1.65 MB fonts/face_data.cyr, which cyrlint had never linted. A file now
+# counts as linted only when the run exited on its own with the status its trailer implies
+# AND printed that trailer; anything else is an ERROR that names the file and the reason.
+# Callers must fail on AW_*_ERRORS, not only on the totals. CHANGELOG [6.6.7]
 #
 # Symlinked files are treated as dep files (they belong to upstream
 # and may track a different formatter baseline) and are skipped in
@@ -46,10 +57,16 @@ var AW_FMT_FAIL_FILES = 0;   # vec<str> of basenames
 # Globals exposed to caller after audit_lint_walk runs.
 var AW_LINT_TOTAL = 0;
 var AW_LINT_SKIPPED = 0;
+# 6.6.7: files cyrlint did not FINISH on (crash, deadline kill, refusal, missing tool, no
+# trailer). A count and a vec<Str> of "path: reason" notes. Non-zero is a failure.
+var AW_LINT_ERRORS = 0;
+var AW_LINT_ERROR_FILES = 0;
 
 # Globals exposed after audit_doc_walk (v6.2.25 — for `cyrius audit`'s doc sweep).
 var AW_DOC_TOTAL = 0;
 var AW_DOC_SKIPPED = 0;
+var AW_DOC_ERRORS = 0;        # 6.6.7 — as AW_LINT_ERRORS, for cyrdoc --check
+var AW_DOC_ERROR_FILES = 0;
 
 # d_type byte for symlink in struct dirent64 from getdents64.
 var _AW_DT_LNK = 10;
@@ -338,23 +355,41 @@ fn audit_fmt_walk(cyrfmt_path, dirs_vec): i64 {
     return 0;
 }
 
-# Parse the trailing summary line from cyrlint's stdout to extract
-# the warning count (first integer at start of last line; matches
-# the bash `tail -1 | grep -o '^[0-9]*'` form). Returns 0 on no
-# match.
+# Parse cyrlint's canonical last stdout line, "<n> warnings", and return n — or -1 when the
+# last line is anything else (or there is no output). ⛔ -1, not 0: a missing trailer means
+# cyrlint did not finish (it refused the file, crashed, timed out or never ran), and reading
+# that as "0 warnings" is the 6.6.7 false GREEN. The line must be EXACTLY digits + " warnings".
 fn _aw_parse_lint_warnings(buf, n): i64 {
-    if (n <= 0) { return 0; }
-    # Find start of last line.
-    var start = n;
-    if (load8(buf + n - 1) == 10) { start = n - 1; }   # ignore trailing \n
-    var i = start;
-    while (i > 0) {
-        if (load8(buf + i - 1) == 10) { i = i; return _aw_parse_leading_int(buf + i, start - i); }
-        i = i - 1;
+    if (n <= 0) { return 0 - 1; }
+    var end = n;
+    if (load8(buf + end - 1) == 10) { end = end - 1; }
+    var start = end;
+    var sgo = 1;
+    while (sgo == 1) {
+        if (start == 0) { sgo = 0; }
+        elif (load8(buf + start - 1) == 10) { sgo = 0; }
+        else { start = start - 1; }
     }
-    return _aw_parse_leading_int(buf, start);
+    var i = start;
+    var v = 0;
+    var dgo = 1;
+    while (dgo == 1) {
+        if (i >= end) { dgo = 0; }
+        else {
+            var c = load8(buf + i);
+            if (c >= 48 && c <= 57) { v = v * 10 + (c - 48); i = i + 1; }
+            else { dgo = 0; }
+        }
+    }
+    if (i == start) { return 0 - 1; }
+    if (end - i != 9) { return 0 - 1; }
+    if (memeq(buf + i, " warnings", 9) != 1) { return 0 - 1; }
+    return v;
 }
 
+# Leading unsigned decimal of p[0..len), 0 when there is none — so it CANNOT tell "0" from
+# "no number", which is why the lint walker no longer uses it (see above). Kept for the
+# check driver's own parsers (programs/checks/selfhost.cyr, lint_fmt.cyr, codegen_regress.cyr).
 fn _aw_parse_leading_int(p, len): i64 {
     var v = 0;
     var i = 0;
@@ -373,14 +408,67 @@ fn _aw_parse_leading_int(p, len): i64 {
     return v;
 }
 
+# Build the "path: reason[N]" note an AW_*_ERROR_FILES entry holds. `num` < 0 = no number.
+fn _aw_note(full, why, num): i64 {
+    var sb = str_builder_new();
+    str_builder_add(sb, full);
+    str_builder_add_cstr(sb, ": ");
+    str_builder_add_cstr(sb, why);
+    if (num >= 0) { str_builder_add_int(sb, num); }
+    return str_builder_build(sb);
+}
+
+# Decide whether one tool run can be TRUSTED. `st` is exec_capture_status's two-slot status,
+# `parsed` the trailer value (-1 = no trailer) and `want` the exit status that trailer
+# implies. Returns 0 when trustworthy, else a note naming the file and the reason. The order
+# is the specific-before-general one: "it never ran" and "it was killed" are more useful
+# than "no trailer", which every one of them also produces.
+fn _aw_run_verdict(full, st, parsed, want): i64 {
+    var code = load64(st);
+    if (code == 0 - 1) { return _aw_note(full, "the tool could not be run", 0 - 1); }
+    if (code == 0 - 2) { return _aw_note(full, "timed out and was killed at the deadline", 0 - 1); }
+    if (load64(st + 8) == 1) { return _aw_note(full, "the tool crashed, signal ", code - 128); }
+    if (parsed < 0) { return _aw_note(full, "the tool refused or failed (no summary line), exit ", code); }
+    if (code != want) { return _aw_note(full, "exit status disagrees with the summary line, exit ", code); }
+    return 0;
+}
+
+# Print an AW_LINT_ERROR_FILES / AW_DOC_ERROR_FILES list, one note per line, capped at 20
+# so a large project cannot bury the rest of the report.
+fn audit_print_errors(notes): i64 {
+    if (notes == 0) { return 0; }
+    var tot = vec_len(notes);
+    var i = 0;
+    while (i < tot) {
+        if (i >= 20) {
+            sys_write(1, "    … and ", 12);
+            print_num(tot - 20);
+            println(" more");
+            i = tot;
+        } else {
+            var nt = vec_get(notes, i);
+            sys_write(1, "    ", 4);
+            sys_write(1, str_data(nt), str_len(nt));
+            println("");
+            i = i + 1;
+        }
+    }
+    return 0;
+}
+
 # Run cyrlint on every non-symlink, non-distlib-bundle *.cyr file in
-# each directory of `dirs_vec`. Sums the leading-integer of cyrlint's
-# trailing summary line into AW_LINT_TOTAL.
+# each directory of `dirs_vec`. Sums the "<n> warnings" trailer into AW_LINT_TOTAL; a run
+# that did not finish cleanly goes to AW_LINT_ERRORS instead (see the header).
 fn audit_lint_walk(cyrlint_path, dirs_vec): i64 {
     AW_LINT_TOTAL = 0;
     AW_LINT_SKIPPED = 0;
-    var cap = 200000;
+    AW_LINT_ERRORS = 0;
+    AW_LINT_ERROR_FILES = vec_new();
+    # 1 MB: on Windows the capture pipe carries stderr too (every per-line warning), and an
+    # output that overflows the buffer loses its trailer — which now reads as an ERROR.
+    var cap = 1048576;
     var lint_buf = alloc(cap);
+    var st[16];
 
     var di = 0;
     while (di < vec_len(dirs_vec)) {
@@ -416,9 +504,15 @@ fn audit_lint_walk(cyrlint_path, dirs_vec): i64 {
                         var args = vec_new();
                         vec_push(args, cyrlint_path);
                         vec_push(args, str_data(full));
-                        var n = exec_capture(args, lint_buf, cap);
+                        var n = exec_capture_status(args, lint_buf, cap, &st);
                         var w = _aw_parse_lint_warnings(lint_buf, n);
-                        AW_LINT_TOTAL = AW_LINT_TOTAL + w;
+                        var bad = _aw_run_verdict(full, &st, w, 0);
+                        if (bad != 0) {
+                            AW_LINT_ERRORS = AW_LINT_ERRORS + 1;
+                            vec_push(AW_LINT_ERROR_FILES, bad);
+                        } else {
+                            AW_LINT_TOTAL = AW_LINT_TOTAL + w;
+                        }
                     }
                 }
             }
@@ -429,30 +523,50 @@ fn audit_lint_walk(cyrlint_path, dirs_vec): i64 {
     return 0;
 }
 
-# Parse cyrdoc's stdout summary "X documented, Y undocumented (Z total)" and
-# return Y. cyrdoc writes the per-fn "undocumented: <name>" markers to STDERR
-# (which exec_capture does not see); only the summary lands on stdout. The
-# "documented, " (comma+space) prefix is unique to the real summary field — the
-# "undocumented (" token is followed by " (", never ", ".
+# Read an unsigned decimal at buf[q..n). Returns the value, or -1 when there is no digit;
+# the index just past it goes to *qout.
+fn _aw_read_uint(buf, q, n, qout): i64 {
+    var v = 0;
+    var got = 0;
+    var go = 1;
+    while (go == 1) {
+        if (q >= n) { go = 0; }
+        else {
+            var c = load8(buf + q);
+            if (c >= 48 && c <= 57) { v = v * 10 + (c - 48); got = 1; q = q + 1; }
+            else { go = 0; }
+        }
+    }
+    store64(qout, q);
+    if (got == 0) { return 0 - 1; }
+    return v;
+}
+
+# Parse cyrdoc's stdout summary "X documented, Y undocumented (Z total)" and return Y — or
+# -1 when no complete summary is present (6.6.7: this returned 0, so a cyrdoc that refused
+# the file, crashed or never ran read as "fully documented"). cyrdoc writes the per-fn
+# "undocumented: <name>" markers to STDERR; only the summary lands on stdout (on Windows the
+# capture pipe carries both, and no marker line matches the whole summary shape).
 fn _aw_parse_undoc(buf, n): i64 {
+    var qb[8];
     var p = 0;
     while (p + 12 <= n) {
         if (memeq(buf + p, "documented, ", 12) == 1) {
-            var q = p + 12;
-            var val = 0;
-            var got = 0;
-            while (q < n) {
-                var c = load8(buf + q);
-                if (c >= 48) {
-                    if (c <= 57) { val = val * 10 + (c - 48); got = 1; q = q + 1; }
-                    else { q = n; }
-                } else { q = n; }
+            var y = _aw_read_uint(buf, p + 12, n, &qb);
+            var q = load64(&qb);
+            if (y >= 0 && q + 15 <= n) {
+                if (memeq(buf + q, " undocumented (", 15) == 1) {
+                    var z = _aw_read_uint(buf, q + 15, n, &qb);
+                    var r = load64(&qb);
+                    if (z >= 0 && r + 7 <= n) {
+                        if (memeq(buf + r, " total)", 7) == 1) { return y; }
+                    }
+                }
             }
-            if (got == 1) { return val; }
         }
         p = p + 1;
     }
-    return 0;
+    return 0 - 1;
 }
 
 # v6.2.25: doc-coverage walk for `cyrius audit`'s project sweep. Runs
@@ -462,8 +576,11 @@ fn _aw_parse_undoc(buf, n): i64 {
 fn audit_doc_walk(cyrdoc_path, dirs_vec): i64 {
     AW_DOC_TOTAL = 0;
     AW_DOC_SKIPPED = 0;
-    var cap = 200000;
+    AW_DOC_ERRORS = 0;
+    AW_DOC_ERROR_FILES = vec_new();
+    var cap = 1048576;   # see audit_lint_walk: stderr shares the pipe on Windows
     var doc_buf = alloc(cap);
+    var st[16];
     var di = 0;
     while (di < vec_len(dirs_vec)) {
         var dir = vec_get(dirs_vec, di);
@@ -499,8 +616,18 @@ fn audit_doc_walk(cyrdoc_path, dirs_vec): i64 {
                         vec_push(args, cyrdoc_path);
                         vec_push(args, "--check");
                         vec_push(args, str_data(full));
-                        var n = exec_capture(args, doc_buf, cap);
-                        AW_DOC_TOTAL = AW_DOC_TOTAL + _aw_parse_undoc(doc_buf, n);
+                        var n = exec_capture_status(args, doc_buf, cap, &st);
+                        var u = _aw_parse_undoc(doc_buf, n);
+                        # `cyrdoc --check` exits with the undocumented count, clamped to 255.
+                        var want = u;
+                        if (want > 255) { want = 255; }
+                        var bad = _aw_run_verdict(full, &st, u, want);
+                        if (bad != 0) {
+                            AW_DOC_ERRORS = AW_DOC_ERRORS + 1;
+                            vec_push(AW_DOC_ERROR_FILES, bad);
+                        } else {
+                            AW_DOC_TOTAL = AW_DOC_TOTAL + u;
+                        }
                     }
                 }
             }
