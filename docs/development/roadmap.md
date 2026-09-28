@@ -89,3 +89,45 @@ Deliberately not in ganita, so that nobody adds them by accident:
 - **Complete pivoting.** Partial pivoting only — the O(n³) column search per step
   buys nothing for the use cases in the ecosystem.
 - **Arbitrary precision.** f64 and f32, nothing else.
+
+---
+
+## Moving the cyrius pin to 6.6.6
+
+**Current pin: `cyrius = "6.6.4"`.** Nothing must change first in ganita's own source —
+but the bump is **not** a one-line edit here, see *Verify* below.
+
+**What was checked** (7 `.cyr` under `src/`; vendored `lib/` excluded):
+
+- **Windows write corruption: not a ganita exposure.** `O_APPEND` / `O_TRUNC` appear **47
+  times, every one inside the vendored `lib/` fold, zero in `src/`**. ganita opens no files
+  at all — no `file_open` / `sys_open` / `file_read_all` / `file_exists` call site in
+  `src/`. It is pure computation over caller-supplied buffers.
+- **No shape the new refusals catch.** Zero `struct` declarations in `src/`, so no
+  struct/vector copy, no by-value struct parameter, no struct-valued return or top-level
+  struct call. No `async fn`, no `operator` fn, no SIMD-returning fn (ganita's vector work
+  is all memory-form: `f64v_*(dst, a, b, n)` over pointers, never a vector-typed value
+  crossing a fn boundary), no fn mixing pair and scalar returns.
+- **Also clean:** no `var` inside a top-level block (zero top-level `{` / `if (` / `while (`
+  at column 0), no raw `SYS_STATFS`, no `lib/regression.cyr` consumer, no `vec_*` of
+  ganita's own, no symlink in `lib/`. The only duplicate top-level global is `var r = main();`
+  in `src/main.cyr` and `src/test.cyr` — two separate entry files that are never co-linked,
+  so the new "a global declared in two co-linked files wins everywhere" rule does not reach it.
+- **Platform:** CI is `ubuntu-latest` only, no `CYRIUS_TARGET_*` branch in `src/`.
+
+**What it gains:** 6.6.5's aggregate-layout fix (the fn-local slot layout has been silently
+wrong since 5.8.17 — for a repo whose whole job is dense numeric layout this is the one to
+want), the three corrected ENTRY stack bases, and 6.6.6's nine new refusals.
+
+**Verify after bumping — the lib-parity gate makes this a two-step change.**
+`.github/workflows/ci.yml` runs `diff -rq lib "$HOME/.cyrius/versions/${CYRIUS_VERSION}/lib"`
+and fails on any difference. ganita vendors the **whole 104-file stdlib snapshot**, so
+bumping the pin without re-vendoring turns CI red immediately. Sequence: bump the pin →
+`cyrius deps` → `cyrius lib sync --full` → commit the refreshed `lib/` → `cyrius build` →
+`cyrius test` → `cyrius distlib --all` to regenerate `dist/ganita.cyr` (the version-consistency
+gate checks the `# Version:` header in every bundle).
+
+⚠ The refreshed `lib/` will carry the 6.6.6 `sigil.cyr` and `mabda.cyr`, whose shipped dist
+does **not** pass `cyrfmt --check`. That is harmless here — ganita's format gate loops over
+`src/*.cyr tests/* docs/examples/*.cyr` and never touches `lib/`. Do **not** "fix" it in the
+fold; per the ecosystem rule the repair belongs in the sigil and mabda source repos.
