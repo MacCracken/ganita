@@ -333,6 +333,7 @@ fn thread_create(fp, arg): i64 {
     alloc_init();
     _threads_active = 1;   # v6.3.17 PF-02: arm the shared-heap lock BEFORE the clone below
     var t = alloc(THREAD_SIZE);
+    if (t == 0) { return 0; }
     var ssize = THREAD_STACK_SIZE;
     var sbase = mmap_stack(ssize);
     if (sbase < 0) { return 0; }
@@ -537,7 +538,9 @@ var CHAN_SIZE = 56;
 fn chan_new(cap): i64 {
     alloc_init();
     var ch = alloc(CHAN_SIZE);
+    if (ch == 0) { return 0; }
     var buf = alloc(cap * 8);
+    if (buf == 0) { return 0; }
     store64(ch, buf);
     store64(ch + 8, cap);
     store64(ch + 16, 0);

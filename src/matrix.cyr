@@ -1,5 +1,5 @@
 # matrix.cyr — dense matrix operations for f64 values
-# Usage: include "lib/matrix.cyr"
+# Usage: include "lib/ganita.cyr" (the fold; this file is its matrix layer)
 # Requires: alloc.cyr, fmt.cyr, string.cyr
 #
 # Row-major dense matrix backed by a single heap allocation.

@@ -204,6 +204,7 @@ fn _phdr_memsz(p) : i64 { return load64(p + 40); }
 #   +88+0..63: needed offsets   +88+64: needed_count
 fn _parse_dynamic(base, dyn_offset, dyn_size): i64 {
     var result = alloc(160);
+    if (result == 0) { return 0; }
     var ri = 0;
     while (ri < 160) { store8(result + ri, 0); ri = ri + 1; }
 
@@ -804,6 +805,7 @@ fn dynlib_open(path): i64 {
 
     # Parse dynamic section from the properly loaded segments
     var dinfo = _parse_dynamic(bias, dyn_offset, dyn_size);
+    if (dinfo == 0) { cyr_munmap(base, span); return 0; }
     var symtab_vaddr  = load64(dinfo);
     var strtab_vaddr  = load64(dinfo + 8);
     var gnuhash_vaddr = load64(dinfo + 24);
@@ -822,6 +824,7 @@ fn dynlib_open(path): i64 {
 
     # Allocate handle
     var h = alloc(120);
+    if (h == 0) { cyr_munmap(base, span); return 0; }
     store64(h, base);
     store64(h + 8, span);
     store64(h + 16, dynsym);

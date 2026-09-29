@@ -51,6 +51,12 @@ fn proc_deadline_kills(): i64 { return 0; }
 # the POSIX module. CHANGELOG [6.6.8]
 var PROC_ECHILD = 10;
 
+# errno ETIMEDOUT — defined so a portable caller that compares a Result against it compiles
+# here (6.6.7 put it in the POSIX block only, so `PROC_ETIMEDOUT` was an undefined variable —
+# a hard error — on agnos). No verb here RETURNS it: agnos has no deadline (see the header).
+# Same value as the POSIX and Windows modules. CHANGELOG [6.6.10]
+var PROC_ETIMEDOUT = 110;
+
 # -- argv / env blobs --
 
 # Length of the NUL-terminated string at `p`.
@@ -207,6 +213,22 @@ fn _agp_wait(pid): i64 {
 fn _agp_code(st): i64 {
     if (WIFSIGNALED(st) == 1) { return 128 + WTERMSIG(st); }
     return WEXITSTATUS(st);
+}
+
+# End child `pid` and its whole descendant tree, and reap `pid` into `stbuf` (its wait status,
+# stored as 4 bytes; left untouched when there was nothing of ours to reap). Returns 0; the
+# caller must not wait for `pid` again. The agnos peer of lib/process.cyr's `proc_kill_tree`:
+# kill#16 with the tree bit (agnos 1.57.7) ENDS the root and every descendant in one snapshot.
+# There is no TERM-then-grace step because agnos gives SIGTERM no default action — a TERM here
+# would only set a pending bit. When the tree kill is REFUSED (-1: a pre-1.57.7 kernel does not
+# know the tree bit) the root is killed alone before the wait — the WAIT_BLOCK below would
+# otherwise wait for a child nothing had signalled, for ever. The tree is lost then, never the
+# bound. CHANGELOG [6.6.10]
+fn proc_kill_tree(pid, stbuf): i64 {
+    if (sys_kill_tree(pid, 9) != 0) { sys_kill(pid, 9); }
+    var st = _agp_wait(pid);
+    if (st >= 0) { store32(stbuf, st); }
+    return 0;
 }
 
 # Wait for `pid` and answer the i64 verbs' way: the exit code, or -1 when it died of a

@@ -90,7 +90,8 @@ fn path_has_ext(path: Str, ext: Str): i64 {
     return str_ends_with(path, ext);
 }
 
-# List directory entries. Returns vec of Str (filenames).
+# The lister behind dir_list / dir_list_checked: push `path`'s entry names (cloned Strs)
+# onto `entries`; 0, or a negative error (see dir_list_checked). One arm per target.
 #
 # v5.9.6 fix: clone each filename out of the getdents64 batch
 # buffer before pushing to the vec. Pre-fix `vec_push(entries,
@@ -120,11 +121,10 @@ fn path_has_ext(path: Str, ext: Str): i64 {
 # Inlined (strlen + sys_open) rather than reaching up to io.cyr's file_open so
 # this base lib keeps its existing dependency surface (string.cyr supplies
 # strlen). See 2026-06-18-stdlib-native-agnos-abi-fs.md.
-fn dir_list(path: Str): i64 {
-    var entries = vec_new();
+fn _dir_list_into_vec(path: Str, entries): i64 {
     var dp = str_data(path);
     var fd = sys_open(dp, strlen(dp), AO_DIRECTORY);   # agnos: (name, namelen, AO_DIRECTORY)
-    if (fd < 0) { return entries; }
+    if (fd < 0) { return fd; }
     # v6.5.11: STACK scratch, not alloc(). The getdents buffer is dead the moment
     # this fn returns, but under the bump allocator alloc() never gives it back —
     # so every call leaked 4 KB. See the note on the non-agnos arm below.
@@ -133,7 +133,8 @@ fn dir_list(path: Str): i64 {
     var rgo = 1;
     while (rgo == 1) {
         var n = sys_getdents(fd, buf, 4096);
-        if (n <= 0) { rgo = 0; }
+        if (n < 0) { sys_close(fd); return n; }   # a read error is NOT the end of the directory
+        if (n == 0) { rgo = 0; }
         else {
             var pos = 0;
             while (pos < n) {
@@ -160,14 +161,13 @@ fn dir_list(path: Str): i64 {
         }
     }
     sys_close(fd);
-    return entries;
+    return 0;
 }
 #endif
 #ifndef CYRIUS_TARGET_AGNOS
-fn dir_list(path: Str): i64 {
-    var entries = vec_new();
+fn _dir_list_into_vec(path: Str, entries): i64 {
     var fd = sys_open(str_data(path), O_RDONLY, 0);
-    if (fd < 0) { return entries; }
+    if (fd < 0) { return fd; }
     # ⛔ v6.5.11: STACK scratch, not alloc(). Both buffers are dead the moment this fn
     # returns, but the default allocator is a BUMP allocator — it has no free — so each
     # call permanently burned 4104 B. Measured before the fix: dir_list 176 B/entry,
@@ -193,7 +193,8 @@ fn dir_list(path: Str): i64 {
     var rgo = 1;
     while (rgo == 1) {
         var n = syscall(FSYS_GETDENTS64, fd, buf, 4096, basep);
-        if (n <= 0) { rgo = 0; }
+        if (n < 0) { sys_close(fd); return n; }   # a read error is NOT the end of the directory
+        if (n == 0) { rgo = 0; }
         else {
             var pos = 0;
             while (pos < n) {
@@ -223,10 +224,37 @@ fn dir_list(path: Str): i64 {
         }
     }
     sys_close(fd);
-    return entries;
+    return 0;
 }
 #endif
 #endif
+
+# List directory entries. Returns a vec of Str (the names; `.` and `..` skipped).
+#
+# ⚠ An UNREADABLE directory lists as EMPTY here — the vec cannot say "I could not look".
+# That is fine for a probe and wrong for anything that walks a tree to reach a verdict: a
+# test runner, an auditor, a coverage count. Those use `dir_list_checked` /
+# `dir_walk_checked`, which report the failure. CHANGELOG [6.6.10]
+fn dir_list(path: Str): i64 {
+    var entries = vec_new();
+    _dir_list_into_vec(path, entries);
+    return entries;
+}
+
+# List `path` into `entries` (a vec of Str; `.` and `..` skipped). Returns 0 when the
+# whole directory was read, or a NEGATIVE error when it could not be opened or its entry
+# stream failed part-way (the open's / read's errno on Linux and macOS, -1 on agnos and
+# Windows); `entries` then holds whatever was read before the failure.
+#
+# ⛔ 6.6.10 — THE ERROR CHANNEL. `dir_list` folded both failures into "an empty directory":
+# the open error returned the empty vec and `getdents` returning -EACCES/-EIO ended the
+# loop like end-of-directory. So `chmod 000 tests/bad` turned `cyrius test` from
+# "1 passed, 1 failed" into "1 passed, 0 failed" and `cyrius coverage` from 50 % to 100 %,
+# with no diagnostic — every arm (Linux getdents64, Darwin getdirentries, agnos getdents,
+# the Windows FindFirstFileW lister) had the same shape. CHANGELOG [6.6.10]
+fn dir_list_checked(path: Str, entries): i64 {
+    return _dir_list_into_vec(path, entries);
+}
 
 # List a directory into CALLER-OWNED buffers — allocates NOTHING.
 #
@@ -246,7 +274,9 @@ fn dir_list(path: Str): i64 {
 #   max_entries capacity of `offs`, in entries
 #
 # Returns the entry count (>= 0), or negative on error:
-#   -1 open failed   -2 scratch too small   -3 names buffer full   -4 offs full
+#   -1 open failed, or the directory could not be read (6.6.10: a read error part-way
+#      used to end the listing like end-of-directory and return a short count)
+#   -2 scratch too small   -3 names buffer full   -4 offs full
 #
 # ⛔ Truncation is an ERROR, never a short read: a silent partial listing is how a caller
 # ends up believing a directory is smaller than it is. `.` and `..` are skipped, matching
@@ -262,7 +292,8 @@ fn dir_list_into(path: Str, scratch, scratch_len, names, names_cap, offs, max_en
     var rgo = 1;
     while (rgo == 1) {
         var n = sys_getdents(fd, scratch, scratch_len);
-        if (n <= 0) { rgo = 0; }
+        if (n < 0) { sys_close(fd); return 0 - 1; }   # 6.6.10: a read error, not the end
+        if (n == 0) { rgo = 0; }
         else {
             var pos = 0;
             while (pos < n) {
@@ -298,7 +329,8 @@ fn dir_list_into(path: Str, scratch, scratch_len, names, names_cap, offs, max_en
     var rgo2 = 1;
     while (rgo2 == 1) {
         var n2 = syscall(FSYS_GETDENTS64, fd2, scratch, scratch_len, &basep);
-        if (n2 <= 0) { rgo2 = 0; }
+        if (n2 < 0) { sys_close(fd2); return 0 - 1; }   # 6.6.10: a read error, not the end
+        if (n2 == 0) { rgo2 = 0; }
         else {
             var pos2 = 0;
             while (pos2 < n2) {
@@ -369,26 +401,21 @@ fn is_dir(path: Str): i64 {
 }
 #endif
 #ifndef CYRIUS_TARGET_AGNOS
+# ⛔ 6.6.10 — ASK stat(2), NOT open(2). This opened the path and read one batch of entries,
+# so it answered "can I LIST this?", not "is this a directory?" — and a directory you may
+# not read (chmod 000, an ACL) answered 0. Every tree walker then took that directory for a
+# FILE, filtered it out by extension, and the whole subtree vanished without a word: the
+# walker never even tried to list it, so no error channel could fire. A directory you cannot
+# read is still a directory; the walker now descends, fails to list it, and says so. stat
+# follows a final symlink, exactly as the open did, so `is_dir` on a link to a directory is
+# still 1 (the walkers' `is_symlink` loop guard is unchanged). `STAT_MODE` is per target
+# (24 x86-Linux, 16 aarch64-Linux, 4 macOS-arm64, 8 macOS-x86 legacy stat) — the offsets
+# `_xdir_exists` in lib/io.cyr reads, verified on every host. The buffer is on the STACK
+# (v6.5.11: dir_walk calls this once per entry). CHANGELOG [6.6.10]
 fn is_dir(path: Str): i64 {
-    var fd = sys_open(str_data(path), O_RDONLY, 0);
-    if (fd < 0) { return 0; }
-    # v6.0.60: use a full 4096 buffer, not 32. Linux getdents64 returns the
-    # first entry in a 32-byte buffer, but Darwin getdirentries64 fails on a
-    # buffer that small (verified on ecb: 32 → error, dir misreported as
-    # non-dir); 4096 matches dir_list and works on both.
-    #
-    # ⛔ v6.5.11: STACK scratch, not alloc(). THIS fn was the dominant cost in fs.cyr
-    # and the filing did not name it — dir_walk (:253) calls is_dir once PER ENTRY, so
-    # a 41-entry walk burned 4104 B x 41. Fixing dir_list alone would have moved
-    # dir_walk 4443 -> ~4267 B/entry and looked complete.
-    var sbuf[4096];
-    var buf = &sbuf;
-    var sbasep[8];
-    var basep = &sbasep;
-    store64(basep, 0);
-    var n = syscall(FSYS_GETDENTS64, fd, buf, 4096, basep);
-    sys_close(fd);
-    if (n >= 0) { return 1; }
+    var st[256];
+    if (sys_stat(str_data(path), &st) != 0) { return 0; }
+    if ((load32(&st + STAT_MODE) & 0xF000) == 0x4000) { return 1; }   # S_IFMT == S_IFDIR
     return 0;
 }
 #endif
@@ -486,16 +513,38 @@ fn is_symlink(path: Str): i64 {
     #endif
 }
 
-fn _dir_walk_d(path: Str, results, depth): i64 {
+# A directory the walk could not list. `failed` (a vec, or 0): the CHECKED walkers record
+# the path there and their caller names it; the unchecked ones warn on stderr instead —
+# except for the ROOT, which callers routinely probe with a path that may not exist.
+fn _dir_walk_unlisted(path: Str, failed, depth, err): i64 {
+    if (failed != 0) { vec_push(failed, path); return 0; }
+    if (depth == 0) { return 0; }
+    syscall(SYS_WRITE, 2, "warning: dir_walk: cannot list ", 31);
+    syscall(SYS_WRITE, 2, str_data(path), str_len(path));
+    syscall(SYS_WRITE, 2, " (error ", 8);
+    var eb[24];
+    var en = 0 - err;
+    var el = 0;
+    if (en <= 0) { store8(&eb, 63); el = 1; }   # '?'
+    while (en > 0 && el < 20) { store8(&eb + el, 48 + en % 10); en = en / 10; el = el + 1; }
+    while (el > 0) { el = el - 1; syscall(SYS_WRITE, 2, &eb + el, 1); }
+    syscall(SYS_WRITE, 2, ") — subtree NOT walked; use dir_walk_checked to fail on it\n", 61);
+    return 0;
+}
+
+fn _dir_walk_d(path: Str, results, depth, failed): i64 {
     # Stop, but do NOT pretend the tree ended: a silent truncation here would be the
     # same lie as the inflated count, one level down.
     if (depth > DIR_WALK_MAX_DEPTH) {
+        if (failed != 0) { vec_push(failed, path); return vec_len(results); }
         syscall(SYS_WRITE, 2, "warning: dir_walk depth cap (64) hit at: ", 41);
         syscall(SYS_WRITE, 2, str_data(path), str_len(path));
         syscall(SYS_WRITE, 2, "\n  a symlink loop or a pathologically deep tree — subtree NOT walked.\n", 72);
         return vec_len(results);
     }
-    var entries = dir_list(path);
+    var entries = vec_new();
+    var lr = _dir_list_into_vec(path, entries);
+    if (lr < 0) { _dir_walk_unlisted(path, failed, depth, lr); }
     var wi = 0;
     while (wi < vec_len(entries)) {
         var full = path_join(path, vec_get(entries, wi));
@@ -504,7 +553,7 @@ fn _dir_walk_d(path: Str, results, depth): i64 {
         if (is_dir(full) == 1 && is_symlink(full) == 1) {
             vec_push(results, full);
         } elif (is_dir(full) == 1) {
-            _dir_walk_d(full, results, depth + 1);
+            _dir_walk_d(full, results, depth + 1, failed);
         } else {
             vec_push(results, full);
         }
@@ -518,7 +567,23 @@ fn _dir_walk_d(path: Str, results, depth): i64 {
 # deeper subtree is skipped with a warning rather than walked forever.
 # Returns the total number of entries in `results`.
 fn dir_walk(path: Str, results): i64 {
-    return _dir_walk_d(path, results, 0);
+    return _dir_walk_d(path, results, 0, 0);
+}
+
+# Walk a directory tree like `dir_walk`, and REPORT every directory it could not list:
+# each one's path (a Str) is pushed onto `failed` — the root itself when it is missing or
+# unreadable, a subdirectory whose open or entry stream failed, and a subtree cut at
+# DIR_WALK_MAX_DEPTH. Returns the number of paths this call pushed onto `failed`: 0 means
+# the whole tree was listed. File paths go to `results` exactly as dir_walk pushes them.
+#
+# ⛔ 6.6.10 — the walker a verdict may rest on. `dir_walk` dropped an unreadable subtree
+# in silence (see dir_list_checked), so `cyrius test`, `cyrius audit` and `cyrius coverage`
+# passed over files they had never seen. A caller that reports a result about the tree
+# must fail, by name, when this returns non-zero. CHANGELOG [6.6.10]
+fn dir_walk_checked(path: Str, results, failed): i64 {
+    var before = vec_len(failed);
+    _dir_walk_d(path, results, 0, failed);
+    return vec_len(failed) - before;
 }
 
 # Find files matching an extension in a directory tree.
@@ -539,8 +604,15 @@ fn dir_walk(path: Str, results): i64 {
 # params makes the bare-literal form coerce at the boundary;
 # str_from-wrapped callers are unaffected (byte-identical).
 fn find_files(path: Str, ext: Str): i64 {
+    return find_files_checked(path, ext, 0);
+}
+
+# `find_files`, with every directory the walk could not list pushed onto `failed` (see
+# dir_walk_checked; 0 = warn on stderr as dir_walk does). Returns the vec of matching paths;
+# the caller fails when `failed` grew. CHANGELOG [6.6.10]
+fn find_files_checked(path: Str, ext: Str, failed): i64 {
     var all = vec_new();
-    dir_walk(path, all);
+    _dir_walk_d(path, all, 0, failed);
     var matched = vec_new();
     var fi = 0;
     while (fi < vec_len(all)) {
@@ -574,7 +646,10 @@ fn _dir_walk_prunes_d(path: Str, results, prunes, depth): i64 {
         syscall(SYS_WRITE, 2, "\n  a symlink loop or a pathologically deep tree — subtree NOT walked.\n", 72);
         return vec_len(results);
     }
-    var entries = dir_list(path);
+    # 6.6.10: an unlistable SUBdirectory is named on stderr, as in dir_walk.
+    var entries = vec_new();
+    var lr = _dir_list_into_vec(path, entries);
+    if (lr < 0) { _dir_walk_unlisted(path, 0, depth, lr); }
     var wi = 0;
     while (wi < vec_len(entries)) {
         var name = vec_get(entries, wi);

@@ -470,9 +470,11 @@ fn _bench_net(elapsed): i64 {
 # no direct offset read and no use of BENCH_SIZE.
 var BENCH_SIZE = 72;
 
-# Create a new benchmark with the given name
+# Create a new benchmark with the given name. Returns 0 when the allocation is refused
+# (it stored through the unchecked pointer before 6.6.10). CHANGELOG [6.6.10]
 fn bench_new(name): i64 {
     var b = alloc(BENCH_SIZE);
+    if (b == 0) { return 0; }
     store64(b, name);
     store64(b + 8, 0);
     store64(b + 16, 0);

@@ -18,6 +18,9 @@
 #   0xF004 (61444) CreatePipe(&rd, &wr, &sa, size)
 #   0xF005 (61445) CreateProcessW(&args10)
 #   0xF01D (61469) TerminateProcess(handle, exitCode)  — v6.4.26, the SIGKILL analogue
+#   0xF040-0xF044  CreateJobObjectW / AssignProcessToJobObject / TerminateJobObject /
+#                  ResumeThread / SetInformationJobObject — 6.6.10, a process TREE (the
+#                  `_win_job_*` helpers in lib/syscalls_windows.cyr)
 #
 # A spawned "pid" (from spawn()) is the process HANDLE, not a Unix PID —
 # treat it opaquely and pass it to wait_pid(). getpid()/getppid() are stubs
@@ -81,12 +84,15 @@ fn _w_cmdbuf(nchars): i64 {
 
 # Build a writable UTF-16LE command line "cmd [arg1 [arg2]]" on the heap.
 # (CreateProcessW may modify lpCommandLine in place, so it must be writable
-# heap, never a read-only literal.) Returns the buffer pointer.
+# heap, never a read-only literal.) Returns the buffer pointer, 0 when the heap is exhausted
+# (6.6.10 — the three builders here stored through address 0 before; a 0 command line makes
+# CreateProcessW fail, so every verb reports a failed spawn).
 fn _win_wcmdline3(cmd, arg1, arg2): i64 {
     var total = strlen(cmd) + 1;
     if (arg1 != 0) { total = total + strlen(arg1) + 1; }
     if (arg2 != 0) { total = total + strlen(arg2) + 1; }
     var wbuf = alloc((total + 1) * 2);
+    if (wbuf == 0) { return 0; }
     var o = _w_append_cstr(wbuf, 0, cmd);
     if (arg1 != 0) { o = _w_append_space(wbuf, o); o = _w_append_cstr(wbuf, o, arg1); }
     if (arg2 != 0) { o = _w_append_space(wbuf, o); o = _w_append_cstr(wbuf, o, arg2); }
@@ -108,6 +114,7 @@ fn _win_wcmdline_vec(args, is_str): i64 {
         i = i + 1;
     }
     var wbuf = alloc((total + 1) * 2);
+    if (wbuf == 0) { return 0; }
     var o = 0;
     var j = 0;
     while (j < argc) {
@@ -135,6 +142,7 @@ fn _win_wenvblock_vec(env, is_str): i64 {
         i = i + 1;
     }
     var wbuf = alloc((total + 1) * 2);
+    if (wbuf == 0) { return 0; }
     var o = 0;
     var j = 0;
     while (j < envc) {
@@ -152,12 +160,90 @@ fn _win_wenvblock_vec(env, is_str): i64 {
 # CreateProcessW core
 # ================================================================
 
+# ⛔ 6.6.10 — EVERY CHILD RUNS IN A JOB OBJECT, so a deadline ends its whole TREE.
+# `_win_watchdog` and `_win_wait_handle` could only TerminateProcess the direct child, so a
+# grandchild kept running — and one holding a capture pipe kept the verb blocked until it
+# exited on its own (cass: `exec_capture_status([cmd.exe, /c, "ping -n 20 127.0.0.1"])` under
+# a 2000 ms deadline returned -2 after 19,437 ms). Now the child is created CREATE_SUSPENDED,
+# put in a KILL_ON_JOB_CLOSE job (lib/syscalls_windows.cyr `_win_job_start`) and resumed, and
+# every deadline ends the JOB. A clean exit is not a deadline: the wait clears KILL_ON_JOB_CLOSE
+# before it closes the job, so what the child left running is left alone — the POSIX verbs'
+# contract too. KILL_ON_JOB_CLOSE is live for as long as the child is: if THIS process dies,
+# the kernel closes the job and ends the tree (the PR_SET_PDEATHSIG the POSIX verbs set).
+# The job is found again by process handle in `_win_job_tab` — PROCESS_INFORMATION stays 24
+# bytes, so no caller's buffer changes. `spawn()` makes a job WITHOUT KILL_ON_JOB_CLOSE: its
+# child is meant to outlive us, and only `wait_pid`'s deadline may end its tree.
+# ⚠ Not thread-safe (the table, like the bump allocator): spawn from one thread.
+# CHANGELOG [6.6.10]
+var _win_job_tab[128];          # 64 × {hProcess, hJob}; hProcess 0 = a free slot
+var _WIN_JOB_SLOTS = 64;
+
+# Remember `job` for process handle `hp`. Returns 1, or 0 when the table is full — then the
+# job's KILL_ON_JOB_CLOSE is cleared and its handle closed, so the child runs untracked.
+fn _win_job_put(hp, job): i64 {
+    var i = 0;
+    while (i < _WIN_JOB_SLOTS) {
+        if (load64(&_win_job_tab + i * 16) == 0) {
+            store64(&_win_job_tab + i * 16, hp);
+            store64(&_win_job_tab + i * 16 + 8, job);
+            return 1;
+        }
+        i = i + 1;
+    }
+    _win_job_set_kill(job, 0);
+    syscall(3, job);
+    return 0;
+}
+
+# The job process handle `hp` runs in (0 = none). `take` = 1 also forgets it.
+fn _win_job_find(hp, take): i64 {
+    if (hp == 0) { return 0; }
+    var i = 0;
+    while (i < _WIN_JOB_SLOTS) {
+        if (load64(&_win_job_tab + i * 16) == hp) {
+            var job = load64(&_win_job_tab + i * 16 + 8);
+            if (take == 1) { store64(&_win_job_tab + i * 16, 0); store64(&_win_job_tab + i * 16 + 8, 0); }
+            return job;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# End `hp`'s whole tree with exit code `code`: its job when it has one, else the process alone.
+fn _win_end_tree(hp, code): i64 {
+    var job = _win_job_find(hp, 0);
+    if (job != 0) { return _win_job_kill(job, code); }
+    return _win_terminate(hp, code);
+}
+
+# Forget `hp`'s job and close it. `kill_rest` = 1 ends whatever is still running in it first
+# (the batch runner's "nothing outlives the run"); 0 clears KILL_ON_JOB_CLOSE, so closing the
+# handle leaves the survivors alone (the library verbs' clean exit).
+fn _win_job_release(hp, kill_rest): i64 {
+    var job = _win_job_find(hp, 1);
+    if (job == 0) { return 0; }
+    if (kill_rest == 1) { _win_job_kill(job, 1); }
+    else { _win_job_set_kill(job, 0); }
+    syscall(3, job);
+    return 0;
+}
+
 # Create a process. `wcmdline` = writable UTF-16LE command line.
 # `hStdOut` = write-handle for child stdout+stderr (0 = inherit parent's).
 # `wenv` = UTF-16LE env block (0 = inherit parent's). `pi` = caller's
 # 24-byte PROCESS_INFORMATION (zeroed + filled here). Returns the
-# CreateProcessW BOOL (non-zero = success).
+# CreateProcessW BOOL (non-zero = success). 6.6.10: the child runs in a KILL_ON_JOB_CLOSE job
+# (see above); wait for it with `_win_wait_close` / `_win_wait_timeout` / `_win_wait_tree`,
+# which release the job.
 fn _win_create_process(wcmdline, hStdOut, wenv, pi): i64 {
+    var ok = _win_create_process_job(wcmdline, hStdOut, wenv, pi, 1);
+    return ok;
+}
+
+# `_win_create_process` with the job's KILL_ON_JOB_CLOSE chosen by `kill_on_close` (0 for a
+# child meant to outlive this process — `spawn`).
+fn _win_create_process_job(wcmdline, hStdOut, wenv, pi, kill_on_close): i64 {
     # STARTUPINFOW (104 bytes), zeroed. Offsets: cb=0x00, dwFlags=0x3C,
     # hStdInput=0x50, hStdOutput=0x58, hStdError=0x60.
     var si[104];
@@ -174,8 +260,8 @@ fn _win_create_process(wcmdline, hStdOut, wenv, pi): i64 {
     while (pz < 24) { store8(pi + pz, 0); pz = pz + 1; }
     # CreateProcessW argument struct (10 qwords) — see ECREATEPROC_PE.
     var a[80];
-    var flags = 0;
-    if (wenv != 0) { flags = 1024; }            # CREATE_UNICODE_ENVIRONMENT
+    var flags = 4;                               # CREATE_SUSPENDED — resumed once in its job
+    if (wenv != 0) { flags = flags | 1024; }     # CREATE_UNICODE_ENVIRONMENT
     store64(&a + 0, 0);                          # lpApplicationName
     store64(&a + 8, wcmdline);                   # lpCommandLine (writable)
     store64(&a + 16, 0);                         # lpProcessAttributes
@@ -186,7 +272,16 @@ fn _win_create_process(wcmdline, hStdOut, wenv, pi): i64 {
     store64(&a + 56, 0);                         # lpCurrentDirectory
     store64(&a + 64, &si);                       # lpStartupInfo
     store64(&a + 72, pi);                        # lpProcessInformation
-    return syscall(61445, &a);                   # CreateProcessW
+    var ok = syscall(61445, &a);                 # CreateProcessW
+    if (ok == 0) { return 0; }
+    var job = _win_job_start(pi, kill_on_close);
+    if (job < 0) {                               # could not be resumed: it was terminated
+        syscall(3, load64(pi + 8));
+        syscall(3, load64(pi));
+        return 0;
+    }
+    if (job > 0) { _win_job_put(load64(pi), job); }
+    return ok;
 }
 
 # ⛔ 6.6.8 — A DEADLINE ON WINDOWS TOO, AND NO "exit 0" FOR A WAIT THAT NEVER HAPPENED.
@@ -202,9 +297,10 @@ fn _win_create_process(wcmdline, hStdOut, wenv, pi): i64 {
 #     (`run` / `wait_pid`: Err(110), ETIMEDOUT). A CAPTURING verb drains its pipe BEFORE it can
 #     wait, and ReadFile on that pipe blocks until the child exits, so those verbs arm a
 #     watchdog THREAD (CreateThread, 0xF007) that waits on the process with the bound and
-#     terminates it — the child's exit closes the pipe and the drain returns. Win32 has no
-#     process tree to end: a grandchild holding the pipe is outside this bound.
-# CHANGELOG [6.6.8]
+#     terminates it — the child's exit closes the pipe and the drain returns. (6.6.8 said
+#     "Win32 has no process tree to end: a grandchild holding the pipe is outside this bound".
+#     6.6.10: it has one — the child's Job object — and every deadline ends it.)
+# CHANGELOG [6.6.8] [6.6.10]
 var _PROC_DEADLINE_MS = 0;
 var _proc_deadline_kills = 0;
 
@@ -222,6 +318,14 @@ fn proc_timeout_ms(): i64 { return _PROC_DEADLINE_MS; }
 # How many children this process has ended at a deadline, ever.
 fn proc_deadline_kills(): i64 { return _proc_deadline_kills; }
 
+# errno ETIMEDOUT / ECHILD — the same names and values as lib/process.cyr's POSIX block:
+# `run` / `wait_pid` answer Err(PROC_ETIMEDOUT) when the deadline ended the child and
+# Err(PROC_ECHILD) when its exit code could not be read. 6.6.7 added both to the POSIX block
+# only, and this peer spelled them as the literals 110 / 10, so a portable caller that
+# compared against the names failed to COMPILE for PE. CHANGELOG [6.6.10]
+var PROC_ETIMEDOUT = 110;
+var PROC_ECHILD = 10;
+
 # Wait for process handle `h` (bounded by the deadline in force) and return its exit code;
 # -2 when the deadline ended it, -1 when the wait or GetExitCodeProcess failed (the code is
 # then UNKNOWN — never a guessed 0). Does not close `h`.
@@ -231,7 +335,7 @@ fn _win_wait_handle(h): i64 {
     var wr = syscall(61441, h, ms) & 4294967295;  # WaitForSingleObject
     var killed = 0;
     if (wr == 258) {                              # WAIT_TIMEOUT
-        _win_terminate(h, 1);
+        _win_end_tree(h, 1);                      # 6.6.10: its job — the whole tree
         wr = syscall(61441, h, 4294967295) & 4294967295;
         killed = 1;
         _proc_deadline_kills = _proc_deadline_kills + 1;
@@ -246,34 +350,59 @@ fn _win_wait_handle(h): i64 {
 
 # Wait for the process in `pi` to exit (bounded by the deadline in force), return its exit
 # code (-2 deadline, -1 unknown — see `_win_wait_handle`), and close both the process and
-# thread handles.
+# thread handles — and its job, leaving anything it started running (6.6.10).
 fn _win_wait_close(pi): i64 {
     var hProcess = load64(pi + 0);
     var hThread = load64(pi + 8);
     var ec = _win_wait_handle(hProcess);
+    _win_job_release(hProcess, 0);
     syscall(3, hThread);                          # CloseHandle(hThread)
     syscall(3, hProcess);                         # CloseHandle(hProcess)
     return ec;
 }
 
 # The watchdog thread body (a cyrius fn compiled for PE is a valid ThreadProc: the one
-# argument arrives in RCX). `a` = {hProcess, ms, fired}. Allocates nothing — the bump
-# allocator is not thread-safe.
+# argument arrives in RCX). `a` = {hProcess, ms, fired, hJob, done}. Allocates nothing and
+# never touches `_win_job_tab` — the bump allocator and the table are not thread-safe, so
+# the job handle is handed over in the block.
+# 6.6.10: the bound is on the CAPTURE, not only on the child. The drain ends when EVERY holder
+# of the pipe's write end has gone, and a grandchild holds it as long as the child did — so
+# once the child has exited the watchdog keeps counting until the drain reports `done`
+# (`_win_watch_end`) or the deadline expires, and then ends the child's job, which is what
+# closes the pipe. Before, it waited on the child alone and a grandchild that outlived it
+# blocked the verb for as long as it ran (the POSIX drain's idle deadline cuts the same case).
 fn _win_watchdog(a): i64 {
-    var wr = syscall(61441, load64(a), load64(a + 8)) & 4294967295;
-    if (wr == 258) {
-        _win_terminate(load64(a), 1);
-        store64(a + 16, 1);
+    var ms = load64(a + 8);
+    var waited = 0;
+    var exited = 0;
+    while (waited < ms) {
+        if (load64(a + 32) == 1) { return 0; }     # the drain is over
+        var slice = ms - waited;
+        if (slice > 20) { slice = 20; }
+        if (exited == 0) {
+            var wr = syscall(61441, load64(a), slice) & 4294967295;   # WaitForSingleObject
+            if (wr == 0) { exited = 1; }
+            else { waited = waited + slice; }
+        } else {
+            syscall(0xF00F, slice);                 # Sleep — the child is gone, its tree may not be
+            waited = waited + slice;
+        }
     }
+    if (load64(a + 32) == 1) { return 0; }
+    if (load64(a + 24) != 0) { _win_job_kill(load64(a + 24), 1); }
+    else { _win_terminate(load64(a), 1); }
+    store64(a + 16, 1);
     return 0;
 }
 
-# Arm a watchdog on `pi`'s process when a deadline is in force. `wd` = the caller's 24-byte
+# Arm a watchdog on `pi`'s process when a deadline is in force. `wd` = the caller's 40-byte
 # block (it must outlive `_win_watch_end`). Returns the thread handle, 0 when none is armed.
 fn _win_watch_start(pi, wd): i64 {
     store64(wd, load64(pi));
     store64(wd + 8, _PROC_DEADLINE_MS);
     store64(wd + 16, 0);
+    store64(wd + 24, _win_job_find(load64(pi), 0));
+    store64(wd + 32, 0);
     if (_PROC_DEADLINE_MS <= 0) { return 0; }
     var ta[48];
     store64(&ta,      0);                         # lpThreadAttributes
@@ -285,8 +414,10 @@ fn _win_watch_start(pi, wd): i64 {
     return syscall(61447, &ta);                   # CreateThread
 }
 
-# Join the watchdog; returns 1 if it had to terminate the child (counted once, here).
+# Join the watchdog; returns 1 if it had to terminate the child (counted once, here). Call it
+# once the drain has returned: it tells the watchdog so (`done`), which then exits at once.
 fn _win_watch_end(t, wd): i64 {
+    store64(wd + 32, 1);
     if (t != 0) {
         syscall(61441, t, 4294967295);
         syscall(3, t);
@@ -321,7 +452,7 @@ fn _win_wait_timeout(pi, ms, killed_out): i64 {
     store64(killed_out, 0);
     var wr = syscall(61441, hProcess, ms) & 4294967295;   # WaitForSingleObject(hProcess, ms)
     if (wr == 258) {                              # WAIT_TIMEOUT (0x102) → enforce deadline
-        _win_terminate(hProcess, 137);            # TerminateProcess(hProcess, 137)
+        _win_end_tree(hProcess, 137);             # 6.6.10: its job (the tree), exit code 137
         wr = syscall(61441, hProcess, 4294967295) & 4294967295;   # INFINITE — reap
         store64(killed_out, 1);
     }
@@ -333,7 +464,37 @@ fn _win_wait_timeout(pi, ms, killed_out): i64 {
     if (wr == 0) {
         if (syscall(61442, hProcess, &code) != 0) { ec = load32(&code); }   # GetExitCodeProcess
     }
+    _win_job_release(hProcess, 0);
     syscall(3, hThread);                           # CloseHandle(hThread)
+    syscall(3, hProcess);                          # CloseHandle(hProcess)
+    return ec;
+}
+
+# 6.6.10 — the batch runner's wait (cbt `_win_run_timed`: test/tests/bench/fuzz/soak/smoke/
+# doctest): `_win_wait_timeout`'s contract — the exit code, 137 with *killed_out = 1 when the
+# deadline ended it — with `ms` <= 0 meaning no deadline, and then EVERYTHING still running in
+# the child's job is ended too, deadline or not. That is the POSIX runner's subreaper sweep:
+# no descendant of a test outlives it, and one that held the runner's stdout cannot hang
+# `cyrius test f | …`. Closes the handles and the job. CHANGELOG [6.6.10]
+fn _win_wait_tree(pi, ms, killed_out): i64 {
+    var hProcess = load64(pi + 0);
+    store64(killed_out, 0);
+    var tmo = 4294967295;                         # INFINITE
+    if (ms > 0) { tmo = ms; }
+    var wr = syscall(61441, hProcess, tmo) & 4294967295;
+    if (wr == 258) {
+        _win_end_tree(hProcess, 137);
+        wr = syscall(61441, hProcess, 4294967295) & 4294967295;
+        store64(killed_out, 1);
+    }
+    var ec = 0 - 1;
+    var code[8];
+    store64(&code, 0);
+    if (wr == 0) {
+        if (syscall(61442, hProcess, &code) != 0) { ec = load32(&code); }
+    }
+    _win_job_release(hProcess, 1);
+    syscall(3, load64(pi + 8));                    # CloseHandle(hThread)
     syscall(3, hProcess);                          # CloseHandle(hProcess)
     return ec;
 }
@@ -411,8 +572,8 @@ fn run(cmd, arg1, arg2): Result {
     var ok = _win_create_process(wcmd, 0, 0, &pi);
     if (ok == 0) { return Err(1); }
     var ec = _win_wait_close(&pi);
-    if (ec == 0 - 2) { return Err(110); }         # ETIMEDOUT — the POSIX peer's PROC_ETIMEDOUT
-    if (ec == 0 - 1) { return Err(10); }          # the exit code is unknown (PROC_ECHILD)
+    if (ec == 0 - 2) { return Err(PROC_ETIMEDOUT); }
+    if (ec == 0 - 1) { return Err(PROC_ECHILD); }   # the exit code is unknown
     return Ok(ec);
 }
 
@@ -426,7 +587,7 @@ fn run_capture(cmd, arg1, arg2, buf, buflen): Result {
     var ok = _win_create_process(wcmd, hWrite, 0, &pi);
     if (ok == 0) { syscall(3, hRead); syscall(3, hWrite); return Err(1); }
     syscall(3, hWrite);                           # parent drops write end → EOF on child exit
-    var wd[24];
+    var wd[40];
     var wt = _win_watch_start(&pi, &wd);
     var total = _win_drain(hRead, buf, buflen);
     syscall(3, hRead);
@@ -440,7 +601,7 @@ fn run_capture(cmd, arg1, arg2, buf, buflen): Result {
 fn spawn(cmd, arg1, arg2): Result {
     var wcmd = _win_wcmdline3(cmd, arg1, arg2);
     var pi[24];
-    var ok = _win_create_process(wcmd, 0, 0, &pi);
+    var ok = _win_create_process_job(wcmd, 0, 0, &pi, 0);   # outlives us: no KILL_ON_JOB_CLOSE
     if (ok == 0) { return Err(1); }
     syscall(3, load64(&pi + 8));                  # close hThread (unused)
     return Ok(load64(&pi + 0));                   # hProcess as the pid token
@@ -449,9 +610,10 @@ fn spawn(cmd, arg1, arg2): Result {
 # Wait for a previously-spawned process handle. Returns Result(exit_code).
 fn wait_pid(pid): Result {
     var ec = _win_wait_handle(pid);               # bounded by the deadline in force (6.6.8)
+    _win_job_release(pid, 0);
     syscall(3, pid);                              # CloseHandle
-    if (ec == 0 - 2) { return Err(110); }
-    if (ec == 0 - 1) { return Err(10); }
+    if (ec == 0 - 2) { return Err(PROC_ETIMEDOUT); }
+    if (ec == 0 - 1) { return Err(PROC_ECHILD); }
     return Ok(ec);
 }
 
@@ -495,7 +657,7 @@ fn exec_capture_status(args, buf, buflen, status_out): i64 {
     var ok = _win_create_process(wcmd, hWrite, 0, &pi);
     if (ok == 0) { syscall(3, hRead); syscall(3, hWrite); return 0 - 1; }
     syscall(3, hWrite);
-    var wd[24];
+    var wd[40];
     var wt = _win_watch_start(&pi, &wd);
     var total = _win_drain(hRead, buf, buflen);
     syscall(3, hRead);
@@ -518,6 +680,7 @@ fn exec_env(args, env): i64 {
     if (vec_len(args) < 1) { return 0 - 1; }
     var wcmd = _win_wcmdline_vec(args, 0);
     var wenv = _win_wenvblock_vec(env, 0);
+    if (wcmd == 0 || wenv == 0) { return 0 - 1; }   # out of memory (0 would mean "inherit the env")
     var pi[24];
     var ok = _win_create_process(wcmd, 0, wenv, &pi);
     if (ok == 0) { return 0 - 1; }
@@ -549,7 +712,7 @@ fn exec_capture_str(args, buf, buflen): i64 {
     var ok = _win_create_process(wcmd, hWrite, 0, &pi);
     if (ok == 0) { syscall(3, hRead); syscall(3, hWrite); return 0 - 1; }
     syscall(3, hWrite);
-    var wd[24];
+    var wd[40];
     var wt = _win_watch_start(&pi, &wd);
     var total = _win_drain(hRead, buf, buflen);
     syscall(3, hRead);
@@ -563,6 +726,7 @@ fn exec_env_str(args, env): i64 {
     if (vec_len(args) < 1) { return 0 - 1; }
     var wcmd = _win_wcmdline_vec(args, 1);
     var wenv = _win_wenvblock_vec(env, 1);
+    if (wcmd == 0 || wenv == 0) { return 0 - 1; }   # out of memory (0 would mean "inherit the env")
     var pi[24];
     var ok = _win_create_process(wcmd, 0, wenv, &pi);
     if (ok == 0) { return 0 - 1; }

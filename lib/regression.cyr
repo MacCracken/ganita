@@ -75,12 +75,115 @@ include "lib/str.cyr"
 include "lib/result.cyr"
 include "lib/net.cyr"
 
-# v6.2.7: AGNOS has no fork/dup2/execve/chdir/wait4 — the POSIX fork+exec model
-# the process/SSH verbs below use can't map onto agnos's in-memory-ELF SYS_SPAWN.
-# Route those verbs to a fail-closed peer (mirrors process.cyr → process_agnos.cyr,
-# v6.0.51). The PORTABLE verbs (display, buffer-scan, regression_network_probe,
-# regression_ssh_target) stay shared. Resolves the regression.cyr cascade layer of
-# docs/development/issues/2026-06-15-cyrius-thread-agnos-clone-dispatch.md.
+# ── Deadlines and the deadline-kill counters — SHARED by every target ──
+# (6.6.10: lifted out of the POSIX-only region so lib/regression_agnos.cyr's verbs honour the
+# same CYRIUS_CHECK_TIMEOUT and count their deadline kills where the check driver reads them;
+# they were inside `#ifndef CYRIUS_TARGET_AGNOS`, so the agnos peer could not reach them and
+# answered 0 for both counters. CHANGELOG [6.6.10])
+
+# Deadline in MILLISECONDS for a child this module spawns. `CYRIUS_CHECK_TIMEOUT` is in
+# SECONDS, mirroring `CYRIUS_TEST_TIMEOUT` for the `cyrius test` runner. Default 120 s:
+# three orders of magnitude above a .tcyr and well over an order above the slowest compile
+# in the suite, so it can only fire on something genuinely stuck. Set it to 0 to disable
+# the deadline (then a hang is a hang again — which is what this exists to stop).
+#
+# ⛔ 6.6.8 — DIGITS ONLY, AND A BAD VALUE IS LOUD. This was `atoi`, which reads a digit
+# PREFIX: `2m` meant 2 s, `1.5` meant 1 s, and `abc`, '' and ` 120` (a leading space) all
+# meant 0 — which DISABLES the deadline — so a typo in the one knob that bounds the run
+# silently took the bound away. A value that is not a plain whole number of seconds now
+# falls back to the default with one stderr line naming the variable (once per process),
+# the rule check.sh already applies to CYRIUS_CHECK_REAP_MINS. CHANGELOG [6.6.8]
+var _regression_warned_short = 0;
+var _regression_warned_long = 0;
+
+# Seconds from env `name` as ms, or -1 when the value is unset / not digits-only (with the
+# loud line, once, when it is SET but malformed; `warned` is the once-flag's address).
+fn _regression_env_secs(name, warned): i64 {
+    var v = getenv(name);
+    if (v == 0) { return 0 - 1; }
+    var n = strlen(v);
+    var ok = 1;
+    if (n == 0 || n > 9) { ok = 0; }
+    var i = 0;
+    var s = 0;
+    while (i < n && ok == 1) {
+        var c = load8(v + i);
+        if (c < 48 || c > 57) { ok = 0; }
+        else { s = s * 10 + (c - 48); }
+        i = i + 1;
+    }
+    if (ok == 1) { return s * 1000; }
+    if (load64(warned) == 0) {
+        store64(warned, 1);
+        var e1 = "regression: ";
+        sys_write(2, e1, strlen(e1));
+        sys_write(2, name, strlen(name));
+        var e2 = "='";
+        sys_write(2, e2, strlen(e2));
+        sys_write(2, v, n);
+        var e3 = "' is not a whole number of seconds (digits only, at most 9) — ";
+        sys_write(2, e3, strlen(e3));
+        var e4 = "IGNORED, the default deadline stays in force\n";
+        sys_write(2, e4, strlen(e4));
+    }
+    return 0 - 1;
+}
+
+fn _regression_timeout_ms(): i64 {
+    var ms = _regression_env_secs("CYRIUS_CHECK_TIMEOUT", &_regression_warned_short);
+    if (ms < 0) { return 120000; }
+    return ms;
+}
+
+# The LONG bound, for children whose runtime is not this process's business: ssh/scp
+# (network, minutes for a Windows self-host) and externally-driven gate scripts. BOUNDED
+# is the property, not "fast"; 900 s is the bound, and the whole of check.sh runs in ~13
+# minutes, so nothing legitimate is near it. `CYRIUS_CHECK_LONG_TIMEOUT` overrides, in
+# seconds, digits only (see above).
+fn _regression_long_timeout_ms(): i64 {
+    var ms = _regression_env_secs("CYRIUS_CHECK_LONG_TIMEOUT", &_regression_warned_long);
+    if (ms < 0) { return 900000; }
+    return ms;
+}
+
+# ⛔ 6.6.8 — A DEADLINE KILL IS COUNTED WHERE IT HAPPENS, so a caller that drops the verb's
+# return value still cannot report the row as an ordinary FAIL or, worse, as a PASS. The
+# deadline's verdict used to travel ONLY through the return value, and 27 of the 30 calls in
+# the check driver never read it: a compile cut at the deadline read as "exit 137", a lint
+# child as "0 warnings". The driver compares this count before and after each row.
+var _regression_deadline_kills = 0;
+var _regression_last_deadline = 0;
+
+# How many children this process has ended at a deadline, ever.
+fn regression_deadline_kills(): i64 { return _regression_deadline_kills; }
+
+# The bound (ms) that fired for the most recent of them; 0 if none has.
+fn regression_last_deadline_ms(): i64 { return _regression_last_deadline; }
+
+# Decode a `_regression_wait_deadline` outcome into `status_out`'s two slots: [0] exit code
+# · 128+sig · -2 the DEADLINE (v6.6.6: not the 137 its own SIGKILL produces — "it never
+# finished" is not "it crashed") · -1 not observed (6.6.7: waitpid never reaped the child, so
+# `st` is not a status and is NOT decoded); [1] = 1 iff a signal killed it. CHANGELOG [6.6.7]
+fn _regression_store_status(status_out, reaped, st): i64 {
+    var code = 0 - 1;
+    var sig = 0;
+    if (reaped == 1) {
+        if (WIFEXITED(st) == 1) { code = WEXITSTATUS(st); }
+        if (WIFSIGNALED(st) == 1) { code = 128 + WTERMSIG(st); sig = 1; }
+    }
+    if (reaped == 0) { code = 0 - 2; }
+    store64(status_out, code);
+    store64(status_out + 8, sig);
+    return 0;
+}
+
+# agnos has fork#96 but no execve, dup2, /dev/null, cwd or poll(2), so the POSIX fork+exec
+# verbs below do not map onto it. Its peer, lib/regression_agnos.cyr, runs the same verbs the
+# agnos way — from-disk spawn with argv (#43), child fds redirected at spawn time (#62), pipes
+# drained with non-blocking reads, a deadline, and kill_tree — since 6.6.10; the ssh / scp /
+# codesign / exec-in-dir verbs stay fail-closed there (no ssh, no cwd). The PORTABLE verbs
+# (display, buffer-scan, regression_network_probe, regression_ssh_target) stay shared. (This
+# read "agnos has no fork … agnos's in-memory-ELF SYS_SPAWN" — the v6.2.7 kernel — until 6.6.10.)
 #ifdef CYRIUS_TARGET_AGNOS
 include "lib/regression_agnos.cyr"
 #endif
@@ -203,85 +306,6 @@ fn regression_file_contains_substr(path, substr): i64 {
 # the parent dies — a SIGKILLed parent runs no cleanup, ever, so nothing parent-side can
 # reach the child. CHANGELOG [6.6.6]
 
-# Deadline in MILLISECONDS for a child this module spawns. `CYRIUS_CHECK_TIMEOUT` is in
-# SECONDS, mirroring `CYRIUS_TEST_TIMEOUT` for the `cyrius test` runner. Default 120 s:
-# three orders of magnitude above a .tcyr and well over an order above the slowest compile
-# in the suite, so it can only fire on something genuinely stuck. Set it to 0 to disable
-# the deadline (then a hang is a hang again — which is what this exists to stop).
-#
-# ⛔ 6.6.8 — DIGITS ONLY, AND A BAD VALUE IS LOUD. This was `atoi`, which reads a digit
-# PREFIX: `2m` meant 2 s, `1.5` meant 1 s, and `abc`, '' and ` 120` (a leading space) all
-# meant 0 — which DISABLES the deadline — so a typo in the one knob that bounds the run
-# silently took the bound away. A value that is not a plain whole number of seconds now
-# falls back to the default with one stderr line naming the variable (once per process),
-# the rule check.sh already applies to CYRIUS_CHECK_REAP_MINS. CHANGELOG [6.6.8]
-var _regression_warned_short = 0;
-var _regression_warned_long = 0;
-
-# Seconds from env `name` as ms, or -1 when the value is unset / not digits-only (with the
-# loud line, once, when it is SET but malformed; `warned` is the once-flag's address).
-fn _regression_env_secs(name, warned): i64 {
-    var v = getenv(name);
-    if (v == 0) { return 0 - 1; }
-    var n = strlen(v);
-    var ok = 1;
-    if (n == 0 || n > 9) { ok = 0; }
-    var i = 0;
-    var s = 0;
-    while (i < n && ok == 1) {
-        var c = load8(v + i);
-        if (c < 48 || c > 57) { ok = 0; }
-        else { s = s * 10 + (c - 48); }
-        i = i + 1;
-    }
-    if (ok == 1) { return s * 1000; }
-    if (load64(warned) == 0) {
-        store64(warned, 1);
-        var e1 = "regression: ";
-        sys_write(2, e1, strlen(e1));
-        sys_write(2, name, strlen(name));
-        var e2 = "='";
-        sys_write(2, e2, strlen(e2));
-        sys_write(2, v, n);
-        var e3 = "' is not a whole number of seconds (digits only, at most 9) — ";
-        sys_write(2, e3, strlen(e3));
-        var e4 = "IGNORED, the default deadline stays in force\n";
-        sys_write(2, e4, strlen(e4));
-    }
-    return 0 - 1;
-}
-
-fn _regression_timeout_ms(): i64 {
-    var ms = _regression_env_secs("CYRIUS_CHECK_TIMEOUT", &_regression_warned_short);
-    if (ms < 0) { return 120000; }
-    return ms;
-}
-
-# The LONG bound, for children whose runtime is not this process's business: ssh/scp
-# (network, minutes for a Windows self-host) and externally-driven gate scripts. BOUNDED
-# is the property, not "fast"; 900 s is the bound, and the whole of check.sh runs in ~13
-# minutes, so nothing legitimate is near it. `CYRIUS_CHECK_LONG_TIMEOUT` overrides, in
-# seconds, digits only (see above).
-fn _regression_long_timeout_ms(): i64 {
-    var ms = _regression_env_secs("CYRIUS_CHECK_LONG_TIMEOUT", &_regression_warned_long);
-    if (ms < 0) { return 900000; }
-    return ms;
-}
-
-# ⛔ 6.6.8 — A DEADLINE KILL IS COUNTED WHERE IT HAPPENS, so a caller that drops the verb's
-# return value still cannot report the row as an ordinary FAIL or, worse, as a PASS. The
-# deadline's verdict used to travel ONLY through the return value, and 27 of the 30 calls in
-# the check driver never read it: a compile cut at the deadline read as "exit 137", a lint
-# child as "0 warnings". The driver compares this count before and after each row.
-var _regression_deadline_kills = 0;
-var _regression_last_deadline = 0;
-
-# How many children this process has ended at a deadline, ever.
-fn regression_deadline_kills(): i64 { return _regression_deadline_kills; }
-
-# The bound (ms) that fired for the most recent of them; 0 if none has.
-fn regression_last_deadline_ms(): i64 { return _regression_last_deadline; }
-
 # Called in the CHILD, between fork and execve. PR_SET_PDEATHSIG = 1, SIGKILL = 9; it
 # survives execve for a non-setuid binary, so the exec'd program inherits it. Linux only —
 # prctl is not a Darwin/BSD syscall and is not routed on PE. The getppid re-check closes
@@ -351,12 +375,27 @@ var _REGRESSION_TREE_CAP = 4096;
 var _regression_tree_dbuf = 0;    # getdents64 buffer
 var _regression_tree_cbuf = 0;    # a task's `children` file
 
+# 0 once all THREE walk buffers exist, -1 if any allocation was refused. Each is retried until
+# it succeeds: the idempotence test used to be on the pid list alone, and nothing was checked,
+# so a refused allocation made the deadline's tree walk write through address 0. CHANGELOG [6.6.10]
 fn _regression_tree_init(): i64 {
-    if (_regression_tree_pids != 0) { return 0; }
-    _regression_tree_pids = alloc(_REGRESSION_TREE_CAP * 8);
-    _regression_tree_dbuf = alloc(4096);
-    _regression_tree_cbuf = alloc(65536);
+    if (_regression_tree_pids == 0) { _regression_tree_pids = alloc(_REGRESSION_TREE_CAP * 8); }
+    if (_regression_tree_dbuf == 0) { _regression_tree_dbuf = alloc(4096); }
+    if (_regression_tree_cbuf == 0) { _regression_tree_cbuf = alloc(65536); }
+    if (_regression_tree_pids == 0 || _regression_tree_dbuf == 0) { return 0 - 1; }
+    if (_regression_tree_cbuf == 0) { return 0 - 1; }
     return 0;
+}
+
+# sys_fork for every timed verb here: on Linux the deadline walks the child's tree, so the walk
+# buffers are allocated BEFORE the child exists — a refused allocation is then this verb's
+# ordinary fork failure (-ENOMEM; each caller's `pid < 0` arm cleans up and returns its error)
+# instead of a fault inside the deadline with a child left running. CHANGELOG [6.6.10]
+fn _regression_fork(): i64 {
+    #ifdef CYRIUS_TARGET_LINUX
+    if (_regression_tree_init() < 0) { return 0 - 12; }
+    #endif
+    return sys_fork();
 }
 
 # Decimal `v` (>= 0) at `p`; returns the byte after it.
@@ -460,7 +499,7 @@ fn _regression_tree_add_children(pid, n): i64 {
 # (0 elsewhere — there is no /proc to walk).
 fn _regression_tree_collect(root): i64 {
     #ifdef CYRIUS_TARGET_LINUX
-    _regression_tree_init();
+    if (_regression_tree_init() < 0) { return 0; }   # no buffers: nothing can be walked
     var n = _regression_tree_add_children(root, 0);
     var i = 0;
     while (i < n) {
@@ -575,6 +614,19 @@ fn _regression_reap_ended(): i64 {
     return w;
 }
 
+# Reap, WITHOUT waiting, every child of this process that has already ended — including the
+# orphans a child SUBREAPER adopts — and return how many were reaped. For a supervisor that
+# must not accumulate zombies between rows (the check driver calls it before each row). Only
+# call it while no child whose status you still want is running: it collects ANY ended child.
+# CHANGELOG [6.6.10]
+fn regression_reap_orphans(): i64 {
+    var st[8];
+    var n = 0;
+    var w = sys_waitpid(0 - 1, &st, 1);
+    while (w > 0) { n = n + 1; w = sys_waitpid(0 - 1, &st, 1); }
+    return n;
+}
+
 var _regression_termed = 0;     # i64[_REGRESSION_TREE_CAP] pids already sent their SIGTERM
 var _regression_termed_n = 0;
 
@@ -582,6 +634,8 @@ var _regression_termed_n = 0;
 fn _regression_term_children_once(): i64 {
     #ifdef CYRIUS_TARGET_LINUX
     if (_regression_termed == 0) { _regression_termed = alloc(_REGRESSION_TREE_CAP * 8); }
+    if (_regression_termed == 0) { return 0 - 1; }                   # CHANGELOG [6.6.10]
+    if (_regression_tree_init() < 0) { return 0 - 1; }
     var k = _regression_tree_add_children(sys_getpid(), 0);
     var i = 0;
     while (i < k) {
@@ -607,7 +661,10 @@ fn _regression_term_children_once(): i64 {
 # orphan as it is reparented here (the caller must be a child SUBREAPER — prctl
 # PR_SET_CHILD_SUBREAPER — or orphans go to init instead); EXIT traps get up to `grace_ms`;
 # then the whole remaining tree is SIGKILLed and reaped. Returns how many descendants were
-# running when it started (0: nothing to do). The check driver calls it on its way out and
+# RUNNING when it started (0: nothing to do) — zombies are not counted: ended children are
+# reaped first and an ended grandchild is skipped (it used to count every listed descendant,
+# so the check driver blamed rows for "leaving running" processes that were long dead —
+# measured: 3 zombies reported as 3; CHANGELOG [6.6.10]). The check driver calls it on its way out and
 # `cyrius_check --run-gate` when its gate ends. Linux only (it walks /proc); elsewhere it
 # reaps the children that have ALREADY ended, signals nothing and returns 0 at once — the
 # loops below are Linux-only because off Linux they would kill nothing and only wait out
@@ -619,7 +676,8 @@ fn regression_terminate_children(grace_ms): i64 {
     #endif
     #ifdef CYRIUS_TARGET_LINUX
     var me = sys_getpid();
-    var n = _regression_tree_collect(me);
+    _regression_reap_ended();
+    var n = _regression_tree_sweep(_regression_tree_collect(me), 0);   # the LIVE ones
     _regression_termed_n = 0;
     var waited = 0;
     var left = _regression_reap_ended();
@@ -756,6 +814,7 @@ fn regression_pipe_read_all(fd, buf, cap, timeout_ms): i64 {
 fn regression_pipe_to_bin_capture(bin_path, src_path, out_path, envp): i64 {
     var src_cap = 1048576;
     var src_buf = alloc(src_cap);
+    if (src_buf == 0) { return 0 - 1; }                              # CHANGELOG [6.6.10]
     var src_n = file_read_all(src_path, src_buf, src_cap);
     if (src_n < 0) { src_n = 0; }
 
@@ -774,7 +833,7 @@ fn regression_pipe_to_bin_capture(bin_path, src_path, out_path, envp): i64 {
     var wfd = load32(&pipefd + 4);
 
     var _rg_ppid = sys_getpid();
-    var pid = sys_fork();
+    var pid = _regression_fork();
     if (pid < 0) {
         sys_close(rfd); sys_close(wfd); sys_close(out_fd);
         return 0 - 1;
@@ -833,7 +892,7 @@ fn regression_pipe_to_bin(bin_path, src_path, envp): i64 {
 #   -2         timeout (child SIGKILL'd)
 fn regression_run_with_timeout(bin_path, timeout_ms, envp): i64 {
     var _rg_ppid = sys_getpid();
-    var pid = sys_fork();
+    var pid = _regression_fork();
     if (pid < 0) { return 0 - 1; }
     if (pid == 0) {
         _regression_child_guard(_rg_ppid);
@@ -870,23 +929,6 @@ fn regression_run_with_timeout(bin_path, timeout_ms, envp): i64 {
 
 # ── Process: exec + capture ───────────────
 
-# Decode a `_regression_wait_deadline` outcome into `status_out`'s two slots: [0] exit code
-# · 128+sig · -2 the DEADLINE (v6.6.6: not the 137 its own SIGKILL produces — "it never
-# finished" is not "it crashed") · -1 not observed (6.6.7: waitpid never reaped the child, so
-# `st` is not a status and is NOT decoded); [1] = 1 iff a signal killed it. CHANGELOG [6.6.7]
-fn _regression_store_status(status_out, reaped, st): i64 {
-    var code = 0 - 1;
-    var sig = 0;
-    if (reaped == 1) {
-        if (WIFEXITED(st) == 1) { code = WEXITSTATUS(st); }
-        if (WIFSIGNALED(st) == 1) { code = 128 + WTERMSIG(st); sig = 1; }
-    }
-    if (reaped == 0) { code = 0 - 2; }
-    store64(status_out, code);
-    store64(status_out + 8, sig);
-    return 0;
-}
-
 # Run `bin_path` (no args), capture stdout into `buf[0..buflen)`,
 # discard stderr. Returns bytes captured (>= 0) or 0 on
 # fork/open failure. envp threaded through.
@@ -906,7 +948,7 @@ fn regression_exec_capture_status(bin_path, buf, buflen, envp, status_out): i64 
     var out_fd = sys_open(out_path, 577, 420);
     if (out_fd < 0) { store64(status_out, 0 - 1); store64(status_out + 8, 0); return 0; }
     var _rg_ppid = sys_getpid();
-    var pid = sys_fork();
+    var pid = _regression_fork();
     if (pid < 0) {
         sys_close(out_fd); sys_unlink(out_path);
         store64(status_out, 0 - 1); store64(status_out + 8, 0);
@@ -948,7 +990,7 @@ fn regression_exec_capture(bin_path, buf, buflen, envp): i64 {
 # WEXITSTATUS or 128+sig.
 fn regression_exec_run(bin_path, envp): i64 {
     var _rg_ppid = sys_getpid();
-    var pid = sys_fork();
+    var pid = _regression_fork();
     if (pid < 0) { return 0 - 1; }
     if (pid == 0) {
         _regression_child_guard(_rg_ppid);
@@ -999,7 +1041,7 @@ fn regression_exec_with_arg_capture_status(bin_path, arg, buf, buflen, envp, sta
     var out_fd = sys_open(out_path, 577, 420);
     if (out_fd < 0) { return 0; }
     var _rg_ppid = sys_getpid();
-    var pid = sys_fork();
+    var pid = _regression_fork();
     if (pid < 0) { sys_close(out_fd); sys_unlink(out_path); return 0; }
     if (pid == 0) {
         _regression_child_guard(_rg_ppid);
@@ -1049,7 +1091,7 @@ fn regression_exec_with_arg_capture_both_status(bin_path, arg, buf, buflen, envp
     var out_fd = sys_open(out_path, 577, 420);
     if (out_fd < 0) { return 0; }
     var _rg_ppid = sys_getpid();
-    var pid = sys_fork();
+    var pid = _regression_fork();
     if (pid < 0) { sys_close(out_fd); sys_unlink(out_path); return 0; }
     if (pid == 0) {
         _regression_child_guard(_rg_ppid);
@@ -1139,7 +1181,7 @@ fn regression_ssh_target(env_name, default_name): i64 {
 #ifndef CYRIUS_TARGET_AGNOS
 fn regression_ssh_skip_check(target): i64 {
     var _rg_ppid = sys_getpid();
-    var pid = sys_fork();
+    var pid = _regression_fork();
     if (pid < 0) { return 0; }
     if (pid == 0) {
         _regression_child_guard(_rg_ppid);
@@ -1180,7 +1222,7 @@ fn regression_ssh_skip_check(target): i64 {
 fn regression_scp_to(target, local_path, remote_path, envp): i64 {
     var dest = _regression_join3(target, ":", remote_path);
     var _rg_ppid = sys_getpid();
-    var pid = sys_fork();
+    var pid = _regression_fork();
     if (pid < 0) { return 0 - 1; }
     if (pid == 0) {
         _regression_child_guard(_rg_ppid);
@@ -1209,7 +1251,7 @@ fn regression_scp_to(target, local_path, remote_path, envp): i64 {
 # exit code.
 fn regression_ssh_remote_exit(target, command, envp): i64 {
     var _rg_ppid = sys_getpid();
-    var pid = sys_fork();
+    var pid = _regression_fork();
     if (pid < 0) { return 0 - 1; }
     if (pid == 0) {
         _regression_child_guard(_rg_ppid);
@@ -1242,7 +1284,7 @@ fn regression_ssh_remote_exec_capture(target, command, out_path, envp): i64 {
     var out_fd = sys_open(out_path, 577, 420);
     if (out_fd < 0) { return 0 - 1; }
     var _rg_ppid = sys_getpid();
-    var pid = sys_fork();
+    var pid = _regression_fork();
     if (pid < 0) { sys_close(out_fd); return 0 - 1; }
     if (pid == 0) {
         _regression_child_guard(_rg_ppid);
@@ -1301,7 +1343,7 @@ fn regression_exec_in_dir3(work_dir, bin_path, arg1, arg2, arg3, out_path, envp)
     }
     if (out_fd < 0) { return 0 - 1; }
     var _rg_ppid = sys_getpid();
-    var pid = sys_fork();
+    var pid = _regression_fork();
     if (pid < 0) { sys_close(out_fd); return 0 - 1; }
     if (pid == 0) {
         _regression_child_guard(_rg_ppid);
@@ -1346,6 +1388,7 @@ fn regression_exec_in_dir3_env(work_dir, bin_path, arg1, arg2, arg3, env_extras_
     }
     var extra_n = vec_len(env_extras_vec);
     var merged = alloc((base_n + extra_n + 1) * 8);
+    if (merged == 0) { return 0 - 1; }       # refused: fail before the fork. CHANGELOG [6.6.10]
     var mi = 0;
     var ei = 0;
     while (ei < extra_n) {

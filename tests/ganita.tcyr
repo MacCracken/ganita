@@ -871,21 +871,30 @@ assert_eq(ganita_binomial(3, 0 - 2), 0 - 1, "binomial with a negative k -> -1 (w
 assert_eq(ganita_fibonacci(0 - 5), 0 - 1, "fibonacci(-5) -> -1 (was 1)");
 assert_eq(ganita_fibonacci(10), 55, "fibonacci(10) = 55 unchanged");
 
-# ⭐ f32 sine and cosine returned their ARGUMENT for |x| >= 2^63, because the
-# underlying f64 routine reduces only within the i64 range. sin is bounded to
-# [-1, 1] by definition, so returning 2^70 is not an approximation but a
-# category error — and roughly a quarter of the finite f32 exponent range sits
-# above 2^63.
-var BIGX = t_d(1);
-var bk = 0;
-while (bk < 70) { BIGX = f64_mul(BIGX, t_d(2)); bk = bk + 1; }
-var BIGF = f32_from(BIGX);
-assert_eq(t_is_nan(ganita_f32_sin(BIGF)), 1, "f32_sin(2^70) -> NaN (was the argument, 2^70)");
-assert_eq(t_is_nan(ganita_f32_cos(BIGF)), 1, "f32_cos(2^70) -> NaN (was the argument, 2^70)");
+# ⭐ f32 sine and cosine past 2^63. Through 1.1.x they returned their ARGUMENT
+# there (the old f64 routine reduced only within the i64 range); 1.2.x guarded
+# that with NaN. Since cyrius 6.6.9 f64_sin/f64_cos reduce every finite argument
+# within 1 ulp, so 1.2.9 dropped the guard and these are the correctly rounded
+# f32 values (reference: libm sin/cos of the exact f32 input, rounded to f32).
+# Inputs as f32 bit literals: 2^70 = 0x62800000, 2^63 = 0x5F000000, FLT_MAX = 0x7F7FFFFF.
+assert_eq(ganita_f32_sin(0x62800000), 0xBF7F88AF, "f32_sin(2^70) = -0.99817944 (was NaN in 1.2.x)");
+assert_eq(ganita_f32_cos(0x62800000), 0x3D770CB4, "f32_cos(2^70) = 0.06031485 (was NaN in 1.2.x)");
+assert_eq(ganita_f32_sin(0xE2800000), 0x3F7F88AF, "f32_sin(-2^70) = -f32_sin(2^70)");
+# At the old guard boundary and at the top of the f32 range, the result is in
+# [-1, 1] and matches the reference bits.
+assert_eq(ganita_f32_sin(0x5F000000), 0x3F7FFB70, "f32_sin(2^63) = 0.99993038 (the old guard's boundary)");
+assert_eq(ganita_f32_cos(0x5F000000), 0x3C41551C, "f32_cos(2^63) = 0.01180008");
+assert_eq(ganita_f32_sin(0x7F7FFFFF), 0xBF0599B3, "f32_sin(FLT_MAX) = -0.52155596");
+assert_eq(ganita_f32_cos(0x7F7FFFFF), 0x3F5A5F96, "f32_cos(FLT_MAX) = 0.85301548");
+assert_eq(f64_le(f64_abs(f32_to(ganita_f32_cos(0x7F7FFFFF))), t_d(1)), 1,
+  "f32_cos(FLT_MAX) is in [-1, 1], as every result must be");
 # The ordinary range is untouched.
 assert_eq(t_dclose(f32_to(ganita_f32_sin(t_f32(0))), t_d(0)), 1, "f32_sin(0) = 0 unchanged");
 assert_eq(f64_lt(f64_abs(f32_to(ganita_f32_sin(t_f32(1)))), t_d(1)) , 1,
   "f32_sin(1) is in range, as every in-range result must be");
+# NaN and infinity still give NaN: there is no sine of infinity.
+assert_eq(t_is_nan(ganita_f32_sin(0x7F800000)), 1, "f32_sin(+inf) -> NaN");
+assert_eq(t_is_nan(ganita_f32_cos(0xFF800000)), 1, "f32_cos(-inf) -> NaN");
 
 test_group("linalg/math: f64 pow domain (1.1.4)");
 # pow is exp(y * ln base); ln is undefined at and below zero, so every base <= 0

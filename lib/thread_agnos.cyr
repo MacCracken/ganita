@@ -127,6 +127,7 @@ fn chan_new(cap): i64 {
     var ch = alloc(56);
     if (ch == 0) { return 0; }
     var buf = alloc(cap * 8);
+    if (buf == 0) { return 0; }                                      # CHANGELOG [6.6.10]
     store64(ch, buf);          # buf
     store64(ch + 8, cap);      # cap
     store64(ch + 16, 0);       # head

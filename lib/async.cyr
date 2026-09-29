@@ -21,11 +21,14 @@
 # iteration. Pair with `chan_try_recv` (lib/thread.cyr) for the
 # progress channel side. See CHANGELOG [5.11.15].
 
-# v6.2.7: AGNOS has no epoll_create1 / fcntl / clone-fork / wait4 in its frozen
-# syscall surface, and async is a SERVER-path runtime unused on the agnos
-# CLIENT target (inbound TCP is AGNOS Phase B; sit is a client). Route to a
-# serial/blocking peer, exactly as thread.cyr → thread_agnos.cyr (v6.2.3). The
-# cancel-token API at the bottom stays SHARED (atomic-only, portable). Resolves
+# v6.2.7: AGNOS has no epoll_create1 / fcntl / clone / wait4 in its syscall surface, so the
+# reactor below cannot exist there. Route to a serial/blocking peer, exactly as thread.cyr →
+# thread_agnos.cyr (v6.2.3). agnos DOES have fork#96 (1.56.55), a from-disk spawn (#43, 1.57.6)
+# and a blocking wait (1.57.7), and the peer's async_timeout / async_run_process use them
+# (6.6.10); inbound TCP (sock_bind/listen/accept on #56/#57) works since v6.2.22, so an async
+# server does run there, serially. (This read "clone-fork … inbound TCP is AGNOS Phase B; sit
+# is a client" until 6.6.10. CHANGELOG [6.6.10]) The cancel-token API at the bottom stays
+# SHARED (atomic-only, portable). Resolves
 # docs/development/issues/2026-06-15-cyrius-thread-agnos-clone-dispatch.md §2.
 
 # 6.6.9: every arm calls the syscall peer, alloc / alloc_via and fncall*; they were a Requires
@@ -35,6 +38,20 @@ include "lib/syscalls.cyr"
 include "lib/alloc.cyr"
 include "lib/string.cyr"
 include "lib/fnptr.cyr"
+
+# 6.6.10: async_run_process's deadline ends the child's whole tree through lib/process.cyr's
+# `proc_kill_tree`. Named here so this module stays self-sufficient, under the SAME guard as
+# the epoll body below that calls it — NOT `#ifdef CYRIUS_TARGET_LINUX`: cx defines only
+# CYRIUS_TARGET_CX, compiles that body too, and was left with proc_kill_tree undefined. The
+# agnos, PE and macOS arms route to their own files, which carry their own include.
+# CHANGELOG [6.6.10]
+#ifndef CYRIUS_TARGET_AGNOS
+#ifndef CYRIUS_TARGET_WIN
+#ifndef CYRIUS_TARGET_MACOS
+include "lib/process.cyr"
+#endif
+#endif
+#endif
 
 #ifdef CYRIUS_TARGET_AGNOS
 include "lib/async_agnos.cyr"
@@ -48,10 +65,12 @@ include "lib/async_agnos.cyr"
 include "lib/async_win.cyr"
 #endif
 
-# v6.5.27: macOS (Darwin) has no epoll either — its readiness API is kqueue, which cyrius has
-# no wrappers for. Before this guard macOS fell into the epoll body below and carried an
-# undefined `sys_epoll_wait`; route it to a serial/blocking peer, the same per-target split as
-# agnos and win. See lib/async_macos.cyr for why a fallback rather than a kqueue reactor.
+# v6.5.27: macOS (Darwin) has no epoll either — its readiness API is kqueue. Before this guard
+# macOS fell into the epoll body below and carried an undefined `sys_epoll_wait`; route it to
+# lib/async_macos.cyr, the same per-target split as agnos and win. That file is a kqueue REACTOR
+# (EVFILT_READ/WRITE for fd parking, EVFILT_TIMER for async_with_timeout's deadline and
+# async_interval, EVFILT_PROC for async_spawn_process), not a serial fallback; this note said
+# "no kqueue wrappers ... a fallback" until 6.6.10. CHANGELOG [6.6.10]
 #ifdef CYRIUS_TARGET_MACOS
 include "lib/async_macos.cyr"
 #endif
@@ -511,6 +530,7 @@ fn _async_connect_task(ctx): i64 {
 # client — connect).
 fn async_connect(rt, addr, port): i64 {
     var ctx = alloc_via(load64(rt + 32), 40);       # rt's allocator (arena-reclaimable)
+    if (ctx == 0) { return 0; }      # out of memory: no task (async_spawn's own OOM answer). CHANGELOG [6.6.10]
     store64(ctx, 0);
     store64(ctx + 8, addr);
     store64(ctx + 16, port);
@@ -540,6 +560,7 @@ fn _async_accept_task(ctx): i64 {
 # async_win.cyr's `async_accept` (AcceptEx). v6.4.44 R3 (async "W"-arc server step).
 fn async_accept(rt, listen_fd): i64 {
     var ctx = alloc_via(load64(rt + 32), 24);
+    if (ctx == 0) { return 0; }      # out of memory: no task (async_spawn's own OOM answer). CHANGELOG [6.6.10]
     store64(ctx, 0);
     store64(ctx + 8, rt);
     store64(ctx + 16, listen_fd);
@@ -563,6 +584,7 @@ fn _async_recv_task(ctx): i64 {
 # chunk (streaming with backpressure awaits the mid-body-suspend follow-on). v6.4.39.
 fn async_recv(rt, fd, buf, len): i64 {
     var ctx = alloc_via(load64(rt + 32), 40);       # rt's allocator (arena-reclaimable)
+    if (ctx == 0) { return 0; }      # out of memory: no task (async_spawn's own OOM answer). CHANGELOG [6.6.10]
     store64(ctx, 0);
     store64(ctx + 8, fd);
     store64(ctx + 16, buf);
@@ -587,6 +609,7 @@ fn _async_send_task(ctx): i64 {
 # count written (<0 = error). One write per call. v6.4.39.
 fn async_send(rt, fd, buf, len): i64 {
     var ctx = alloc_via(load64(rt + 32), 40);       # rt's allocator (arena-reclaimable)
+    if (ctx == 0) { return 0; }      # out of memory: no task (async_spawn's own OOM answer). CHANGELOG [6.6.10]
     store64(ctx, 0);
     store64(ctx + 8, fd);
     store64(ctx + 16, buf);
@@ -740,6 +763,7 @@ fn _async_resolve_task(ctx): i64 {
 # run concurrently. Linux only. v6.4.40 (async DNS).
 fn async_resolve(rt, ns_addr, ns_port, host): i64 {
     var ctx = alloc_via(load64(rt + 32), 56);       # rt's allocator (arena-reclaimable)
+    if (ctx == 0) { return 0; }      # out of memory: no task (async_spawn's own OOM answer). CHANGELOG [6.6.10]
     store64(ctx, 0);
     store64(ctx + 8, host);
     store64(ctx + 16, ns_addr);
@@ -817,10 +841,14 @@ fn async_with_timeout(rt, handle, ms): i64 {
     var tfd = _async_timerfd(ms, 0);
     if (tfd < 0) { return 0 - 1; }
     var sctx = alloc_via(load64(rt + 32), 24);      # rt's allocator (arena-reclaimable)
+    # Out of memory: -1, like a failed timerfd. With no sentinel, `_async_pump(rt, handle, 0)`
+    # would wait for the handle alone — a deadline that never fires. CHANGELOG [6.6.10]
+    if (sctx == 0) { syscall(SYS_CLOSE, tfd); return 0 - 1; }
     store64(sctx, 0);
     store64(sctx + 8, tfd);
     store64(sctx + 16, rt);
     var sentinel = async_spawn(rt, &_async_timeout_sentinel, sctx);
+    if (sentinel == 0) { syscall(SYS_CLOSE, tfd); return 0 - 1; }
     _async_pump(rt, handle, sentinel);
     # snapshot the winner BEFORE retiring (retire marks the loser DONE, which would
     # otherwise make the handle look completed)
@@ -866,13 +894,16 @@ fn async_interval(rt, fp, arg, ms, tok): i64 {
     var tfd = _async_timerfd(ms, ms);
     if (tfd < 0) { return 0; }
     var ctx = alloc_via(load64(rt + 32), 48);       # rt's allocator (arena-reclaimable)
+    if (ctx == 0) { syscall(SYS_CLOSE, tfd); return 0; }   # out of memory. CHANGELOG [6.6.10]
     store64(ctx, 0);
     store64(ctx + 8, fp);
     store64(ctx + 16, arg);
     store64(ctx + 24, tfd);
     store64(ctx + 32, rt);
     store64(ctx + 40, tok);
-    return async_spawn(rt, &_async_interval_task, ctx);
+    var h = async_spawn(rt, &_async_interval_task, ctx);
+    if (h == 0) { syscall(SYS_CLOSE, tfd); }         # no task owns the timer: do not leak it
+    return h;
 }
 
 # ================================================================
@@ -921,6 +952,7 @@ fn _async_process_task(ctx): i64 {
 # v6.4.36 (P2 — tokio::process::Command spawn).
 fn async_spawn_process(rt, path, argv, envp): i64 {
     var ctx = alloc_via(load64(rt + 32), 56);       # rt's allocator (arena-reclaimable)
+    if (ctx == 0) { return 0; }      # out of memory: no task (async_spawn's own OOM answer). CHANGELOG [6.6.10]
     store64(ctx, 0);
     store64(ctx + 8, path);
     store64(ctx + 16, argv);
@@ -933,20 +965,23 @@ fn async_spawn_process(rt, path, argv, envp): i64 {
 
 # Spawn `path` and wait for it, with an optional deadline (ms <= 0 = no deadline).
 # Returns the child's exit code, or -2 if the deadline fired first — in which case
-# the child is SIGKILLed, reaped, and its pidfd closed (no orphan, no fd leak). Does
+# the child's whole tree is ended (TERM, grace, KILL — 6.6.10), the child reaped, and its
+# pidfd closed (no orphan, no fd leak). Does
 # NOT close the runtime. v6.4.36 (P2 — the spawn + wait + timeout combinator).
 fn async_run_process(rt, path, argv, envp, ms): i64 {
     var h = async_spawn_process(rt, path, argv, envp);
     if (h == 0) { return 0 - 1; }
     if (ms <= 0) { return task_join(rt, h); }
     if (async_with_timeout(rt, h, ms) == 1) { return load64(h + 40); }
-    # timed out: clean up the still-running child
+    # Timed out: end the still-running child's WHOLE TREE. 6.6.10 — this was `sys_kill(pid, 9)`
+    # on the pid alone, so whatever the child had started kept running past the deadline.
+    # `proc_kill_tree` (lib/process.cyr) TERMs the tree, waits up to `_PROC_GRACE_MS`, KILLs the
+    # stragglers and REAPS `pid` — so there is no waitpid here. CHANGELOG [6.6.10]
     var ctx = load64(h + 8);
     var pid = load64(ctx + 32);
     if (pid > 0) {
-        sys_kill(pid, 9);
         var sb[8];
-        sys_waitpid(pid, &sb, 0);
+        proc_kill_tree(pid, &sb);
     }
     var pidfd = load64(ctx + 40);
     if (pidfd > 0) { syscall(SYS_CLOSE, pidfd); }
@@ -1016,14 +1051,29 @@ fn async_await_readable(fd): i64 {
     return 0;
 }
 
-# Run a function with a timeout (ms). Returns function result or -1 on timeout.
-# Uses fork: child runs fn, parent waits with timeout.
+# Run a function with a timeout (ms). Returns the function's result, or -1 on timeout or on
+# any failure: the pipe, the fork or the epoll set could not be made, or the child ended
+# without writing its 8-byte result (it crashed or exited early). Uses fork: the child runs
+# fn and writes the result down a pipe; the parent waits for it with the deadline.
+# ⛔ 6.6.10 — A WAKE IS NOT A RESULT. The parent took any EPOLLIN/HUP as "the child wrote its
+# result" and returned `load64(&rbuf)` after an unchecked read, so a body that crashed or
+# called exit, and a fork that FAILED (the parent closed wfd, epoll saw HUP at once), all
+# returned stale stack bytes as the fn's value (measured 6293997; on aarch64 the previous
+# call's value). And an unchecked sys_pipe left pipefd uninitialised, so the parent's close
+# of "its" fds closed the CALLER's (EBADF on the caller's fd 4 afterwards). Only an exact
+# 8-byte read is a result now; every other outcome reaps the child and returns -1.
+# CHANGELOG [6.6.10]
 fn async_timeout(fp, arg, ms): i64 {
     var pipefd[16];
-    sys_pipe(&pipefd);
+    if (sys_pipe(&pipefd) < 0) { return 0 - 1; }      # no fd was made: close none
     var rfd = load32(&pipefd);
     var wfd = load32(&pipefd + 4);
     var pid = sys_fork();
+    if (pid < 0) {
+        syscall(SYS_CLOSE, rfd);
+        syscall(SYS_CLOSE, wfd);
+        return 0 - 1;
+    }
     if (pid == 0) {
         syscall(SYS_CLOSE, rfd);
         var result = fncall1(fp, arg);
@@ -1033,32 +1083,32 @@ fn async_timeout(fp, arg, ms): i64 {
     }
     syscall(SYS_CLOSE, wfd);
     # Use epoll with timeout to wait for result
+    var got = 0 - 1;
+    var rbuf[8];
     var epfd = syscall(SYS_EPOLL_CREATE1, 0);
-    var ev[16];
-    store32(&ev, 1);
-    #ifdef CYRIUS_ARCH_AARCH64
-    store64(&ev + 8, rfd);        # epoll_data @8 on aarch64 (unpacked); @4 on x86 (v6.4.42)
-    #endif
-    #ifndef CYRIUS_ARCH_AARCH64
-    store64(&ev + 4, rfd);
-    #endif
-    syscall(SYS_EPOLL_CTL, epfd, 1, rfd, &ev);
-    var revents[16];
-    var nr = sys_epoll_wait(epfd, &revents, 1, ms);
-    syscall(SYS_CLOSE, epfd);
-    if (nr > 0) {
-        # Child finished in time
-        var rbuf[8];
-        syscall(SYS_READ, rfd, &rbuf, 8);
-        syscall(SYS_CLOSE, rfd);
-        syscall(SYS_WAIT4, pid, 0, 0, 0);
-        return load64(&rbuf);
+    if (epfd >= 0) {
+        var ev[16];
+        store32(&ev, 1);
+        #ifdef CYRIUS_ARCH_AARCH64
+        store64(&ev + 8, rfd);        # epoll_data @8 on aarch64 (unpacked); @4 on x86 (v6.4.42)
+        #endif
+        #ifndef CYRIUS_ARCH_AARCH64
+        store64(&ev + 4, rfd);
+        #endif
+        var nr = 0;
+        if (syscall(SYS_EPOLL_CTL, epfd, 1, rfd, &ev) >= 0) {
+            var revents[16];
+            nr = sys_epoll_wait(epfd, &revents, 1, ms);
+        }
+        syscall(SYS_CLOSE, epfd);
+        # Child finished in time — or died: only a whole 8-byte result counts.
+        if (nr > 0) { got = syscall(SYS_READ, rfd, &rbuf, 8); }
     }
-    # Timeout: kill child
-    syscall(SYS_KILL, pid, 9);
+    if (got != 8) { syscall(SYS_KILL, pid, 9); }       # timed out, or no result: stop it
     syscall(SYS_WAIT4, pid, 0, 0, 0);
     syscall(SYS_CLOSE, rfd);
-    return 0 - 1;
+    if (got != 8) { return 0 - 1; }
+    return load64(&rbuf);
 }
 
 #endif
@@ -1172,23 +1222,64 @@ fn async_write_unlock(lk): i64 {
 # epoll/fork/syscalls). Backing for the `async fn` / `await` sugar:
 #
 #   async fn fetch(url): i64 { ... }      # compiles to a constructor that builds
-#   var f = fetch(addr);                  # a Future [ &fetch$impl, 1, addr ] (lazy)
+#   var f = fetch(addr);                  # a Future [ &fetch$impl, 1|FUT_MEMO, addr, done, value ] (lazy)
 #   var result = await f;                 # → future_force(f): runs the body, returns its value
 #
 # A Future is a heap object `[ impl_fn_ptr, argc, arg0, …, arg{argc-1} ]` produced
 # by the async-fn constructor (synthesized in PARSE_FN_DEF). Forcing it calls the
 # impl with the bundled args. The lazy shape means an `async fn` only runs when
 # awaited (or spawned + run) — matching the cooperative runtime above, where a
-# Future is exactly a task with its arguments bundled in. v1 re-runs the body on
-# each force; force-once memoization (cache the result + a done flag) is a follow-on
-# (CHANGELOG [6.3.11]). A COROUTINE async fn (one that awaits mid-body) is the exception:
-# its body stamps DONE when it returns, and a later force answers with the same value and
-# runs nothing (CHANGELOG [6.6.8]). Requires lib/fnptr.cyr (already a hard requirement of this
-# file — async_run dispatches tasks via fncall1).
+# Future is exactly a task with its arguments bundled in.
+#
+# The argc word carries two compiler-set markers (src/frontend/parse_fn.cyr
+# `_async_argc_word`; the compiler and this file ship in LOCKSTEP):
+#   FUT_MEMO (256) — a compiler-built PLAIN Future, laid out
+#                    `[fp, argc|256, arg0 … arg{n-1}, done, value]`. It runs its body ONCE;
+#                    every later force answers from `value`. (It re-ran the body on every
+#                    force until 6.6.10 — `await F; await F;` ran it twice.)
+#   FUT_CORO (512) — a COROUTINE (an async fn that awaits mid-body), `[fp, 1|512, SELF,
+#                    state, …]`. Its impl takes SELF alone; each force resumes it once, and
+#                    once it has returned it answers with the same value and runs nothing
+#                    (CHANGELOG [6.6.8]).
+# A hand-built Future (`[fp, argc, args…]`, argc 0..8, no marker) is re-run on each force.
+# Requires lib/fnptr.cyr (already a hard requirement of this file — async_run dispatches
+# tasks via fncall1).
+var FUT_MEMO = 256;
+var FUT_CORO = 512;
+
+# Force a Future and return its value (0 for a null Future). See the layout above; the
+# header is never rewritten, so a force that re-enters the same Future (a spawned copy plus
+# a direct await) sees the same shape. CHANGELOG [6.6.10]
 fn future_force(fut): i64 {
     if (fut == 0) { return 0; }
-    var fp = load64(fut);
-    var argc = load64(fut + 8);
+    var aw = load64(fut + 8);
+    if ((aw & FUT_MEMO) == 0) {
+        var argc = aw;
+        if ((aw & FUT_CORO) != 0) { argc = aw & 255; }
+        return _future_call(load64(fut), argc, fut);
+    }
+    var n = aw & 255;
+    var mw = fut + 16 + n * 8;             # [done, value], past the arguments
+    if (load64(mw) == 1) { return load64(mw + 8); }
+    var v = _future_call(load64(fut), n, fut);
+    store64(mw + 8, v);
+    store64(mw, 1);
+    return v;
+}
+
+# 1 when `fut` is a coroutine Future that has not completed yet, else 0 (a plain or
+# hand-built Future is complete once forced). A coroutine's `await inner(..)` of a
+# coroutine Future re-suspends while this is 1, so the nested body is driven to its value.
+fn future_pending(fut): i64 {
+    if (fut == 0) { return 0; }
+    if ((load64(fut + 8) & FUT_CORO) == 0) { return 0; }
+    if (load64(fut + 24) == 0 - 1) { return 0; }   # C[state] == DONE (parse.cyr _coro_mark_done)
+    return 1;
+}
+
+# Call a Future's impl `fp` with its `argc` bundled arguments (fut+16 …). Split out of
+# future_force so the memo path calls the SAME ladder with the unmarked arity.
+fn _future_call(fp, argc, fut): i64 {
     if (argc == 0) { return fncall0(fp); }
     if (argc == 1) { return fncall1(fp, load64(fut + 16)); }
     if (argc == 2) { return fncall2(fp, load64(fut + 16), load64(fut + 24)); }
@@ -1216,8 +1307,8 @@ fn future_force(fut): i64 {
     }
     # v6.5.70: past the fncall ladder's top rung. ⛔ THIS USED TO FALL THROUGH TO fncall6 —
     # `argc >= 7` called the impl with six arguments, so arguments 7+ were never written and
-    # the body read stack garbage: `await a7(1,2,3,4,5,6,7)` returned a code-address-shaped
-    # value instead of 28, exit 0, no diagnostic. Fail loudly instead of quietly wrong.
+    # the body read stack garbage. A compiler-built Future can no longer get here (a plain
+    # async fn with 9+ parameters is refused at its declaration, 6.6.10); a hand-built one can.
     sys_write(2, "future_force: async fn arity above 8 is not supported\n", 54);
     sys_exit(70);
     return 0;

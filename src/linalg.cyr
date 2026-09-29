@@ -1,6 +1,6 @@
 # linalg.cyr — dense linear algebra on f64 matrices
-# Usage: include "lib/linalg.cyr"
-# Requires: alloc.cyr, math.cyr, matrix.cyr
+# Usage: include "lib/ganita.cyr" (the fold; this file is its linalg layer)
+# Requires: alloc.cyr, math.cyr, and ganita's own src/matrix.cyr (earlier in the fold)
 #
 # Builds on matrix.cyr's storage layer (row-major, f64 as i64 bit patterns).
 # All decompositions use out-params (Cyrius has no tuples):

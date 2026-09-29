@@ -45,6 +45,7 @@ fn thread_create(fp, arg): i64 {
     alloc_init();
     _threads_active = 1;   # v6.3.17 PF-02: arm the shared-heap lock before CreateThread
     var a = alloc(48);
+    if (a == 0) { return 0; }
     store64(a,      0);    # lpThreadAttributes = NULL
     store64(a + 8,  0);    # dwStackSize = 0 (default)
     store64(a + 16, fp);   # lpStartAddress = the cyrius body
@@ -108,7 +109,9 @@ fn gettid(): i64 { return syscall(61451); }
 fn chan_new(cap): i64 {
     alloc_init();
     var ch = alloc(56);
+    if (ch == 0) { return 0; }
     var buf = alloc(cap * 8);
+    if (buf == 0) { return 0; }
     store64(ch, buf);          # buf
     store64(ch + 8, cap);      # cap
     store64(ch + 16, 0);       # head

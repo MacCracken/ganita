@@ -212,6 +212,7 @@ fn clock_epoch_ns(): i64 {
 # Duration struct: {secs: i64, nsecs: i64} = 16 bytes
 fn dur_new(secs, nsecs): i64 {
     var d = alloc(16);
+    if (d == 0) { return 0; }
     store64(d, secs);
     store64(d + 8, nsecs);
     return d;
@@ -304,6 +305,7 @@ fn _chrono_init_mdays(): i64 {
     # Single-threaded callers see no behaviour change: the table is fully built before
     # anything can observe a non-zero pointer, which is what the guard already promised.
     var t = alloc(96);
+    if (t == 0) { return 0 - 1; }
     store64(t, 31);       # Jan
     store64(t + 8, 28);   # Feb
     store64(t + 16, 31);  # Mar
@@ -358,7 +360,9 @@ fn is_leap_year(y): i64 {
 # Returns alloc'd 48-byte struct
 fn epoch_to_date(epoch): i64 {
     _chrono_init_mdays();
+    if (_chrono_mdays == 0) { return 0; }     # 6.6.10: the month table could not be allocated
     var r = alloc(48);
+    if (r == 0) { return 0; }
     var secs = epoch;
     var days = secs / 86400;
     var rem = secs % 86400;
@@ -409,7 +413,9 @@ fn _chrono_w4(buf, pos, val): i64 {
 # Returns null-terminated string (alloc'd)
 fn iso8601(epoch): i64 {
     var d = epoch_to_date(epoch);
+    if (d == 0) { return 0; }
     var buf = alloc(24);
+    if (buf == 0) { return 0; }
     _chrono_w4(buf, 0, load64(d));       # year
     store8(buf + 4, 45);                  # -
     _chrono_w2(buf, 5, load64(d + 8));   # month
@@ -594,6 +600,7 @@ fn _chrono_emit_spec(out, op, s, year, month, day, hour, minute, second): i64 {
 # Generalizes iso8601(); iso8601() is kept as the fast fixed-form path.
 fn dt_format(dt, fmt): i64 {
     var d = epoch_to_date(dt / 1000000000);
+    if (d == 0) { return 0; }
     var year = load64(d);
     var month = load64(d + 8);
     var day = load64(d + 16);
@@ -602,6 +609,7 @@ fn dt_format(dt, fmt): i64 {
     var second = load64(d + 40);
     var flen = strlen(fmt);
     var out = alloc(flen * 4 + 16);              # each spec expands to <= 4 chars
+    if (out == 0) { return 0; }
     var op = 0;
     var i = 0;
     while (i < flen) {

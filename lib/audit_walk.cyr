@@ -27,12 +27,21 @@
 # ⛔ FAIL CLOSED (6.6.7). The lint and doc walkers used to take the tool's summary trailer
 # as their ONLY signal, through a capture verb that threw the exit status away, and a
 # missing trailer parsed as ZERO. So a cyrlint that crashed, hung, refused the file
-# (`file too large to lint`, `cannot read file` on an empty .cyr — both rc 1, no trailer)
-# or did not exist at all scored "0 warnings", and `cyrius audit` printed "ok: lint clean"
-# over rekha's 1.65 MB fonts/face_data.cyr, which cyrlint had never linted. A file now
-# counts as linted only when the run exited on its own with the status its trailer implies
+# (`file too large to lint`, rc 1, no trailer) or did not exist at all scored "0 warnings",
+# and `cyrius audit` printed "ok: lint clean" over rekha's 1.65 MB fonts/face_data.cyr,
+# which cyrlint had never linted. A file now counts as linted only when the run exited on
+# its own with the status its trailer implies
 # AND printed that trailer; anything else is an ERROR that names the file and the reason.
 # Callers must fail on AW_*_ERRORS, not only on the totals. CHANGELOG [6.6.7]
+#
+# ⛔ 6.6.10 — A DIRECTORY THE WALK COULD NOT LIST IS AN ERROR TOO. The listers folded an open
+# or getdents failure into "an empty directory" (lib/fs.cyr had the same fold), so a
+# `chmod 000 src/bad` made `cyrius audit` print "ok: format clean" / "ok: lint clean" over a
+# subtree it never saw. Each walker now records "<dir>: cannot list directory …" in its
+# AW_*_ERROR_FILES. And the non-Linux lister marks directories and symlinks (it marked every
+# entry a regular file, so on macOS, Windows and agnos the walk never descended at all).
+# An EMPTY .cyr is an ordinary file since 6.6.10 — cyrfmt/cyrlint/cyrdoc treat it as an empty
+# module (clean) and only an unreadable one as an error. CHANGELOG [6.6.10]
 #
 # Symlinked files are treated as dep files (they belong to upstream
 # and may track a different formatter baseline) and are skipped in
@@ -65,7 +74,7 @@ var AW_FMT_FAIL_FILES = 0;   # vec<str> of basenames
 # ⛔ 6.6.8 — THE FMT WALKER FAILS CLOSED TOO. It compared cyrfmt's stdout with the file and
 # threw the exit status away, so a cyrfmt that crashed (or hung to the deadline) with no
 # output on an EMPTY .cyr gave 0 == 0 bytes and the file read as formatted — and a refusal
-# that did print (its "cannot read file" goes to stdout) was reported as "needs
+# that did print (its "cannot read file" went to stdout until 6.6.10) was reported as "needs
 # reformatting", the wrong reason. A run that did not exit 0 on its own is now an ERROR that
 # names the file and why; callers fail on AW_FMT_ERRORS as on the lint/doc ones.
 var AW_FMT_ERRORS = 0;
@@ -115,7 +124,8 @@ var _AW_MARKER_VENDORED = "-- bundled distribution";
 # hardcoded `lib/unicode/` skip would silently stop covering it the day the layout moved, and a
 # `_`-prefix rule would wrongly skip hand-written internals like `_decode.cyr`.
 fn _aw_is_generated(path): i64 {
-    var buf = alloc(512);
+    var sbuf[512];                  # STACK (6.6.10): an unchecked alloc per walked file
+    var buf = &sbuf;
     var n = file_read_all(str_data(path), buf, 512);
     if (n <= 0) { return 0; }
     var i = 0;
@@ -139,7 +149,8 @@ fn _aw_is_generated(path): i64 {
 }
 
 fn _aw_is_distlib_bundle(path): i64 {
-    var buf = alloc(512);
+    var sbuf[512];                  # STACK (6.6.10): an unchecked alloc per walked file
+    var buf = &sbuf;
     var n = file_read_all(str_data(path), buf, 512);
     if (n <= 0) { return 0; }
     if (str_starts_with_buf(buf, n, _AW_MARKER_DISTLIB) == 1) { return 1; }
@@ -185,20 +196,28 @@ fn str_starts_with_buf(buf, n, prefix): i64 {
     return 0;
 }
 
-# Portable (non-Linux) dir lister: delegate to fs.cyr's cross-platform
-# dir_list (FindFirstFileW on Windows, getdirentries on macOS, agnos getdents)
-# and mark every entry DT_REG (8). No d_type, so the DT_LNK skip is dropped —
-# that is a Linux `cyrius deps` vendored-symlink concern, and the audit sweep is
-# read-only (fmt --check / lint / doc --check), so there is no write-through-
-# symlink risk; _aw_is_distlib_bundle still skips vendored bundles by content.
+# Portable (non-Linux) dir lister: fs.cyr's cross-platform checked lister (FindFirstFileW on
+# Windows, getdirentries on macOS, agnos getdents), with each entry's type asked of the
+# filesystem: DT_LNK (10) for a symlink, DT_DIR (4) for a directory, else DT_REG (8).
+# ⛔ 6.6.10: this marked EVERY entry DT_REG, so the walkers' recursive descent (which keys on
+# DT_DIR) never fired off Linux — `cyrius audit` on macOS and Windows checked the top level of
+# src/ and tests/ and nothing below — and it read an unlistable directory as empty. Returns 0,
+# or the lister's negative error. CHANGELOG [6.6.10]
 fn _aw_dir_list_portable(path, out_names, out_dtypes): i64 {
-    var names = dir_list(path);
+    var names = vec_new();
+    var lr = dir_list_checked(path, names);
     var i = 0;
     while (i < vec_len(names)) {
-        vec_push(out_names, vec_get(names, i));
-        vec_push(out_dtypes, 8);   # DT_REG
+        var nm = vec_get(names, i);
+        var full = path_join(path, nm);
+        var dt = 8;                                   # DT_REG
+        if (is_symlink(full) == 1) { dt = 10; }       # DT_LNK
+        elif (is_dir(full) == 1) { dt = 4; }          # DT_DIR
+        vec_push(out_names, nm);
+        vec_push(out_dtypes, dt);
         i = i + 1;
     }
+    if (lr < 0) { return lr; }
     return 0;
 }
 
@@ -208,6 +227,8 @@ fn _aw_dir_list_portable(path, out_names, out_dtypes): i64 {
 # (and the Linux dirent byte offsets differ from macOS), so Windows / macOS /
 # agnos route through the portable lister above. (Added cross-platform at v6.2.25
 # when `cyrius audit` began including this walker — the CLI cross-compiles to PE.)
+# Returns 0 when the whole directory was listed, or a NEGATIVE error (the open's or the
+# getdents' errno) — 6.6.10: both used to end the listing as if the directory were empty.
 fn _aw_dir_list_typed(path, out_names, out_dtypes): i64 {
     # Linux x86/aarch64 only — the getdents64 block (and SYS_GETDENTS64) must be
     # #ifndef'd OUT of the PE / Mach-O / agnos compiles, since the early-`return`
@@ -216,12 +237,14 @@ fn _aw_dir_list_typed(path, out_names, out_dtypes): i64 {
     #ifndef CYRIUS_TARGET_MACOS
     #ifndef CYRIUS_TARGET_AGNOS
     var fd = sys_open(str_data(path), O_RDONLY, 0);
-    if (fd < 0) { return 0; }
-    var buf = alloc(4096);
+    if (fd < 0) { return fd; }
+    var sbuf[4096];                 # STACK (6.6.10): was an unchecked alloc per directory
+    var buf = &sbuf;
     var rgo = 1;
     while (rgo == 1) {
         var n = syscall(SYS_GETDENTS64, fd, buf, 4096);
-        if (n <= 0) { rgo = 0; }
+        if (n < 0) { sys_close(fd); return n; }
+        if (n == 0) { rgo = 0; }
         else {
             var pos = 0;
             while (pos < n) {
@@ -236,7 +259,16 @@ fn _aw_dir_list_typed(path, out_names, out_dtypes): i64 {
                     }
                 }
                 if (skip == 0) {
-                    vec_push(out_names, str_from(name));
+                    var nstr = str_clone(str_from(name));
+                    # DT_UNKNOWN (0): the filesystem does not fill d_type — ask it, so the
+                    # descent still happens there. CHANGELOG [6.6.10]
+                    if (dtype == 0) {
+                        var ufull = path_join(path, nstr);
+                        dtype = 8;
+                        if (is_symlink(ufull) == 1) { dtype = 10; }
+                        elif (is_dir(ufull) == 1) { dtype = 4; }
+                    }
+                    vec_push(out_names, nstr);
                     vec_push(out_dtypes, dtype);
                 }
                 pos = pos + reclen;
@@ -250,6 +282,11 @@ fn _aw_dir_list_typed(path, out_names, out_dtypes): i64 {
     #endif
     # Windows / macOS / agnos (also the unreachable tail on Linux): cross-platform.
     return _aw_dir_list_portable(path, out_names, out_dtypes);
+}
+
+# The AW_*_ERROR_FILES note for a directory a walker could not list. CHANGELOG [6.6.10]
+fn _aw_unlisted_note(dir, err): i64 {
+    return _aw_note(dir, "cannot list directory (subtree NOT checked), error ", 0 - err);
 }
 
 var _AW_DT_DIR = 4;
@@ -310,13 +347,22 @@ fn audit_fmt_walk(cyrfmt_path, dirs_vec): i64 {
     var cap = 2000000;
     var orig_buf = alloc(cap);
     var fmt_buf  = alloc(cap);
+    if (orig_buf == 0 || fmt_buf == 0) {   # 6.6.10: were stored through unchecked
+        AW_FMT_ERRORS = 1;
+        vec_push(AW_FMT_ERROR_FILES, str_from("audit_fmt_walk: out of memory — nothing was checked"));
+        return 1;
+    }
 
     var di = 0;
     while (di < vec_len(dirs_vec)) {
         var dir = vec_get(dirs_vec, di);
         var names = vec_new();
         var dtypes = vec_new();
-        _aw_dir_list_typed(dir, names, dtypes);
+        var _awlr = _aw_dir_list_typed(dir, names, dtypes);
+        if (_awlr < 0) {
+            AW_FMT_ERRORS = AW_FMT_ERRORS + 1;
+            vec_push(AW_FMT_ERROR_FILES, _aw_unlisted_note(dir, _awlr));
+        }
         var ni = 0;
         while (ni < vec_len(names)) {
             var name = vec_get(names, ni);
@@ -343,6 +389,13 @@ fn audit_fmt_walk(cyrfmt_path, dirs_vec): i64 {
                         AW_FMT_SKIPPED = AW_FMT_SKIPPED + 1;
                     } else {
                         var orig_n = file_read_all(str_data(full), orig_buf, cap);
+                        # 6.6.10: an unreadable file is an ERROR by name, whatever cyrfmt says.
+                        if (orig_n < 0) {
+                            AW_FMT_ERRORS = AW_FMT_ERRORS + 1;
+                            vec_push(AW_FMT_ERROR_FILES, _aw_note(full, "cannot read the file, error ", 0 - orig_n));
+                            ni = ni + 1;
+                            continue;
+                        }
                         var args = vec_new();
                         vec_push(args, cyrfmt_path);
                         vec_push(args, str_data(full));
@@ -504,6 +557,11 @@ fn audit_lint_walk(cyrlint_path, dirs_vec): i64 {
     # output that overflows the buffer loses its trailer — which now reads as an ERROR.
     var cap = 1048576;
     var lint_buf = alloc(cap);
+    if (lint_buf == 0) {                    # 6.6.10: was handed to the capture unchecked
+        AW_LINT_ERRORS = 1;
+        vec_push(AW_LINT_ERROR_FILES, str_from("audit_lint_walk: out of memory — nothing was linted"));
+        return 1;
+    }
     var st[16];
 
     var di = 0;
@@ -511,7 +569,11 @@ fn audit_lint_walk(cyrlint_path, dirs_vec): i64 {
         var dir = vec_get(dirs_vec, di);
         var names = vec_new();
         var dtypes = vec_new();
-        _aw_dir_list_typed(dir, names, dtypes);
+        var _awlr = _aw_dir_list_typed(dir, names, dtypes);
+        if (_awlr < 0) {
+            AW_LINT_ERRORS = AW_LINT_ERRORS + 1;
+            vec_push(AW_LINT_ERROR_FILES, _aw_unlisted_note(dir, _awlr));
+        }
         var ni = 0;
         while (ni < vec_len(names)) {
             var name = vec_get(names, ni);
@@ -616,13 +678,22 @@ fn audit_doc_walk(cyrdoc_path, dirs_vec): i64 {
     AW_DOC_ERROR_FILES = vec_new();
     var cap = 1048576;   # see audit_lint_walk: stderr shares the pipe on Windows
     var doc_buf = alloc(cap);
+    if (doc_buf == 0) {                     # 6.6.10: was handed to the capture unchecked
+        AW_DOC_ERRORS = 1;
+        vec_push(AW_DOC_ERROR_FILES, str_from("audit_doc_walk: out of memory — nothing was checked"));
+        return 1;
+    }
     var st[16];
     var di = 0;
     while (di < vec_len(dirs_vec)) {
         var dir = vec_get(dirs_vec, di);
         var names = vec_new();
         var dtypes = vec_new();
-        _aw_dir_list_typed(dir, names, dtypes);
+        var _awlr = _aw_dir_list_typed(dir, names, dtypes);
+        if (_awlr < 0) {
+            AW_DOC_ERRORS = AW_DOC_ERRORS + 1;
+            vec_push(AW_DOC_ERROR_FILES, _aw_unlisted_note(dir, _awlr));
+        }
         var ni = 0;
         while (ni < vec_len(names)) {
             var name = vec_get(names, ni);

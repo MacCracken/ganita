@@ -4,6 +4,43 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.9] — 2026-09-29 — f32 `sin` / `cos` are correct past 2^63
+
+Toolchain **6.6.9 → 6.6.10** (the vendored `lib/` is the full 6.6.10 snapshot). No
+public signature changed. **597 assertions** (was 589). Reported by cyrius 6.6.11 bite 14;
+re-vendored into cyrius 6.6.11 as `lib/ganita.cyr`.
+
+### Fixed — `ganita_f32_sin` / `ganita_f32_cos` returned NaN for |x| ≥ 2^63
+
+The 1.2.x guard returned NaN at and above 2^63 because stdlib's `f64_sin` / `f64_cos`
+used to reduce only within the i64 range and returned the argument past it. cyrius
+6.6.9 made both within 1 ulp for every finite argument on every target, so the guard
+now threw away a correct value: `ganita_f32_sin(2^70)` was NaN where the answer is
+-0.99817944 (`0xBF7F88AF`). The guard (`_F32_TRIG_LIMIT`, `_f32_trig_limit`) is gone and
+both are `f32_from(f64_sin|cos(f32_to(x)))` again. Roughly a quarter of the finite f32
+exponent range is above 2^63. ±inf and NaN still give NaN.
+
+### Changed — the matrix / linalg headers named retired stdlib files
+
+`src/matrix.cyr` said `Usage: include "lib/matrix.cyr"` and `src/linalg.cyr` said
+`include "lib/linalg.cyr"` / `Requires: … matrix.cyr`. Neither file has existed in
+cyrius's `lib/` since the carve; a consumer gets both layers through `lib/ganita.cyr`.
+The headers say so now. Comment only (the text is carried into the fold, which is why
+it is fixed here and not in cyrius's copy).
+
+### Tests
+
+- The two rows that pinned NaN for `sin` / `cos` of 2^70 now assert the correctly rounded
+  f32 (reference: libm on the exact f32 input, rounded to f32), plus rows for -2^70, the
+  old boundary 2^63 and `FLT_MAX`, an in-[-1, 1] row, and ±inf → NaN. Against 1.2.8's
+  `math_f32.cyr` 8 of them fail. Same results on aarch64 (qemu).
+
+### Changed
+
+- **Toolchain pin 6.6.9 → 6.6.10.** `lib/` re-vendored with `cyrius lib sync --full`
+  (111 files, `diff -rq` clean against the 6.6.10 snapshot); `dist/` regenerated with
+  `cyrius distlib --all` (reproducible; the `.deps` sidecar is unchanged).
+
 ## [1.2.8] — 2026-09-28 — `pow` is within 1 ulp everywhere
 
 Toolchain **6.6.7 → 6.6.9** (the vendored `lib/` is the full 6.6.9 snapshot). No

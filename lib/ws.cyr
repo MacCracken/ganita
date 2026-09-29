@@ -43,6 +43,7 @@ enum WsState {
 # Create WebSocket handle from connected socket
 fn ws_new(fd): i64 {
     var ws = alloc(32);
+    if (ws == 0) { return 0; }
     store64(ws, fd);
     store64(ws + 8, WS_CONNECTING);
     store64(ws + 16, 0);
@@ -77,10 +78,15 @@ fn _ws_handshake_request(path, host, key_out): i64 {
     var raw[16];
     if (sys_getrandom(&raw, 16, 0) != 16) { return 0; }
     var key = base64_encode(&raw, 16);
+    if (key == 0) { return 0; }
     memcpy(key_out, key, strlen(key));
     store8(key_out + strlen(key), 0);
 
-    var buf = alloc(512);
+    # 6.6.10: sized from the request, not a fixed 512. The path and host were memcpy'd into a
+    # 512-byte buffer with no length check, so a long path overran the heap (the CVE-50 shape
+    # in lib/http.cyr); the fixed text below is 114 bytes plus the NUL. CHANGELOG [6.6.10]
+    var buf = alloc(strlen(path) + strlen(host) + strlen(key) + 160);
+    if (buf == 0) { return 0; }
     var pos = 0;
     # GET path HTTP/1.1\r\n
     memcpy(buf + pos, "GET ", 4); pos = pos + 4;
@@ -104,6 +110,7 @@ fn _ws_handshake_request(path, host, key_out): i64 {
 # Perform WebSocket handshake on connected socket
 fn ws_connect(sock, path, host): i64 {
     var ws = ws_new(sock);
+    if (ws == 0) { return 0; }
     var key[32];
     var req = _ws_handshake_request(path, host, &key);
     if (req == 0) { store64(ws + 8, WS_CLOSED); return ws; }   # CVE-19: no entropy → fail closed
@@ -115,7 +122,9 @@ fn ws_connect(sock, path, host): i64 {
     # Read response (simplified — check for 101)
     var resp[512];
     var n = sys_read(sock, &resp, 511);
-    if (n <= 0) { store64(ws + 8, WS_CLOSED); return ws; }
+    # 6.6.10: fewer than 12 bytes cannot hold "HTTP/1.1 101" — the status check below would read
+    # stale stack bytes past the ones received. CHANGELOG [6.6.10]
+    if (n < 12) { store64(ws + 8, WS_CLOSED); return ws; }
     store8(&resp + n, 0);
 
     # Check for "101" in first line
@@ -178,6 +187,7 @@ fn _ws_send_frame(ws, opcode, data, len): i64 {
 
     # Mask and send payload
     var masked = alloc(len);
+    if (masked == 0) { return 0 - 1; }
     var i = 0;
     while (i < len) {
         var mb = (mask >> ((i % 4) * 8)) & 0xFF;
@@ -203,14 +213,52 @@ fn ws_ping(ws): i64 {
     return _ws_send_frame(ws, WS_OP_PING, "", 0);
 }
 
+# Largest incoming frame payload ws_recv_frame accepts, in bytes (16 MiB). A frame declaring
+# more is refused and the connection marked CLOSED. Raise it before receiving if a peer
+# legitimately sends larger messages; it bounds what a peer can make this process allocate.
+var WS_RECV_MAX_PAYLOAD = 16777216;
+
+# Read EXACTLY n bytes into buf. Returns 0, or -1 on EOF / a read error (EINTR is retried).
+# A TCP read returns what has arrived, so any frame part — even the 2-byte header — may come
+# back short; a single sys_read is never "the bytes".
+fn _ws_recv_exact(fd, buf, n): i64 {
+    var got = 0;
+    while (got < n) {
+        var r = sys_read(fd, buf + got, n - got);
+        if (r == 0 - 4) { continue; }
+        if (r <= 0) { return 0 - 1; }
+        got = got + r;
+    }
+    return 0;
+}
+
+# A frame that cannot be read in full, or that breaks a bound, ends the connection: the stream
+# position is unknown after it, so nothing later on this socket can be parsed as a frame.
+fn _ws_recv_fail(ws): i64 {
+    store64(ws + 8, WS_CLOSED);
+    return 0;
+}
+
 # Receive a WebSocket frame, returns payload pointer (caller must check opcode)
-# Sets opcode_out to the frame opcode
+# Sets opcode_out to the frame opcode and len_out to the payload length. Returns 0, with
+# len_out 0 and the connection CLOSED, on EOF, a read error, a short frame, a length above
+# WS_RECV_MAX_PAYLOAD, or a failed allocation.
+#
+# ⛔ CVE-53 (6.6.10). The extended-length, mask and payload reads were single unchecked
+# sys_read calls: a short read (routine for any frame larger than one TCP segment) left stale
+# stack bytes as the length or mask, and the payload was reported complete when it was not.
+# The 64-bit length dropped its high 32 bits, and `alloc(plen + 1)` took the peer's length
+# unchecked — so a remote peer chose the allocation size, and a failed alloc was written through
+# at `payload + plen`. Every read is now exact, a 64-bit length with any of its top 32 bits set
+# (RFC 6455 §5.2 requires the MSB to be 0; nothing that large fits the cap) or above the cap is
+# refused, and the allocation is checked. Pinned by
+# tests/tcyr/stdlib/ws_recv_frame_short_reads.tcyr. CHANGELOG [6.6.10]
 fn ws_recv_frame(ws, opcode_out, len_out): i64 {
+    store64(len_out, 0);
     if (ws_state(ws) != WS_OPEN) { return 0; }
     var fd = ws_fd(ws);
     var hdr[2];
-    var n = sys_read(fd, &hdr, 2);
-    if (n < 2) { store64(ws + 8, WS_CLOSED); return 0; }
+    if (_ws_recv_exact(fd, &hdr, 2) != 0) { return _ws_recv_fail(ws); }
 
     var opcode = load8(&hdr) & 0x0F;
     store64(opcode_out, opcode);
@@ -219,30 +267,33 @@ fn ws_recv_frame(ws, opcode_out, len_out): i64 {
 
     if (plen == 126) {
         var ext[2];
-        sys_read(fd, &ext, 2);
+        if (_ws_recv_exact(fd, &ext, 2) != 0) { return _ws_recv_fail(ws); }
         plen = (load8(&ext) << 8) | load8(&ext + 1);
     } elif (plen == 127) {
-        var ext[8];
-        sys_read(fd, &ext, 8);
-        var _e4 = load8(&ext + 4) << 24;
-        var _e5 = load8(&ext + 5) << 16;
-        var _e6 = load8(&ext + 6) << 8;
-        plen = _e4 | _e5 | _e6 | load8(&ext + 7);
+        var ext8[8];
+        if (_ws_recv_exact(fd, &ext8, 8) != 0) { return _ws_recv_fail(ws); }
+        var hi = load8(&ext8) | load8(&ext8 + 1) | load8(&ext8 + 2) | load8(&ext8 + 3);
+        if (hi != 0) { return _ws_recv_fail(ws); }
+        var _e4 = load8(&ext8 + 4) << 24;
+        var _e5 = load8(&ext8 + 5) << 16;
+        var _e6 = load8(&ext8 + 6) << 8;
+        plen = _e4 | _e5 | _e6 | load8(&ext8 + 7);
     }
-    store64(len_out, plen);
+    if (plen > WS_RECV_MAX_PAYLOAD) { return _ws_recv_fail(ws); }
 
     # Read mask if present
     var mask = 0;
     if (masked == 1) {
         var mk[4];
-        sys_read(fd, &mk, 4);
+        if (_ws_recv_exact(fd, &mk, 4) != 0) { return _ws_recv_fail(ws); }
         mask = load8(&mk) | (load8(&mk + 1) << 8) | (load8(&mk + 2) << 16) | (load8(&mk + 3) << 24);
     }
 
     # Read payload
     var payload = alloc(plen + 1);
+    if (payload == 0) { return _ws_recv_fail(ws); }
     if (plen > 0) {
-        sys_read(fd, payload, plen);
+        if (_ws_recv_exact(fd, payload, plen) != 0) { return _ws_recv_fail(ws); }
     }
 
     # Unmask if needed
@@ -255,6 +306,7 @@ fn ws_recv_frame(ws, opcode_out, len_out): i64 {
         }
     }
     store8(payload + plen, 0);
+    store64(len_out, plen);
 
     # Auto-respond to ping with pong
     if (opcode == WS_OP_PING) {

@@ -107,46 +107,67 @@ fn _fs_narrow(w, dst, cap): i64 {
     return o;
 }
 
-# List directory entries (filenames; . and .. skipped). Windows analogue of the
-# getdents64 dir_list — same return contract (a vec of cloned Str).
-fn dir_list(path): i64 {
-    var entries = vec_new();
-    # Build the UTF-16LE search pattern "<path>\*".
-    var wpat = alloc(1024);
-    var n = _fs_widen(wpat, str_data(path));
-    store8(wpat + n * 2, 92);          store8(wpat + n * 2 + 1, 0);        # '\'
-    store8(wpat + (n + 1) * 2, 42);    store8(wpat + (n + 1) * 2 + 1, 0);  # '*'
-    store8(wpat + (n + 2) * 2, 0);     store8(wpat + (n + 2) * 2 + 1, 0);  # NUL
+# List `path`'s entry names (cloned Strs; `.` and `..` skipped) onto `entries` — the
+# Windows arm of fs.cyr's `_dir_list_into_vec` (dir_list / dir_list_checked / the walkers
+# sit on it). 0, or -1 when the directory could not be enumerated.
+#
+# ⛔ 6.6.10 — FAIL CLOSED. FindFirstFileW on "<dir>\*" answers even an EMPTY directory (its
+# `.` and `..` entries), so INVALID_HANDLE_VALUE is never "no entries": the path is missing,
+# is not a directory, or its ACL denies listing. This returned the empty vec for all three,
+# which every walker then read as an empty directory — the same fold as the getdents arms.
+# ⚠ A FindNextFileW failure part-way still ends the listing: telling ERROR_NO_MORE_FILES
+# from a real error needs GetLastError, which has no PE reroute. After a successful
+# FindFirstFileW the handle is open on the directory, so that is the residual.
+# The three buffers are on the STACK (they were alloc()ed and stored through unchecked —
+# a refused allocation wrote the pattern to address 0 — and never given back: the default
+# allocator has no free, and dir_walk lists every directory it visits). CHANGELOG [6.6.10]
+fn _dir_list_into_vec(path: Str, entries): i64 {
+    # UTF-16LE search pattern "<path>\*". _fs_widen writes (len+1) WCHARs; the pattern adds
+    # two more, so a path past 509 bytes cannot fit — refused rather than overrun.
+    var pd = str_data(path);
+    if (strlen(pd) > 509) { return 0 - 1; }
+    var wpat[1040];
+    var n = _fs_widen(&wpat, pd);
+    store8(&wpat + n * 2, 92);          store8(&wpat + n * 2 + 1, 0);        # '\'
+    store8(&wpat + (n + 1) * 2, 42);    store8(&wpat + (n + 1) * 2 + 1, 0);  # '*'
+    store8(&wpat + (n + 2) * 2, 0);     store8(&wpat + (n + 2) * 2 + 1, 0);  # NUL
 
-    var fd = alloc(592);               # WIN32_FIND_DATAW
-    var h = syscall(61462, wpat, fd);  # FindFirstFileW
-    if (h == 0 - 1) { return entries; }  # INVALID_HANDLE_VALUE — no entries
+    var fd[592];                        # WIN32_FIND_DATAW
+    var h = syscall(61462, &wpat, &fd); # FindFirstFileW
+    if (h == 0 - 1) { return 0 - 1; }   # INVALID_HANDLE_VALUE — see above: an ERROR
 
-    var name8 = alloc(1056);
+    var name8[1056];
     var more = 1;
     while (more != 0) {
-        _fs_narrow(fd + 44, name8, 1056);   # cFileName (UTF-16) → UTF-8
+        _fs_narrow(&fd + 44, &name8, 1056);   # cFileName (UTF-16) → UTF-8
         var skip = 0;
-        if (load8(name8) == 46) {
-            if (load8(name8 + 1) == 0) { skip = 1; }
-            if (load8(name8 + 1) == 46) {
-                if (load8(name8 + 2) == 0) { skip = 1; }
+        if (load8(&name8) == 46) {
+            if (load8(&name8 + 1) == 0) { skip = 1; }
+            if (load8(&name8 + 1) == 46) {
+                if (load8(&name8 + 2) == 0) { skip = 1; }
             }
         }
         if (skip == 0) {
-            vec_push(entries, str_clone(str_from(name8)));
+            vec_push(entries, str_clone(str_from(&name8)));
         }
-        more = syscall(61463, h, fd);   # FindNextFileW (0 at end)
+        more = syscall(61463, h, &fd);  # FindNextFileW (0 at end)
     }
     syscall(61464, h);                  # FindClose
-    return entries;
+    return 0;
 }
 
-# Is `path` a directory? One GetFileAttributesW call — no handle churn.
-fn is_dir(path): i64 {
-    var wpath = alloc(1024);
-    _fs_widen(wpath, str_data(path));
-    var attrs = syscall(61465, wpath);          # GetFileAttributesW
+# Is `path` a directory? One GetFileAttributesW call — no handle churn. Both fns here take
+# `path: Str` as fs.cyr's POSIX arms do (bite 14's find, 6.6.10): untyped, a bare literal
+# (`is_dir("dir")`) arrived as a raw cstring and `str_data` read garbage — a page fault at
+# 0xFFFFFFFFFFFFFFFF under wine, while every POSIX arm coerced it. The attributes
+# answer for a directory whose ACL denies LISTING, so such a directory is still a directory
+# here (the walkers then fail to list it, by name). Stack buffer, as above. CHANGELOG [6.6.10]
+fn is_dir(path: Str): i64 {
+    var pd = str_data(path);
+    if (strlen(pd) > 511) { return 0; }
+    var wpath[1040];
+    _fs_widen(&wpath, pd);
+    var attrs = syscall(61465, &wpath);         # GetFileAttributesW
     if (attrs == 4294967295) { return 0; }      # INVALID_FILE_ATTRIBUTES
     if ((attrs & 16) != 0) { return 1; }        # FILE_ATTRIBUTE_DIRECTORY
     return 0;

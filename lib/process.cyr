@@ -41,10 +41,12 @@ include "lib/str.cyr"
 include "lib/process_win.cyr"
 #endif
 
-# v6.0.56: agnos has no fork/exec/dup2 either — it spawns an in-memory ELF via
-# sys_spawn + sys_waitpid. The agnos process surface lives in process_agnos.cyr;
-# the POSIX block below is excluded on agnos too (nested #ifndef AGNOS). See
-# docs/development/issues/2026-06-03-agnos-followup-after-boot.md.
+# agnos has fork#96 but no execve or dup2, so the POSIX fork+exec model does not map: it
+# spawns FROM DISK with a real argv and a clean fd table (spawn_path#43, 1.57.6), redirects the
+# child's fds at spawn time (#62) and waits with WAIT_BLOCK (1.57.7) — process_agnos.cyr, since
+# 6.6.8. The POSIX block below is excluded on agnos too (nested #ifndef AGNOS). (This read "no
+# fork/exec/dup2 … spawns an in-memory ELF via sys_spawn" — the v6.0.56 design — until 6.6.10.
+# CHANGELOG [6.6.10])
 #ifdef CYRIUS_TARGET_AGNOS
 include "lib/process_agnos.cyr"
 #endif
@@ -112,9 +114,11 @@ fn proc_deadline_kills(): i64 { return _proc_deadline_kills; }
 
 # Bound every child this module WAITS for to `ms` milliseconds; 0 = wait for ever (the
 # default, and the pre-6.6.6 behaviour). Returns the previous value, so a caller can set a
-# short bound around one call and put the old one back. POSIX only: process_win.cyr /
-# process_agnos.cyr do not define this, so a call on those targets fails to COMPILE rather
-# than silently not bounding anything.
+# short bound around one call and put the old one back. POSIX and Windows (process_win.cyr
+# has had its own since 6.6.8); process_agnos.cyr does not define it — agnos verbs have no
+# deadline — so a call there fails to COMPILE rather than silently not bounding anything.
+# (This said "POSIX only … process_win.cyr … do not define this" until 6.6.10.
+# CHANGELOG [6.6.10])
 fn proc_set_timeout_ms(ms): i64 {
     var prev = _PROC_DEADLINE_MS;
     _PROC_DEADLINE_MS = ms;
@@ -132,10 +136,18 @@ fn proc_timeout_ms(): i64 {
 # prctl is not a Darwin/BSD syscall and is not routed on PE. The getppid re-check closes the
 # race where the parent died between the fork and the prctl: the death signal was then
 # delivered to nobody and will never fire, so the child exits itself.
+# macOS (6.6.10): when a deadline is in force the child also calls setsid(), so it leads its
+# own process group and `proc_kill_tree` can end that GROUP — macOS has no /proc to walk for
+# descendants. Only with a deadline: a session of its own detaches the child from the terminal
+# (no Ctrl-C, no /dev/tty), which an unbounded call — `git` prompting for credentials through
+# cbt/deps.cyr — must keep. CHANGELOG [6.6.10]
 fn _proc_child_guard(ppid_before): i64 {
     #ifdef CYRIUS_TARGET_LINUX
     sys_prctl(1, 9, 0, 0, 0);
     if (syscall(SYS_GETPPID) != ppid_before) { sys_exit(1); }
+    #endif
+    #ifdef CYRIUS_TARGET_MACOS
+    if (_PROC_DEADLINE_MS > 0) { sys_setsid(); }
     #endif
     return 0;
 }
@@ -217,11 +229,22 @@ fn _proc_tree_add(pid, tid, n): i64 {
 }
 #endif
 
+# Allocate the snapshot buffer once. Returns 1 when it exists, 0 when the allocation failed —
+# then no tree can be snapshotted and the callers end the direct child alone (6.6.10: the
+# allocation was unchecked, so an exhausted heap walked /proc into address 0). CHANGELOG [6.6.10]
+fn _proc_tree_ready(): i64 {
+    if (_proc_tree != 0) { return 1; }
+    var tb = alloc(_PROC_TREE_CAP * 8 + 4096 + 65536);
+    if (tb == 0) { return 0; }
+    _proc_tree = tb;
+    return 1;
+}
+
 # Snapshot every descendant of `root` into `_proc_tree`, breadth-first; returns how many
 # (0 off Linux — nothing to walk).
 fn _proc_tree_collect(root): i64 {
     #ifdef CYRIUS_TARGET_LINUX
-    if (_proc_tree == 0) { _proc_tree = alloc(_PROC_TREE_CAP * 8 + 4096 + 65536); }
+    if (_proc_tree_ready() == 0) { return 0; }
     var n = _proc_tree_add(root, 0, 0);
     var i = 0;
     while (i < n) { n = _proc_tree_add(load64(_proc_tree + i * 8), 0, n); i = i + 1; }
@@ -282,11 +305,90 @@ fn _proc_tree_sweep(n, sig): i64 {
     return live;
 }
 
+# End child `pid` and every process descended from it, and REAP `pid` into `stbuf` (the
+# wait-status buffer — at least 4 bytes; never a signal number). TERM first, a grace of
+# `_PROC_GRACE_MS` (5 s) for the tree to go, then KILL whatever is left. Returns 0. The caller
+# must NOT waitpid `pid` again: it has been reaped here.
+#   Linux: the descendants are snapshotted from /proc/<pid>/task/*/children before the TERM;
+#          `pid` gets its TERM first, and each descendant ONE TERM once `pid` has gone (a
+#          second TERM kills a shell mid-EXIT-trap — see lib/regression.cyr's twin).
+#   macOS: there is no /proc, so "the tree" is `pid`'s PROCESS GROUP — the whole group gets
+#          one TERM, then one KILL. That covers the tree when the child called setsid() before
+#          exec (this module's verbs do when a deadline is set; cbt's batch runner and
+#          lib/async_macos.cyr's async_run_process always do). A child that does not lead a
+#          group of its own is ended alone.
+# Not defined on Windows (a process there is a HANDLE; process_win.cyr ends a tree through a
+# Job object). The agnos peer defines it on kill#16's tree bit.
+# 6.6.10: public. It was the private `_proc_kill_tree` (6.6.8), so every other deadline in the
+# stdlib — lib/async.cyr's async_run_process, cbt's test runner — SIGKILLed the pid alone and
+# left the grandchildren running. CHANGELOG [6.6.10]
+fn proc_kill_tree(pid, stbuf): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    var g = _proc_kill_group(pid, stbuf);
+    return g;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    var t = _proc_kill_tree(pid, stbuf);
+    return t;
+    #endif
+}
+
+# macOS: `proc_kill_tree` by process group. `kill(-pid, 0)` answers 0 while a group with that
+# id has a live member — and POSIX does not reuse a pid while a process group of that id
+# exists, so while ours lives the probe cannot reach a stranger's group. This relies on
+# sys_kill passing Darwin's third `posix` argument as 0: with a stale register an all-zombie
+# group answered EPERM instead of ESRCH, and the wait below ran out its whole grace
+# (lib/syscalls_linux_common.cyr, CHANGELOG [6.6.10]).
+fn _proc_kill_group(pid, stbuf): i64 {
+    var tgt = pid;
+    if (sys_kill(0 - pid, 0) == 0) { tgt = 0 - pid; }
+    sys_kill(tgt, 15);
+    var got = 0;
+    var waited = 0;
+    var go = 1;
+    while (go == 1) {
+        if (got == 0) {
+            var w = sys_waitpid(pid, stbuf, 1);
+            if (w == pid) { got = 1; }
+            if (w < 0) { got = 2; }
+        }
+        if (got != 0) {
+            if (tgt == pid) { go = 0; }
+            else { if (sys_kill(tgt, 0) != 0) { go = 0; } }
+        }
+        if (go == 1) {
+            if (waited >= _PROC_GRACE_MS) { go = 0; }
+            else { syscall(7, 0, 0, 10); waited = waited + 10; }
+        }
+    }
+    if (tgt != pid) { sys_kill(tgt, 9); }
+    if (got == 0) { sys_kill(pid, 9); sys_waitpid(pid, stbuf, 0); }
+    return 0;
+}
+
+# A capture the deadline cut short (`_proc_read_cut` == 1) whose child had ALREADY exited on its
+# own: the drain was held open by something the child left running (a `cmd & echo` grandchild on
+# the pipe), and the verb reports the deadline. On macOS end what is left of the child's process
+# group — the child called setsid() because a deadline was set, and POSIX does not reuse a pid
+# while a group of that id exists, so the probe cannot reach a stranger's group (the same shape
+# as cbt's `_run_end_leftovers`). Linux has no group here and no adoption window in a LIBRARY
+# verb (that changes who reaps the caller's orphans), so the leftover is only cut off from the
+# pipe there. Returns 0. CHANGELOG [6.6.10]
+fn _proc_end_cut_group(pid): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    var st[8];
+    if (sys_kill(0 - pid, 0) == 0) { proc_kill_tree(pid, &st); }
+    #endif
+    return 0;
+}
+
 # SIGTERM `pid`; once it has gone, ONE SIGTERM to each descendant it left (a second TERM kills
 # a shell mid-EXIT-trap — see lib/regression.cyr's twin); all within `_PROC_GRACE_MS`; then
-# SIGKILL the stragglers and reap `pid` into `stbuf`.
+# SIGKILL the stragglers and reap `pid` into `stbuf`. The /proc walk behind `proc_kill_tree`
+# (off Linux the snapshot is empty and `pid` alone is signalled).
 fn _proc_kill_tree(pid, stbuf): i64 {
     var n = _proc_tree_collect(pid);
+
     sys_kill(pid, 15);
     var got = 0;
     var waited = 0;
@@ -309,9 +411,115 @@ fn _proc_kill_tree(pid, stbuf): i64 {
     return 0;
 }
 
+# TERM the first `n` snapshot entries (each once), give them `_PROC_GRACE_MS` to go, KILL
+# what is left, and reap every one of them that is our child. CHANGELOG [6.6.10]
+fn _proc_tree_end(n): i64 {
+    var waited = 0;
+    var live = _proc_tree_sweep(n, 15);
+    while (live > 0 && waited < _PROC_GRACE_MS) {
+        syscall(7, 0, 0, 10);
+        waited = waited + 10;
+        live = _proc_tree_sweep(n, 15);
+    }
+    _proc_tree_sweep(n, 9);
+    var tries = 0;
+    while (_proc_tree_sweep(n, 0) > 0 && tries < 100) { syscall(7, 0, 0, 10); tries = tries + 1; }
+    return 0;
+}
+
+# ⛔ 6.6.10 — AN ADOPTION WINDOW, for a caller that must also end what its child LEFT BEHIND.
+# `proc_kill_tree` reaches the tree that exists when a deadline fires. A child that EXITS on its
+# own leaves its descendants to init, where nothing of ours can find them again: the
+# `cyrius test` runner left a test's forked `sleep` at PPID=1 on every clean pass, and one that
+# held the runner's stdout hung `cyrius test f | cat` until it exited. Linux's
+# PR_SET_CHILD_SUBREAPER makes those orphans OUR children instead. Open the window just before
+# the fork and close it once the child has been reaped:
+#   `_proc_subreap_begin()` — become a subreaper and remember the children we ALREADY have;
+#   `_proc_subreap_end()`   — end every child adopted since, and its descendants (TERM, grace,
+#                             KILL, reap), then clear the subreaper bit if begin set it.
+# Children that existed before the window are left alone — and they are all a subreaper can
+# have adopted before it — so a daemon an earlier step started (a git credential-cache daemon
+# from an implicit `cyrius deps` resolve) survives the window. Linux only: elsewhere both
+# return 0 and do nothing (macOS: the child leads its own process group and `proc_kill_tree`
+# ends that group after the reap). Not re-entrant. CHANGELOG [6.6.10]
+var _proc_sr_pre = 0;       # i64[_PROC_TREE_CAP]: our children when the window opened
+var _proc_sr_npre = 0;
+var _proc_sr_set = 0;       # 1 when begin set the bit (it was clear), so end clears it again
+var _proc_sr_open = 0;      # 1 between a SUCCESSFUL begin and its end — end does nothing otherwise
+
+# Open the adoption window. Returns 0, or -1 when it could not (no memory, or prctl refused) —
+# the caller then runs without one, exactly as before 6.6.10.
+fn _proc_subreap_begin(): i64 {
+    #ifdef CYRIUS_TARGET_LINUX
+    if (_proc_tree_ready() == 0) { return 0 - 1; }
+    if (_proc_sr_pre == 0) {
+        var pb = alloc(_PROC_TREE_CAP * 8);
+        if (pb == 0) { return 0 - 1; }
+        _proc_sr_pre = pb;
+    }
+    var cur[8];
+    store64(&cur, 0);
+    sys_prctl(37, &cur, 0, 0, 0);                             # PR_GET_CHILD_SUBREAPER
+    _proc_sr_set = 0;
+    if (load32(&cur) == 0) {
+        if (sys_prctl(36, 1, 0, 0, 0) != 0) { return 0 - 1; } # PR_SET_CHILD_SUBREAPER
+        _proc_sr_set = 1;
+    }
+    var n = _proc_tree_add(sys_getpid(), 0, 0);
+    var i = 0;
+    while (i < n) { store64(_proc_sr_pre + i * 8, load64(_proc_tree + i * 8)); i = i + 1; }
+    _proc_sr_npre = n;
+    _proc_sr_open = 1;
+    #endif
+    return 0;
+}
+
+# 1 when `p` was already our child when the window opened.
+fn _proc_sr_had(p): i64 {
+    var i = 0;
+    while (i < _proc_sr_npre) {
+        if (load64(_proc_sr_pre + i * 8) == p) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Close the adoption window: end every child adopted since `_proc_subreap_begin` and all of
+# their descendants. Up to four rounds, because a process ended in one round can orphan its
+# own children onto us. Returns how many the first round found (0 when nothing was left).
+fn _proc_subreap_end(): i64 {
+    var found = 0;
+    #ifdef CYRIUS_TARGET_LINUX
+    if (_proc_sr_open == 0) { return 0; }         # begin failed (or never ran): nothing adopted
+    _proc_sr_open = 0;
+    var round = 0;
+    while (round < 4) {
+        var n = _proc_tree_add(sys_getpid(), 0, 0);
+        var k = 0;
+        var i = 0;
+        while (i < n) {
+            var p = load64(_proc_tree + i * 8);
+            if (_proc_sr_had(p) == 0) { store64(_proc_tree + k * 8, p); k = k + 1; }
+            i = i + 1;
+        }
+        if (k == 0) { round = 4; }
+        else {
+            i = 0;
+            while (i < k) { k = _proc_tree_add(load64(_proc_tree + i * 8), 0, k); i = i + 1; }
+            if (round == 0) { found = k; }
+            _proc_tree_end(k);
+            round = round + 1;
+        }
+    }
+    if (_proc_sr_set == 1) { sys_prctl(36, 0, 0, 0, 0); _proc_sr_set = 0; }
+    _proc_sr_npre = 0;
+    #endif
+    return found;
+}
+
 # Wait for `pid`, but not for ever. Returns 1 if the child was reaped normally (`stbuf` holds
 # its status), 0 if the deadline fired (the child's whole tree was then ended by
-# `_proc_kill_tree`: TERM, grace, KILL — 6.6.8), and -1 if waitpid failed before either —
+# `proc_kill_tree`: TERM, grace, KILL — 6.6.8), and -1 if waitpid failed before either —
 # then `stbuf` was NEVER WRITTEN and must not be decoded. That is not hypothetical: a caller
 # that inherited SIGCHLD = SIG_IGN (it survives execve) has its children auto-reaped by the
 # kernel, so waitpid blocks until they exit and then fails ECHILD; decoding the untouched
@@ -334,7 +542,7 @@ fn _proc_wait_deadline(pid, stbuf, timeout_ms): i64 {
     while (waited < timeout_ms) {
         var w = sys_waitpid(pid, stbuf, 1);
         if (w == pid) { return 1; }
-        if (w < 0) { _proc_kill_tree(pid, stbuf); return 0 - 1; }
+        if (w < 0) { proc_kill_tree(pid, stbuf); return 0 - 1; }
         syscall(7, 0, 0, slice);
         waited = waited + slice;
         if (waited >= 50) { slice = 10; }
@@ -343,7 +551,7 @@ fn _proc_wait_deadline(pid, stbuf, timeout_ms): i64 {
     _proc_deadline_kills = _proc_deadline_kills + 1;
     # The deadline fired and WE ended it (6.6.8: its whole tree, TERM -> grace -> KILL): 0 is
     # the truth even if an auto-reap leaves nothing to collect.
-    _proc_kill_tree(pid, stbuf);
+    proc_kill_tree(pid, stbuf);
     return 0;
 }
 
@@ -464,7 +672,7 @@ fn run_capture(cmd, arg1, arg2, buf, buflen): Result {
     sys_close(read_fd);
     var status_buf[4];
     var reaped = _proc_wait_deadline(pid, &status_buf, proc_timeout_ms());
-    if (cut == 1 && reaped == 1) { _proc_deadline_kills = _proc_deadline_kills + 1; }
+    if (cut == 1 && reaped == 1) { _proc_deadline_kills = _proc_deadline_kills + 1; _proc_end_cut_group(pid); }
     return Ok(total);
 }
 
@@ -537,6 +745,10 @@ fn getppid(): i64 { return sys_getppid(); }
 # literals), the _str family pushes Str envp entries. envp shape
 # follows the family, not the call site.
 
+# 6.6.10: every verb below checks its argv / envp allocations and answers -1 (nothing ran)
+# when the heap is exhausted — they stored through address 0 before (the alloc census,
+# tests/gates/memory/stdlib_alloc_checked_census.sh). CHANGELOG [6.6.10]
+
 # Run command with a vec of cstr argv elements. Returns exit code
 # or -1.
 # Usage: var args = vec_new(); vec_push(args, "/usr/bin/ls");
@@ -550,6 +762,7 @@ fn exec_vec(args): i64 {
     var cmd = vec_get(args, 0);
     # Build argv array (argc + 1 for null terminator)
     var argv = alloc((argc + 1) * 8);
+    if (argv == 0) { return 0 - 1; }
     var avi = 0;
     while (avi < argc) {
         store64(argv + avi * 8, vec_get(args, avi));
@@ -557,6 +770,7 @@ fn exec_vec(args): i64 {
     }
     store64(argv + argc * 8, 0);
     var envp = alloc(8);
+    if (envp == 0) { return 0 - 1; }
     store64(envp, 0);
     var _pg_ppid = sys_getpid();
     var pid = sys_fork();
@@ -614,6 +828,7 @@ fn exec_capture_status(args, buf, buflen, status_out): i64 {
     if (argc < 1) { return 0 - 1; }
     var cmd = vec_get(args, 0);
     var argv = alloc((argc + 1) * 8);
+    if (argv == 0) { return 0 - 1; }
     var avi = 0;
     while (avi < argc) {
         store64(argv + avi * 8, vec_get(args, avi));
@@ -621,6 +836,7 @@ fn exec_capture_status(args, buf, buflen, status_out): i64 {
     }
     store64(argv + argc * 8, 0);
     var envp = alloc(8);
+    if (envp == 0) { return 0 - 1; }
     store64(envp, 0);
     var pipefd[16];
     if (sys_pipe(&pipefd) < 0) { return 0 - 1; }
@@ -650,7 +866,7 @@ fn exec_capture_status(args, buf, buflen, status_out): i64 {
     # which is "unknown" (-1), never a guessed -2. A poll error (cut 2) is a failure to read
     # the child's output, reported as -1, never as the deadline. CHANGELOG [6.6.8]
     if (cut == 1) {
-        if (reaped == 1) { reaped = 0; _proc_deadline_kills = _proc_deadline_kills + 1; }
+        if (reaped == 1) { reaped = 0; _proc_deadline_kills = _proc_deadline_kills + 1; _proc_end_cut_group(pid); }
     }
     if (cut == 2) { if (reaped == 1) { reaped = 0 - 1; } }
     _proc_store_status(status_out, reaped, load32(&stbuf));
@@ -675,6 +891,7 @@ fn exec_env(args, env): i64 {
     if (argc < 1) { return 0 - 1; }
     var cmd = vec_get(args, 0);
     var argv = alloc((argc + 1) * 8);
+    if (argv == 0) { return 0 - 1; }
     var avi = 0;
     while (avi < argc) {
         store64(argv + avi * 8, vec_get(args, avi));
@@ -683,6 +900,7 @@ fn exec_env(args, env): i64 {
     store64(argv + argc * 8, 0);
     var envc = vec_len(env);
     var envp = alloc((envc + 1) * 8);
+    if (envp == 0) { return 0 - 1; }
     var evi = 0;
     while (evi < envc) {
         store64(envp + evi * 8, vec_get(env, evi));
@@ -734,6 +952,7 @@ fn exec_vec_str(args): i64 {
     if (argc < 1) { return 0 - 1; }
     var cmd = str_data(vec_get(args, 0));
     var argv = alloc((argc + 1) * 8);
+    if (argv == 0) { return 0 - 1; }
     var avi = 0;
     while (avi < argc) {
         store64(argv + avi * 8, str_data(vec_get(args, avi)));
@@ -741,6 +960,7 @@ fn exec_vec_str(args): i64 {
     }
     store64(argv + argc * 8, 0);
     var envp = alloc(8);
+    if (envp == 0) { return 0 - 1; }
     store64(envp, 0);
     var _pg_ppid = sys_getpid();
     var pid = sys_fork();
@@ -766,6 +986,7 @@ fn exec_capture_str(args, buf, buflen): i64 {
     if (argc < 1) { return 0 - 1; }
     var cmd = str_data(vec_get(args, 0));
     var argv = alloc((argc + 1) * 8);
+    if (argv == 0) { return 0 - 1; }
     var avi = 0;
     while (avi < argc) {
         store64(argv + avi * 8, str_data(vec_get(args, avi)));
@@ -773,6 +994,7 @@ fn exec_capture_str(args, buf, buflen): i64 {
     }
     store64(argv + argc * 8, 0);
     var envp = alloc(8);
+    if (envp == 0) { return 0 - 1; }
     store64(envp, 0);
     var pipefd[16];
     sys_pipe(&pipefd);
@@ -797,7 +1019,7 @@ fn exec_capture_str(args, buf, buflen): i64 {
     sys_close(rfd);
     var stbuf[4];
     var reaped = _proc_wait_deadline(pid, &stbuf, proc_timeout_ms());
-    if (cut == 1 && reaped == 1) { _proc_deadline_kills = _proc_deadline_kills + 1; }
+    if (cut == 1 && reaped == 1) { _proc_deadline_kills = _proc_deadline_kills + 1; _proc_end_cut_group(pid); }
     return total;
 }
 
@@ -808,6 +1030,7 @@ fn exec_env_str(args, env): i64 {
     if (argc < 1) { return 0 - 1; }
     var cmd = str_data(vec_get(args, 0));
     var argv = alloc((argc + 1) * 8);
+    if (argv == 0) { return 0 - 1; }
     var avi = 0;
     while (avi < argc) {
         store64(argv + avi * 8, str_data(vec_get(args, avi)));
@@ -816,6 +1039,7 @@ fn exec_env_str(args, env): i64 {
     store64(argv + argc * 8, 0);
     var envc = vec_len(env);
     var envp = alloc((envc + 1) * 8);
+    if (envp == 0) { return 0 - 1; }
     var evi = 0;
     while (evi < envc) {
         store64(envp + evi * 8, str_data(vec_get(env, evi)));
@@ -856,6 +1080,7 @@ fn _read_environ_envp(): i64 {
     var fd = sys_open("/proc/self/environ", 0, 0);   # 0 = O_RDONLY
     if (fd < 0) { return 0; }
     var blob = alloc(65536);
+    if (blob == 0) { sys_close(fd); return 0; }
     var n = sys_read(fd, blob, 65535);
     sys_close(fd);
     if (n <= 0) { return 0; }
@@ -868,6 +1093,7 @@ fn _read_environ_envp(): i64 {
         i = i + 1;
     }
     var envp = alloc((count + 1) * 8);
+    if (envp == 0) { return 0; }
     var ei = 0;
     var start = 0;
     i = 0;
@@ -899,7 +1125,11 @@ fn exec_cmd(cmdline): i64 {
     store64(&argv + 16, cmdline);
     store64(&argv + 24, 0);
     var envp = _read_environ_envp();
-    if (envp == 0) { envp = alloc(8); store64(envp, 0); }
+    if (envp == 0) {
+        envp = alloc(8);
+        if (envp == 0) { return 0 - 1; }
+        store64(envp, 0);
+    }
     var _pg_ppid = sys_getpid();
     var pid = sys_fork();
     if (pid < 0) { return 0 - 1; }

@@ -66,6 +66,7 @@ include "lib/alloc.cyr"
 # Build a box: 16 bytes, tag at +0, payload at +8.
 fn boxed_new(t, value): i64 {
     var b = alloc(16);
+    if (b == 0) { return 0; }
     store64(b, t);
     store64(b + 8, value);
     return b;

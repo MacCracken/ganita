@@ -615,6 +615,7 @@ fn str_join(parts, sep: Str): Str {
 # Create Str from raw buffer (copies data, adds null terminator)
 fn str_from_buf(ptr, len): Str {
     var buf = alloc(len + 1);
+    if (buf == 0) { return 0; }
     memcpy(buf, ptr, len);
     store8(buf + len, 0);
     return str_new(buf, len);
@@ -632,6 +633,7 @@ fn str_eq_cstr(s, cstr): i64 {
 fn str_cstr(s): i64 {
     var slen = str_len(s);
     var buf = alloc(slen + 1);
+    if (buf == 0) { return 0; }
     memcpy(buf, str_data(s), slen);
     store8(buf + slen, 0);
     return buf;

@@ -329,6 +329,7 @@ fn _tls_native_alloc(sock, host, hook_fp, hook_ctx): i64 {
         if (fncall2(hook_fp, hook_ctx, nctx) != 0) { return 0; }
     }
     var ctx = alloc(40);
+    if (ctx == 0) { return 0; }
     store64(ctx, nctx);
     store64(ctx + 8, 0);
     store64(ctx + 16, sock);
@@ -715,6 +716,11 @@ fn tls_connect_alloc(sock, host, hook_fp, hook_ctx): i64 {
     # state correctly via SSL_free which works on either
     # connected or unconnected SSL handles.
     var ctx = alloc(24);
+    if (ctx == 0) {
+        if (_fn_SSL_free != 0) { fncall1(_fn_SSL_free, ssl); }
+        fncall1(_fn_SSL_CTX_free, ssl_ctx);
+        return 0;
+    }
     store64(ctx, ssl_ctx);
     store64(ctx + 8, ssl);
     store64(ctx + 16, sock);
@@ -834,6 +840,7 @@ fn tls_accept_alloc(sock, creds, hook_fp, hook_ctx): i64 {
     # d2i_AutoPrivateKey advances its 2nd arg, so pass the address of a cell
     # holding the DER pointer (not the pointer directly).
     var pcell = alloc(8);
+    if (pcell == 0) { fncall1(_fn_SSL_CTX_free, ssl_ctx); return 0; }
     store64(pcell, load64(creds + 16));
     var pkey = fncall3(_fn_d2i_AutoPrivateKey, 0, pcell, load64(creds + 24));
     if (pkey == 0) { fncall1(_fn_SSL_CTX_free, ssl_ctx); return 0; }
@@ -852,6 +859,11 @@ fn tls_accept_alloc(sock, creds, hook_fp, hook_ctx): i64 {
     if (ssl == 0) { fncall1(_fn_SSL_CTX_free, ssl_ctx); return 0; }
     fncall2(_fn_SSL_set_fd, ssl, sock);
     var ctx = alloc(24);
+    if (ctx == 0) {
+        if (_fn_SSL_free != 0) { fncall1(_fn_SSL_free, ssl); }
+        fncall1(_fn_SSL_CTX_free, ssl_ctx);
+        return 0;
+    }
     store64(ctx, ssl_ctx);
     store64(ctx + 8, ssl);
     store64(ctx + 16, sock);

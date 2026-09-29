@@ -13,13 +13,14 @@ Written in [Cyrius](https://github.com/MacCracken/cyrius).
 
 ## Status
 
-**1.2.8** — `pow` is within 1 ulp of the correctly rounded value everywhere (was hundreds of ulp out). See
+**1.2.9** — `ganita_f32_sin` / `ganita_f32_cos` are correct for every finite f32 (were NaN at and above 2^63). See
 [`CHANGELOG.md`](CHANGELOG.md) for the full history and
 [`docs/development/state.md`](docs/development/state.md) for the live snapshot.
 Recent releases in brief:
 
 | | |
 |---|---|
+| **1.2.9** | f32 `sin` / `cos` correct past 2^63 (the NaN guard dropped — stdlib's `f64_sin` reduces every finite argument since cyrius 6.6.9); toolchain 6.6.10 |
 | **1.2.8** | `pow` within 1 ulp everywhere — an fdlibm `e_pow` core replaces `exp(y·ln x)` (909 ulp) and the squaring path (772 ulp); toolchain 6.6.9 |
 | **1.2.7** | `pow` answers the C99 Annex F special values (was NaN for every infinite base/exponent off the integral path, and for `pow(1, NaN)`); toolchain 6.6.7 |
 | **1.2.6** | `ganita_f64_cbrt`, correctly rounded for every f64 (and so every f32); `inv`/`qr`/`pseudo_inv` stop discarding scratch; element cap settled by ADR 0002; toolchain 6.6.4 |

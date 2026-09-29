@@ -50,6 +50,7 @@ fn cffi_type_align(t): i64 { return t & 0xFF; }
 # Create a new C struct layout. Supports up to 32 fields.
 fn cffi_struct_new(): i64 {
     var layout = alloc(536);
+    if (layout == 0) { return 0; }
     store64(layout, 0);       # field_count
     store64(layout + 8, 1);   # max_align (at least 1)
     store64(layout + 16, 0);  # current_size

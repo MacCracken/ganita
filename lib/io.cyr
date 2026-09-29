@@ -441,11 +441,12 @@ fn xlseek(fd, off, whence): i64 {
 }
 
 # Advisory whole-file lock (op: LOCK_SH=1 / LOCK_EX=2 / LOCK_UN=8, +LOCK_NB=4).
-# Unlike lseek, flock's number is NOT carried uniformly in the peers — the agnos peer and
-# (since v6.6.4) both Linux peers declare SYS_FLOCK; the macOS peer does not, so that arm
-# issues the x86 number 73 for ESYSXLAT to renumber — so the per-target dispatch is
-# centralized here and a caller using xflock can never hand-roll a Linux #73 that traps
-# off-Linux (the agnos-ABI footgun this wrapper set exists to end). Windows has no flock.
+# Unlike lseek, flock's number is NOT carried uniformly in the peers — the agnos peer (#59)
+# and both Linux peers declare SYS_FLOCK, and since 6.6.10 the x86-macOS peer does too (73,
+# which EMACHO_SYSXLAT renumbers to BSD 131); the macOS arm below still issues the literal 73,
+# the same number on both Macs — so the per-target dispatch is centralized here and a caller
+# using xflock can never hand-roll a Linux #73 that traps off-Linux (the agnos-ABI footgun
+# this wrapper set exists to end). Windows has no flock.
 fn xflock(fd, op): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return sys_flock(fd, op);                  # agnos kernel #59 (inode-keyed advisory)

@@ -125,7 +125,9 @@ fn sys_utimensat(dirfd, path, times, flags): i64 {
     # the first time; both arms above then matched nothing and
     # `sys_utimensat(AT_FDCWD, "/missing", 0, 0)` answered 0 — a FAILED file-time
     # set reading as SUCCESS. -ENOSYS is the honest answer on any target this
-    # chain does not name (cx: cxvm routes only read/write/open/close/lseek/exit).
+    # chain does not name (cx: cxvm translates only read/write/open/close/lseek/exit and
+    # host-serves getrandom/clock_gettime — programs/cxvm.cyr's op-0x70 dispatch is the
+    # authority; docs/platform-status.md states the guest contract. CHANGELOG [6.6.10]).
     # Deliberately a trailing default rather than one more named arm, so an
     # eighth target inherits the error instead of the garbage.
     # CHANGELOG [6.6.6]
@@ -239,9 +241,23 @@ fn sys_getppid(): i64 {
     return syscall(SYS_GETPPID);
 }
 
-# Send a signal to a process by PID.
+# Send a signal to a process by PID (pid > 0), to a process group (pid < -1 is -pgid, pid 0
+# is the caller's own group), or to every process the caller may signal (pid -1).
+#
+# macOS: Darwin's kill is kill(pid, signum, posix) — one parameter more than Linux — and the
+# 2-arg form left `posix` to whatever the third argument register (rdx / x2) held from earlier
+# code. posix only matters for pid <= 0: it decides whether a broadcast skips the caller and
+# whether an empty group answers EPERM or ESRCH, so a stale value made kill(-pgid) — the tree
+# kill a deadline ends with — answer differently run to run. Pass 0 explicitly (the historic
+# BSD behaviour). Not memory-unsafe (posix is a value, not a pointer); it was non-determinism.
+# CHANGELOG [6.6.10]
 fn sys_kill(pid, sig): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return syscall(SYS_KILL, pid, sig, 0);
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
     return syscall(SYS_KILL, pid, sig);
+    #endif
 }
 
 # Create a new session and become its leader. Detaches from the
@@ -675,23 +691,49 @@ fn sys_timerfd_settime(fd, flags, new_value, old_value): i64 {
 # Returns bytes written into buf, 0 at end-of-dir, -errno on error.
 # Used by drm device-node enumeration; high-level fs::list_dir
 # wraps this for the typical case.
+#
+# macOS: declines with -ENOSYS (-78) and issues no syscall. The Mach-O backends route the
+# number to Darwin getdirentries64(fd, buf, nbytes, off_t *basep), which has a FOURTH
+# parameter and it is an OUT-pointer: through this 3-arg wrapper xnu wrote the 8-byte seek
+# position to whatever address the fourth argument register (r10 / x3) still held — measured on
+# both Macs zeroing a live 8-byte variable. The records it returns are not linux_dirent64
+# either (d_namlen u16 at 18, d_type at 20, d_name at 21, against d_type 18 / d_name 19 here),
+# so a caller parsing them read shifted names. lib/fs.cyr's dir_list has a Darwin lister that
+# passes basep and parses the Darwin layout; use that for a portable directory walk.
+# CHANGELOG [6.6.10]
 fn sys_getdents64(fd, buf, count): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
     return syscall(SYS_GETDENTS64, fd, buf, count);
+    #endif
 }
 
-# Fill `buf` with `len` bytes from the kernel CSPRNG. `flags`
+# Fill up to `len` bytes of `buf` from the kernel CSPRNG. `flags`
 # is GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE (see
-# lib/random.cyr for constants). Returns bytes filled or -errno.
+# lib/random.cyr for constants). Returns bytes filled (which may be
+# FEWER than `len` — a short read, as on Linux) or -errno. Use
+# random_bytes() to fill a whole buffer; it loops over short reads.
 #
 # macOS portability (v6.0.75): on Mach-O the backend ESYSXLAT rewrites the
 # getrandom syscall (318/278) to Darwin getentropy (500), which fills `len`
-# bytes (≤256) and returns 0 on success / -errno on failure — NOT the byte
+# bytes and returns 0 on success / -errno on failure — NOT the byte
 # count Linux getrandom returns. Normalize that 0→len here so every caller
 # gets the Linux contract on both platforms. This is a no-op on Linux:
 # getrandom only returns 0 when len==0 (otherwise it returns a positive
 # count or -errno), so `r==0 → return len` already equals `return r` there.
-# (getentropy's 256-byte cap is ample for TLS's ≤32-byte requests.)
+#
+# getentropy REFUSES any request above 256 bytes (EINVAL — it does not short-read), so
+# before 6.6.10 sys_getrandom(buf, 257, 0) was -22 on both Macs and random_bytes() failed
+# for every size above 256: sigil's RSA-3072/4096 blinding draw (384/512 B, on every private
+# key operation) and LUKS keygen above 256 B failed closed there. Clamping to 256 turns the
+# refusal into a Linux-shaped short read, which random_bytes (and any Linux-correct caller)
+# already loops over. CHANGELOG [6.6.10]
 fn sys_getrandom(buf, len, flags): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    if (len > 256) { len = 256; }
+    #endif
     var r = syscall(SYS_GETRANDOM, buf, len, flags);
     if (r == 0) { return len; }
     return r;

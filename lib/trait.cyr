@@ -25,6 +25,7 @@ include "lib/str.cyr"
 # Create a trait object (fat pointer: vtable + data)
 fn trait_obj_new(vtable, data): i64 {
     var obj = alloc(16);
+    if (obj == 0) { return 0; }
     store64(obj, vtable);
     store64(obj + 8, data);
     return obj;
@@ -61,6 +62,7 @@ var DISPLAY_VTABLE_SIZE = 16;
 # Create a Display vtable from print and to_string fns
 fn display_vtable(print_fn, to_string_fn): i64 {
     var vt = alloc(DISPLAY_VTABLE_SIZE);
+    if (vt == 0) { return 0; }
     store64(vt, print_fn);
     store64(vt + 8, to_string_fn);
     return vt;
@@ -86,6 +88,7 @@ var DEFAULT_VTABLE_SIZE = 8;
 # Create a Default vtable from a default constructor fn
 fn default_vtable(default_fn): i64 {
     var vt = alloc(DEFAULT_VTABLE_SIZE);
+    if (vt == 0) { return 0; }
     store64(vt, default_fn);
     return vt;
 }
@@ -100,6 +103,7 @@ var EQ_VTABLE_SIZE = 8;
 # Create an Eq vtable from an equality function
 fn eq_vtable(eq_fn): i64 {
     var vt = alloc(EQ_VTABLE_SIZE);
+    if (vt == 0) { return 0; }
     store64(vt, eq_fn);
     return vt;
 }
@@ -119,6 +123,7 @@ var FROM_VTABLE_SIZE = 8;
 # Create a From vtable from a conversion function
 fn from_vtable(from_fn): i64 {
     var vt = alloc(FROM_VTABLE_SIZE);
+    if (vt == 0) { return 0; }
     store64(vt, from_fn);
     return vt;
 }
@@ -134,6 +139,7 @@ fn _int_print(n): i64 {
 
 fn _int_to_string(n): i64 {
     var buf = alloc(24);
+    if (buf == 0) { return 0; }
     fmt_int_buf(n, buf);
     return str_from(buf);
 }

@@ -534,6 +534,7 @@ fn sys_pause(): i64 {
 # Signal operations
 fn sigset_new(): i64 {
     var set = alloc(8);
+    if (set == 0) { return 0; }
     store64(set, 0);
     return set;
 }
@@ -559,6 +560,7 @@ fn sigset_has(set, signum): i64 {
 # epoll_event: { u32 events, u64 data } = 12 bytes
 fn epoll_event_new(events, data): i64 {
     var ev = alloc(16);
+    if (ev == 0) { return 0; }
     store32(ev, events);
     store64(ev + 4, data);
     return ev;
@@ -576,6 +578,7 @@ fn sys_epoll_wait(epfd, events, maxevents, timeout): i64 {
 # itimerspec: { interval: {sec, nsec}, value: {sec, nsec} } = 32 bytes
 fn timerspec_new(interval_sec, initial_sec): i64 {
     var ts = alloc(32);
+    if (ts == 0) { return 0; }
     store64(ts, interval_sec);
     store64(ts + 8, 0);
     store64(ts + 16, initial_sec);

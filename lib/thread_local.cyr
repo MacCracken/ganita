@@ -428,6 +428,7 @@ fn _tlocal_win_block(): i64 {
     if (blk == 0) {
         alloc_init();
         blk = alloc(1024);   # TLOCAL_MAX_SLOTS (128) * 8 bytes
+        if (blk == 0) { return 0; }
         var i = 0;
         while (i < 1024) { store8(blk + i, 0); i = i + 1; }
         syscall(61454, _tlocal_win_idx, blk);        # TlsSetValue(idx, blk)

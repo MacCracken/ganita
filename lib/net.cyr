@@ -100,8 +100,10 @@ var _NET_EINPROGRESS = 115;
 
 # sockaddr_in: { family(2), port(2), addr(4), zero(8) } = 16 bytes
 # Build a sockaddr_in struct from address and port
+# Returns the 16-byte struct, or 0 when the allocation is refused. CHANGELOG [6.6.10]
 fn sockaddr_in(addr, port): i64 {
     var sa = alloc(16);
+    if (sa == 0) { return 0; }
     memset(sa, 0, 16);
     #ifdef CYRIUS_TARGET_MACOS
     # BSD sockaddr_in prefixes a length byte: sin_len(u8=16) @0, sin_family(u8) @1.
@@ -128,8 +130,10 @@ fn sockaddr_in(addr, port): i64 {
 # allocator-free, so it can't call this alloc-based builder) — keep the two in
 # lock-step if the layout ever changes (e.g. populating sin6_scope_id).
 # See docs/development/issues/2026-06-15-cyrius-net-v6-darwin.md.
+# Returns the 28-byte struct, or 0 when the allocation is refused. CHANGELOG [6.6.10]
 fn sockaddr_in6(addr16, port): i64 {
     var sa = alloc(28);
+    if (sa == 0) { return 0; }
     memset(sa, 0, 28);
     #ifdef CYRIUS_TARGET_MACOS
     store8(sa, 28);                  # sin6_len (BSD)
@@ -233,14 +237,18 @@ fn udp_socket() : Result {
 fn sock_reuse(fd): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     # AGNOS has no setsockopt — Linux NSYS_SETSOCKOPT=54 collides with agnos
-    # #54=SYS_UDP_UNBIND (silent mis-dispatch). Server-side reuse is AGNOS
-    # Phase B (inbound TCP), unreached on the client path; no-op success. v6.2.7.
+    # #54=SYS_UDP_UNBIND (silent mis-dispatch) — and nothing to set: the kernel has no
+    # TIME_WAIT hold on a listen port, so a restarted server re-listens without it.
+    # No-op success. (This read "server-side reuse is Phase B, unreached on the client
+    # path" — false since v6.2.22 wired bind/listen/accept to #56/#57. CHANGELOG [6.6.10])
     return 0;
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    var val = alloc(4);
-    store32(val, 1);
-    return syscall(NSYS_SETSOCKOPT, fd, SOL_SOCKET, SO_REUSEADDR, val, 4);
+    # The option value lives on the stack: setsockopt copies it in, so there is no allocation to
+    # refuse (it was an unchecked alloc(4), leaked per call, until 6.6.10). CHANGELOG [6.6.10]
+    var val[8];
+    store32(&val, 1);
+    return syscall(NSYS_SETSOCKOPT, fd, SOL_SOCKET, SO_REUSEADDR, &val, 4);
     #endif
 }
 
@@ -263,7 +271,10 @@ fn sock_set_recv_timeout(fd, secs, usecs): i64 {
     # Linux struct timeval is {tv_sec, tv_usec} — both i64 on 64-bit
     # Linux (16 bytes total). Kernel reads 16 bytes; padding doesn't
     # matter because both fields are 64-bit.
-    var tv = alloc(16);
+    # On the stack: setsockopt copies the timeval in (an unchecked, leaked alloc(16) per call
+    # until 6.6.10). CHANGELOG [6.6.10]
+    var tvb[16];
+    var tv = &tvb;
     memset(tv, 0, 16);
     store64(tv, secs);
     #ifdef CYRIUS_TARGET_MACOS
@@ -294,7 +305,8 @@ fn sock_set_send_timeout(fd, secs, usecs): i64 {
     return _agnos_sock_set_tmo(&_agnos_sock_sndto_us, fd, secs * 1000000 + usecs);
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    var tv = alloc(16);
+    var tvb[16];                                 # on the stack, as above. CHANGELOG [6.6.10]
+    var tv = &tvb;
     memset(tv, 0, 16);
     store64(tv, secs);
     #ifdef CYRIUS_TARGET_MACOS
@@ -328,13 +340,14 @@ fn sock_bind(fd, addr, port) : Result {
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
     var sa = sockaddr_in(addr, port);
+    if (sa == 0) { return Err(12); }             # ENOMEM: the address was never built
     var r = syscall(NSYS_BIND, fd, sa, 16);
     if (r < 0) { return Err(0 - r); }
     return Ok(0);
     #endif
 }
 
-# Listen on socket. Returns Result(0). AGNOS Phase B — see sock_bind.
+# Listen on socket. Returns Result(0). On AGNOS it issues sock_listen#56 (see sock_bind).
 fn sock_listen(fd, backlog) : Result {
     #ifdef CYRIUS_TARGET_AGNOS
     # Issue sock_listen(#56) on the port stashed by sock_bind (the kernel merges
@@ -353,7 +366,7 @@ fn sock_listen(fd, backlog) : Result {
     #endif
 }
 
-# Accept a connection. Returns Result(client_fd). AGNOS Phase B — see sock_bind.
+# Accept a connection. Returns Result(client_fd). On AGNOS it issues sock_accept#57 (see sock_bind).
 fn sock_accept(fd) : Result {
     #ifdef CYRIUS_TARGET_AGNOS
     # AGNOS sock_accept(#57) is NON-BLOCKING: it drives net_poll (advancing the
@@ -411,6 +424,7 @@ fn sock_connect(fd, addr, port) : Result {
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
     var sa = sockaddr_in(addr, port);
+    if (sa == 0) { return Err(12); }             # ENOMEM: the address was never built
     var r = syscall(NSYS_CONNECT, fd, sa, 16);
     if (r < 0) { return Err(0 - r); }
     return Ok(0);

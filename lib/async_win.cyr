@@ -91,13 +91,19 @@ fn _async_win_retire(rt, t): i64 {
         # A process race-loser: drain the threadpool wait FIRST (UnregisterWaitEx before
         # CloseHandle is mandatory), then kill + reap the still-running child and close its
         # handles — so async_run_process's timeout path just returns -2 (no double cleanup).
+        # 6.6.10: the child's JOB, i.e. its whole tree — TerminateProcess on the child alone
+        # left whatever it had started running past the deadline. Its own job's handle is
+        # at ctx+96 (0 when it could not be put in one: then the child alone, as before).
         syscall(0xF030, load64(ctx + 88), 0 - 1);    # UnregisterWaitEx(wait, INVALID_HANDLE)
         var hp = load64(ctx + 72);
         if (hp != 0) {
-            syscall(61469, hp, 137);                 # TerminateProcess(hProcess, 137 = 128+SIGKILL)
+            var job = load64(ctx + 96);
+            if (job != 0) { _win_job_kill(job, 137); }          # TerminateJobObject(137 = 128+SIGKILL)
+            else { syscall(61469, hp, 137); }                   # TerminateProcess(hProcess, 137)
             syscall(61441, hp, 4294967295);          # WaitForSingleObject(INFINITE) — reap
             syscall(3, load64(ctx + 80));            # CloseHandle(hThread)
             syscall(3, hp);                          # CloseHandle(hProcess)
+            if (job != 0) { syscall(3, job); store64(ctx + 96, 0); }
         }
     }
     store64(t + 16, TASK_DONE);
@@ -644,6 +650,7 @@ fn _asw_wcmdline(argv): i64 {
         total = total + l + 1; i = i + 1;
     }
     var wbuf = alloc((total + 2) * 2);
+    if (wbuf == 0) { return 0; }                     # out of memory: a failed spawn (6.6.10)
     var o = 0; var j = 0;
     while (load64(argv + j * 8) != 0) {
         if (j > 0) { store8(wbuf + o, 32); store8(wbuf + o + 1, 0); o = o + 2; }   # space
@@ -655,7 +662,8 @@ fn _asw_wcmdline(argv): i64 {
 }
 
 # Build a UTF-16LE environment block from a NULL-terminated envp (char**): each entry
-# NUL-terminated, whole block double-NUL-terminated. 0 / empty → 0 (inherit parent env).
+# NUL-terminated, whole block double-NUL-terminated. 0 / empty → 0 (inherit parent env);
+# -1 when the heap is exhausted (6.6.10: it stored through address 0 before).
 fn _asw_wenvblock(envp): i64 {
     if (envp == 0) { return 0; }
     if (load64(envp) == 0) { return 0; }
@@ -666,6 +674,7 @@ fn _asw_wenvblock(envp): i64 {
         total = total + l + 1; i = i + 1;
     }
     var wbuf = alloc((total + 2) * 2);
+    if (wbuf == 0) { return 0 - 1; }                 # out of memory — NOT 0, which means "inherit"
     var o = 0; var j = 0;
     while (load64(envp + j * 8) != 0) {
         o = _asw_wappend(wbuf, o, load64(envp + j * 8));
@@ -678,14 +687,18 @@ fn _asw_wenvblock(envp): i64 {
 
 # CreateProcessW with inherited stdio. `wcmd` = writable UTF-16LE cmdline, `wenv` = env
 # block (0 = inherit). `pi` = caller's 24-byte PROCESS_INFORMATION. Returns the BOOL.
-fn _asw_create_process(wcmd, wenv, pi): i64 {
+# 6.6.10: created CREATE_SUSPENDED, put in a KILL_ON_JOB_CLOSE Job object (lib/syscalls_windows.cyr
+# `_win_job_start`) and resumed; the job handle is stored at `job_out` (0 = none — the child
+# then runs untracked, as before). A child that could not be resumed is terminated and
+# reported as a failed spawn.
+fn _asw_create_process(wcmd, wenv, pi, job_out): i64 {
     var si[104];
     var z = 0; while (z < 104) { store8(&si + z, 0); z = z + 1; }
     store64(&si, 104);                          # cb = sizeof(STARTUPINFOW)
     var pz = 0; while (pz < 24) { store8(pi + pz, 0); pz = pz + 1; }
     var a[80];
-    var flags = 0;
-    if (wenv != 0) { flags = 1024; }            # CREATE_UNICODE_ENVIRONMENT
+    var flags = 4;                               # CREATE_SUSPENDED — resumed once in its job
+    if (wenv != 0) { flags = flags | 1024; }     # CREATE_UNICODE_ENVIRONMENT
     store64(&a + 0, 0);                          # lpApplicationName (NULL → cmdline's first token)
     store64(&a + 8, wcmd);                       # lpCommandLine (writable)
     store64(&a + 16, 0);
@@ -696,20 +709,44 @@ fn _asw_create_process(wcmd, wenv, pi): i64 {
     store64(&a + 56, 0);
     store64(&a + 64, &si);                       # lpStartupInfo
     store64(&a + 72, pi);                        # lpProcessInformation
-    return syscall(61445, &a);                   # CreateProcessW
+    store64(job_out, 0);
+    var ok = syscall(61445, &a);                 # CreateProcessW
+    if (ok == 0) { return 0; }
+    var job = _win_job_start(pi, 1);
+    if (job < 0) {                               # could not be resumed: it was terminated
+        syscall(3, load64(pi + 8));
+        syscall(3, load64(pi));
+        return 0;
+    }
+    store64(job_out, job);
+    return ok;
+}
+
+# Close the child's job after a NORMAL exit: KILL_ON_JOB_CLOSE is cleared first, so what the
+# child left running is left alone (the deadline path ends the job instead — see
+# `_async_win_retire`). 6.6.10, CHANGELOG [6.6.10]
+fn _asw_job_close(ctx): i64 {
+    var job = load64(ctx + 96);
+    if (job == 0) { return 0; }
+    _win_job_set_kill(job, 0);
+    syscall(3, job);
+    store64(ctx + 96, 0);
+    return 0;
 }
 
 # Reactor subprocess task: on first run CreateProcessW the child and register a one-shot
 # threadpool wait on its process HANDLE (signalled on exit → bridge posts to the IOCP);
 # on wake reap it via GetExitCodeProcess and return the exit code. ctx =
-#   +0 OVERLAPPED(32) +32 task +40 step +48 rt +56 argv +64 envp +72 hProcess +80 hThread +88 wait.
+#   +0 OVERLAPPED(32) +32 task +40 step +48 rt +56 argv +64 envp +72 hProcess +80 hThread +88 wait
+#   +96 hJob (6.6.10 — the child's Job object, so a deadline ends its whole tree).
 fn _async_process_task(ctx): i64 {
     if (load64(ctx + 40) == 0) {
         var rt = load64(ctx + 48);
         var wcmd = _asw_wcmdline(load64(ctx + 56));
         var wenv = _asw_wenvblock(load64(ctx + 64));
+        if (wcmd == 0 || wenv == 0 - 1) { return 0 - 1; }                 # out of memory
         var pi[24];
-        if (_asw_create_process(wcmd, wenv, &pi) == 0) { return 0 - 1; }   # spawn failed
+        if (_asw_create_process(wcmd, wenv, &pi, ctx + 96) == 0) { return 0 - 1; }   # spawn failed
         var hProcess = load64(&pi + 0);
         store64(ctx + 72, hProcess);
         store64(ctx + 80, load64(&pi + 8));         # hThread
@@ -726,6 +763,7 @@ fn _async_process_task(ctx): i64 {
             var c0[8]; store64(&c0, 0);
             syscall(61442, hProcess, &c0);           # GetExitCodeProcess
             syscall(3, load64(ctx + 80)); syscall(3, hProcess);
+            _asw_job_close(ctx);
             return load32(&c0);
         }
         store64(ctx + 88, load64(&wh));
@@ -739,6 +777,7 @@ fn _async_process_task(ctx): i64 {
     var ec = load32(&code);
     syscall(3, load64(ctx + 80));                   # CloseHandle(hThread)
     syscall(3, hProcess);                           # CloseHandle(hProcess)
+    _asw_job_close(ctx);
     return ec;
 }
 
@@ -747,7 +786,8 @@ fn _async_process_task(ctx): i64 {
 # command line), non-blocking (parks on the process handle until exit). Returns a task handle
 # whose result — via task_join(rt, handle) — is the child's exit code. v6.4.44 (R2).
 fn async_spawn_process(rt, path, argv, envp): i64 {
-    var ctx = alloc_via(load64(rt + 32), 96);
+    var ctx = alloc_via(load64(rt + 32), 104);
+    if (ctx == 0) { return 0; }
     store64(ctx + 40, 0);
     store64(ctx + 48, rt);
     store64(ctx + 56, argv);
@@ -755,12 +795,14 @@ fn async_spawn_process(rt, path, argv, envp): i64 {
     store64(ctx + 72, 0);
     store64(ctx + 80, 0);
     store64(ctx + 88, 0);
+    store64(ctx + 96, 0);
     return async_spawn(rt, &_async_process_task, ctx);
 }
 
 # Spawn `path` and wait, with an optional deadline (ms <= 0 = no deadline). Returns the child
 # exit code, or -2 if the deadline fired first — in which case async_with_timeout's retire has
-# already TerminateProcess'd + reaped + closed the child (no orphan, no handle leak). Does NOT
+# already ended the child's job (its whole tree, 6.6.10) + reaped + closed it (no orphan, no
+# handle leak). Does NOT
 # close the runtime. Mirror of async.cyr async_run_process. v6.4.44 (R2).
 fn async_run_process(rt, path, argv, envp, ms): i64 {
     var h = async_spawn_process(rt, path, argv, envp);
@@ -787,7 +829,14 @@ fn async_await_readable(fd): i64 {
     return 0;
 }
 
-# Run `fp(arg)` with a timeout. No fork on Windows; run inline (mirrors agnos). `ms` ignored.
+# Run `fp(arg)` with a timeout — REFUSED on Windows: returns -1 (the timeout value of the
+# Linux contract) and does not run `fp`.
+# ⛔ 6.6.10 — FAIL CLOSED. This ran the body INLINE and ignored `ms`, so a caller that asked
+# for "at most ms" got an unbounded call that answered as if it had been bounded. There is no
+# fork on Windows, so there is no second process to put a deadline on, and a thread cannot be
+# killed safely mid-body. -1 is what a caller of this API already handles (the body did not
+# finish in time); an answer that looks like success is not. Nothing in the tree or the
+# ecosystem calls it on Windows. CHANGELOG [6.6.10]
 fn async_timeout(fp, arg, ms): i64 {
-    return fncall1(fp, arg);
+    return 0 - 1;
 }

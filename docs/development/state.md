@@ -2,10 +2,18 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-09-28 (1.2.8 — `pow` within 1 ulp everywhere,
-> toolchain 6.6.9).
+> Last refreshed: 2026-09-29 (1.2.9 — f32 `sin` / `cos` correct past 2^63,
+> toolchain 6.6.10).
 
 ## Version
+
+**1.2.9** — **f32 `sin` / `cos` are correct past 2^63.** The 1.2.x guard returned NaN
+for |x| ≥ 2^63, written against the old stdlib `f64_sin` that returned its argument
+there; cyrius 6.6.9 reduces every finite argument within 1 ulp, so the guard is gone
+(`ganita_f32_sin(2^70)` = `0xBF7F88AF`, was NaN). The matrix / linalg headers no longer
+name the retired `lib/matrix.cyr` / `lib/linalg.cyr`. Toolchain **6.6.9 → 6.6.10**,
+`lib/` re-vendored (**111** files). No public signature changed. **597 assertions**
+(was 589).
 
 **1.2.8** — **`pow` is within 1 ulp everywhere.** Both finite paths of `ganita_f64_pow`
 were hundreds of ulp out: `exp(y·ln x)` up to 909 ulp (|y·ln x| = 667) and the 1.2.4
@@ -134,9 +142,9 @@ initial carve out of cyrius stdlib (2026-06-10, cyrius v6.1.26).
 
 ## Toolchain
 
-- **Cyrius pin**: `6.6.9` (`cyrius.cyml [package].cyrius`, since 1.2.8).
-  `cyrius version` reports `manifest-pin: 6.6.9` with no drift line —
-  `cyrius lib sync --full` re-copied all 111 files from the 6.6.9 snapshot.
+- **Cyrius pin**: `6.6.10` (`cyrius.cyml [package].cyrius`, since 1.2.9).
+  `cyrius version` reports `manifest-pin: 6.6.10` with no drift line —
+  `cyrius lib sync --full` re-copied all 111 files from the 6.6.10 snapshot.
 - **`lib/` matches the pin exactly**: 111 files, 0 differ. Verify by comparing
   the trees against `~/.cyrius/versions/<pin>/lib`, not by trusting
   `cyrius lib sync --full`'s exit code.

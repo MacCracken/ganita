@@ -70,6 +70,7 @@ fn _http_parse_url(url): i64 {
         vi = vi + 1;
     }
     var result = alloc(24);
+    if (result == 0) { return 0; }
     var p = 0;
     # Skip "http://"
     if (memeq(url, "http://", 7) == 1) { p = 7; }
@@ -83,6 +84,7 @@ fn _http_parse_url(url): i64 {
     var host_len = p - host_start;
     if (host_len == 0) { return 0; }  # empty host
     var host = alloc(host_len + 1);
+    if (host == 0) { return 0; }
     memcpy(host, url + host_start, host_len);
     store8(host + host_len, 0);
     store64(result, host);
@@ -122,6 +124,7 @@ fn _http_build_request(method, host, path): i64 {
     var need = mlen + 1 + plen + 17 + hlen + 23 + 1;
     if (need > _HTTP_REQ_CAP) { return 0; }
     var buf = alloc(need);
+    if (buf == 0) { return 0; }
     var pos = 0;
     memcpy(buf + pos, method, mlen); pos = pos + mlen;
     store8(buf + pos, 32); pos = pos + 1;
@@ -186,6 +189,7 @@ fn _http_parse_response_a(a, buf, len): i64 {
 # Parse HTTP response: extract status code and body
 fn _http_parse_response(buf, len): i64 {
     var result = alloc(32);
+    if (result == 0) { return 0; }
     store64(result, 0);
     store64(result + 8, 0);
     store64(result + 16, 0);
@@ -224,6 +228,7 @@ fn http_get(url): i64 {
     var parsed = _http_parse_url(url);
     if (parsed == 0) {
         var bad = alloc(24);
+        if (bad == 0) { return 0; }
         store64(bad, HTTP_ERROR);
         store64(bad + 8, 0);
         store64(bad + 16, 0);
@@ -236,8 +241,10 @@ fn http_get(url): i64 {
     # not resolve before any TCP socket. sock_connect wants a packed address; it used to get the
     # host STRING pointer, so no http_* call reached any host. CHANGELOG [6.6.9]
     var slot = alloc(16);
+    if (slot == 0) { return 0; }
     if (_http_prepare(host, path, slot) != 0) {
         var unr = alloc(24);
+        if (unr == 0) { return 0; }
         store64(unr, HTTP_ERROR);
         store64(unr + 8, 0);
         store64(unr + 16, 0);
@@ -252,10 +259,21 @@ fn http_get(url): i64 {
     # unwrap, mirroring the lib/sandhi.cyr / regression-tls-live.sh
     # call shape.
     var fd_r_tag, fd_r = tcp_socket();
-    if (is_err_result(fd_r_tag) == 1) { var err = alloc(24); store64(err, HTTP_ERROR); return err; }
+    if (is_err_result(fd_r_tag) == 1) {
+        var err = alloc(24);
+        if (err == 0) { return 0; }
+        store64(err, HTTP_ERROR);
+        return err;
+    }
     var fd = fd_r;
     var c_r_tag, c_r = sock_connect(fd, addr, port);
-    if (is_err_result(c_r_tag) == 1) { sys_close(fd); var err = alloc(24); store64(err, HTTP_ERROR); return err; }
+    if (is_err_result(c_r_tag) == 1) {
+        sys_close(fd);
+        var cerr = alloc(24);
+        if (cerr == 0) { return 0; }
+        store64(cerr, HTTP_ERROR);
+        return cerr;
+    }
     # Send the WHOLE request. v6.6.8: this used to call sock_send and drop its count, so a
     # short write (SO_SNDTIMEO, a signal) sent half a request and then waited for a response to
     # it. A failed or short send is now HTTP_ERROR. CHANGELOG [6.6.8]
@@ -263,12 +281,14 @@ fn http_get(url): i64 {
     if (sock_send_all(fd, req, qlen) != qlen) {
         sys_close(fd);
         var serr = alloc(24);
+        if (serr == 0) { return 0; }
         store64(serr, HTTP_ERROR);
         return serr;
     }
     # Read response — sock_recv returns Result; payload(Ok) is bytes
     # read, Err short-circuits the loop.
     var rbuf = alloc(65536);
+    if (rbuf == 0) { sys_close(fd); return 0; }
     var total = 0;
     var rgo = 1;
     while (rgo == 1) {
@@ -297,6 +317,7 @@ fn http_get_r(url) : Result {
     var port = load64(parsed + 8);
     var path = load64(parsed + 16);
     var slot = alloc(16);
+    if (slot == 0) { return Err(HttpOther); }
     var prep = _http_prepare(host, path, slot);
     if (prep == 1) { return Err(HttpBadUrl); }                # v6.6.9: over-long (CVE-50)
     if (prep != 0) { return Err(HttpNetErr); }                # v6.6.9: does not resolve
@@ -310,6 +331,7 @@ fn http_get_r(url) : Result {
     var qlen = strlen(req);
     if (sock_send_all(fd, req, qlen) != qlen) { sys_close(fd); return Err(HttpNetErr); }   # v6.6.8
     var rbuf = alloc(65536);
+    if (rbuf == 0) { sys_close(fd); return Err(HttpOther); }
     var total = 0;
     var rgo = 1;
     while (rgo == 1) {
@@ -356,6 +378,7 @@ fn http_get_a(a, url): i64 {
     var port = load64(parsed + 8);
     var path = load64(parsed + 16);
     var slot = alloc(16);
+    if (slot == 0) { return 0; }
     if (_http_prepare(host, path, slot) != 0) {               # v6.6.9: CVE-50 / unresolved
         var unr = alloc_via(a, 24);
         if (unr == 0) { return 0; }

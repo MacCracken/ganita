@@ -80,9 +80,13 @@ include "lib/syscalls_x86_64_agnos.cyr"
 # cyrius-x bytecode (v6.6.6). The .cyx guest ABI is x86_64-LINUX-numbered:
 # cxvm issues the guest's own syscall number on whatever host it runs on and
 # translates the pointer args, so the x86_64 peer is the correct table here.
-# ⚠ cxvm implements read(0)/write(1)/open(2)/close(3)/lseek(8)/exit(60) and
-# passes anything else straight through WITHOUT pointer translation — so a
-# wrapper outside that set compiles on cx and will not work. Before this arm
+# ⚠ The served set — authority: programs/cxvm.cyr's op-0x70 dispatch — is read(0) /
+# write(1) / open(2) / close(3) / lseek(8) / exit(60) with pointer translation, plus
+# getrandom(318) and clock_gettime(228) served through the HOST's stdlib (6.6.8). Anything
+# else goes to the host raw, WITHOUT pointer translation — so a wrapper outside that set
+# compiles on cx and will not work. (This read "read/write/open/close/lseek/exit" until
+# 6.6.10, two releases after 318/228 were added; docs/platform-status.md states the whole
+# guest contract.) Before this arm
 # the cx driver matched no target at all, so `sys_exit` (and every other
 # wrapper) was undefined and `lib/assert.cyr` could not compile for cx.
 #ifdef CYRIUS_TARGET_CX

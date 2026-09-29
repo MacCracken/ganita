@@ -32,21 +32,23 @@
 # doc is the bug. Return convention: rax >= 0 on success, -1 on error (NOT
 # Linux -errno).
 #
-# ⚠ #96 / #97 (agnos, assigned by operator ruling 2026-08-05; next free = #98).
-# Neither may be swapped on first-come grounds.
+# ⚠ #96 / #97 (agnos, assigned by operator ruling 2026-08-05). Both are MINTED; the kernel's
+# highest arm is #108 (sched_yield_to, agnos 1.57.9), so the next free number is #109.
 #   #97 = chan_op — MINTED at cyrius 6.5.8. The kernel arm shipped in agnos 1.56.40
-#                   (`kernel/core/syscall.cyr:7620`, `if (num == 97)`), with all five
+#                   (`kernel/core/syscall.cyr`, `if (num == 97)`), with all five
 #                   ops CAPS/MINT/SEND/RECV/CLOSE dispatching and `CH_OP_SUPPORTED`
 #                   = 0x1F advertising exactly those. Verified by reading the kernel,
 #                   not the ABI doc — see the RE-FREEZE RULE above.
-#   #96 = fork    — STILL NOT MINTED. No dispatch arm exists in agnos 1.56.40
-#                   (`grep 'num == 96'` finds nothing). Do NOT add the constant until
-#                   it does: on agnos an unknown `num` falls THROUGH the dispatch
-#                   chain and the caller reads the fall-through value as DATA, so a
-#                   minted-but-unimplemented constant is strictly worse than an absent
-#                   one — and a host build of the same consumer looks healthy either
-#                   way, so nothing off-target catches it. Gated by
-#                   tests/gates/platform/syscall_wrapper_pass.sh axis 5.
+#   #96 = fork    — MINTED at cyrius v6.5.37 (agnos 1.56.55). Its arm is in the ring-3 ENTRY
+#                   STUB (`kernel/arch/x86_64/syscall_hw.cyr`, `sc_num == 96`), not in
+#                   `core/syscall.cyr` — which is why a `grep 'num == 96'` of the dispatch
+#                   finds nothing; see sys_fork. The rule that kept it unminted until then
+#                   still holds for every future number: do NOT add a constant before its
+#                   kernel arm exists — an unknown `num` falls THROUGH the dispatch chain and
+#                   the caller reads the fall-through value as DATA, and a host build of the
+#                   same consumer looks healthy either way. Gated by
+#                   tests/gates/platform/syscall_wrapper_pass.sh axis 5. (This block read
+#                   "#96 STILL NOT MINTED; next free = #98" until 6.6.10 — CHANGELOG [6.6.10].)
 
 # ================================================================
 # Syscall numbers — §2 FROZEN (0-28) + §3 (29-33)
@@ -164,7 +166,7 @@ enum SysNrAgnos {
     #   Linux call would read a garbage mask and SUCCEED, returning the old one)
     # v6.5.8 — the local-IPC channel band. ONE syscall, op-dispatched on arg1, which is
     # the same `MDO_OP_SUPPORTED` shape that grew #93 across a whole arc with no ABI
-    # break. (#96 fork is NOT minted — see the header; no kernel arm exists yet.)
+    # break. (#96 is fork, minted at v6.5.37 and declared with the stat band above.)
     SYS_CHAN_OP          = 97;    # chan_op(op, a1, a2, a3) → 0/len / negative CH_E_*
     SYS_PTRSCAN          = 98;    # ptrscan(buf, max) → 16 / 0 (idle) / -1  (agnos 1.56.42)
     SYS_PROCLIST         = 99;    # proclist(buf, max) → record count / -1  (agnos 1.56.47)
@@ -674,8 +676,14 @@ var _agnos_sock_sndto_us: i64[8];
 # by conn_id 0..7. sys_sock_accept writes it and _agnos_sock_bind consumes it, so an accepted
 # socket starts with its LISTENER's recv/send timeouts — Linux copies SO_RCVTIMEO/SO_SNDTIMEO into
 # the accepted socket, and the fresh slot here used to fall back to the 30 s default instead.
-# sys_sock_connect and sys_sock_close clear the mark, so a conn_id the kernel recycles for an
-# OUTBOUND connection never inherits a listener's deadline. CHANGELOG [6.6.8]
+# The lifecycle is: accept WRITES the mark, _agnos_sock_bind CONSUMES it, sys_sock_connect
+# CLEARS it. The connect clear is the LOAD-BEARING one — a conn_id the kernel recycles for an
+# OUTBOUND connection must not inherit a listener's deadline (pinned by
+# tests/gates/platform/agnos_accept_timeout_inherit.sh). The clear in sys_sock_close is
+# DEFENSIVE and cannot be observed: every path to a bind goes through an accept (which
+# overwrites the mark) or a connect (which clears it) first, so no gate can tell whether it is
+# there — measured by mutation, 6.6.10. It stays as belt and braces, not as a guarantee.
+# CHANGELOG [6.6.8] [6.6.10]
 var _agnos_accept_from: i64[8];
 
 # ================================================================
@@ -732,6 +740,32 @@ fn sys_ftruncate(fd, length): i64 { return 0 - 38; }
 fn sys_truncate(path, length): i64 { return 0 - 38; }
 # Create an anonymous in-memory file. agnos has no memfd; shared memory is sys_mmap.
 fn sys_memfd_create(name, flags): i64 { return 0 - 38; }
+
+# ── 6.6.10: agnos peers for the portable wrappers the .tcyr corpus calls and this peer lacked —
+# found by the corpus cross-compile ratchet (tests/gates/toolchain/tcyr_corpus_cross_compiles.sh),
+# where each one was an "undefined function" that failed the whole agnos build. Same rule as the
+# blocks around it: no Linux `SYS_*` constant is minted, because the Linux number is a live,
+# unrelated agnos call. CHANGELOG [6.6.10]
+# Create a connected socket pair. agnos has no AF_UNIX and no socketpair; its local IPC is the
+# #97 channel band (sys_chan_mint), whose endpoints are not an fd pair of this shape. -ENOSYS.
+fn sys_socketpair(domain, type, protocol, fds): i64 { return 0 - 38; }
+# Receive a datagram and its source address. agnos sockets are connection-id based (sock_recv#49
+# on a connected id); there is no unconnected receive-from form. -ENOSYS.
+fn sys_recvfrom(fd, buf, len, flags, srcaddr, srcaddrlen): i64 { return 0 - 38; }
+# Receive a message (a msghdr). agnos has no msghdr surface — sys_sendmsg's twin. -ENOSYS.
+fn sys_recvmsg(fd, msghdr, flags): i64 { return 0 - 38; }
+# Change a file's mode by descriptor: a no-op success, exactly as sys_chmod — agnos has no
+# permission model, so there is no mode to change.
+fn sys_fchmod(fd, mode): i64 { return 0; }
+# The real group id: 0. agnos has no groups (and every process is uid 0 — sys_getuid).
+fn sys_getgid(): i64 { return 0; }
+# The effective group id: 0, as sys_getgid.
+fn sys_getegid(): i64 { return 0; }
+# Flush `fd`'s data and metadata to disk. agnos has no per-file flush; sync#12 flushes every
+# mounted filesystem, a superset, so this is sync's answer (0).
+fn sys_fsync(fd): i64 { return syscall(SYS_SYNC); }
+# Flush `fd`'s data to disk: sync#12, as sys_fsync.
+fn sys_fdatasync(fd): i64 { return syscall(SYS_SYNC); }
 
 # ── v6.6.8: agnos peers for the namespace / root / capability / cross-process-memory /
 # mknodat wrappers. ⛔ Same rule as the block above — NO `SYS_*` Linux constant is minted
@@ -964,9 +998,10 @@ fn WIFSIGNALED(status): i64 {
 # The signal that ended the child; meaningful when WIFSIGNALED.
 fn WTERMSIG(status): i64 { return status & 0xFF; }
 
-# Allocate an 8-byte (64-bit) pending-signal mask, zeroed.
+# Allocate an 8-byte (64-bit) pending-signal mask, zeroed. 0 when the allocation is refused.
 fn sigset_new(): i64 {
     var set = alloc(8);
+    if (set == 0) { return 0; }                                      # CHANGELOG [6.6.10]
     store64(set, 0);
     return set;
 }
@@ -1006,6 +1041,92 @@ fn sys_kill_tree(pid, sig): i64 {
     if (sig < 0) { return 0 - 1; }
     if (sig > 63) { return 0 - 1; }
     return syscall(SYS_KILL, pid, sig | AGNOS_KILL_TREE);
+}
+
+# ── Child helpers shared by lib/regression_agnos.cyr and lib/async_agnos.cyr (6.6.10) ──
+# Both ports hand the kernel a POSIX-shaped argv/envp (NULL-terminated arrays of cstrs) as #43
+# blobs, bound a child with a deadline, and end it at the deadline — one copy here, rather than a
+# private copy per module (lib/process_agnos.cyr's _agp_* builders take vecs, not pointer arrays).
+
+# Append the NUL-terminated string `s` and one NUL to the #43 blob `b` at offset `off` (capacity
+# `cap`). Returns the new offset, or -1 when `off` is already -1, `s` is 0, or it does not fit.
+fn _agnos_blob_put(b, off, cap, s): i64 {
+    if (off < 0) { return 0 - 1; }
+    if (s == 0) { return 0 - 1; }
+    var i = 0;
+    while (load8(s + i) != 0) {
+        if (off + i + 1 >= cap) { return 0 - 1; }
+        store8(b + off + i, load8(s + i));
+        i = i + 1;
+    }
+    if (off + i + 1 > cap) { return 0 - 1; }
+    store8(b + off + i, 0);
+    return off + i + 1;
+}
+
+# 1 iff the blob entry b[s, e) has a '=' at index >= 1 — the kernel's KEY=VALUE rule for an env.
+fn _agnos_blob_has_eq(b, s, e): i64 {
+    var j = s + 1;
+    while (j < e) {
+        if (load8(b + j) == 61) { return 1; }
+        j = j + 1;
+    }
+    return 0;
+}
+
+# Append every string of the NULL-terminated pointer array `ptrs` from index `from` (`ptrs` 0 is
+# an empty array). With `need_eq` 1 an entry that is not KEY=VALUE is refused. Returns the new
+# offset, or -1 — also when the blob would then hold more than SPAWN_ARGC_MAX entries, which the
+# kernel refuses (-SPAWN_E_ARGS) and never truncates.
+fn _agnos_blob_ptrs(b, off, cap, ptrs, from, need_eq): i64 {
+    if (off < 0) { return 0 - 1; }
+    if (ptrs == 0) { return off; }
+    var i = from;
+    while (load64(ptrs + i * 8) != 0) {
+        var s = off;
+        off = _agnos_blob_put(b, off, cap, load64(ptrs + i * 8));
+        if (off < 0) { return 0 - 1; }
+        if (need_eq == 1) { if (_agnos_blob_has_eq(b, s, off - 1) == 0) { return 0 - 1; } }
+        i = i + 1;
+    }
+    var n = 0;
+    var k = 0;
+    while (k < off) {
+        if (load8(b + k) == 0) { n = n + 1; }
+        k = k + 1;
+    }
+    if (n > SPAWN_ARGC_MAX) { return 0 - 1; }
+    return off;
+}
+
+# Poll child `pid` (#4, NON-blocking) until it exits. Returns its wait status (>= 0), -1 when it is
+# not ours, or -2 when `bounded` is 1 and the deadline in `dl` (_agnos_dl_start) passed first. A
+# wait with a deadline cannot use WAIT_BLOCK (it has no timeout, and takes only pids 0..15), so
+# this polls, sleeping 1 ms between polls (#41 blocks only the caller).
+fn _agnos_wait_poll(pid, dl, bounded): i64 {
+    while (1 == 1) {
+        var st = sys_waitpid(pid);
+        if (st != 0 - 2) { return st; }
+        if (bounded == 1) { if (_agnos_dl_over(dl) == 1) { return 0 - 2; } }
+        sys_sleep_ms(1);
+    }
+    return 0 - 1;
+}
+
+# End child `pid` and its whole tree with SIGKILL, then reap it. Returns its wait status, or -1
+# when it could not be reaped within ~5 s. SIGKILL AT ONCE: agnos gives SIGTERM no default action
+# (see sys_kill), so the POSIX TERM -> grace -> KILL sequence would end nothing and only wait.
+# kill_tree needs agnos 1.57.7; an older kernel answers -1 and the child alone is killed.
+fn _agnos_kill_reap(pid): i64 {
+    if (sys_kill_tree(pid, 9) < 0) { sys_kill(pid, 9); }
+    var i = 0;
+    while (i < 5000) {
+        var st = sys_waitpid(pid);
+        if (st != 0 - 2) { return st; }
+        sys_sleep_ms(1);
+        i = i + 1;
+    }
+    return 0 - 1;
 }
 
 # spawn_limits(mem_pages, cpu_ms) — #107, agnos 1.57.7: ONE-SHOT resource caps for the caller's
@@ -1177,12 +1298,14 @@ fn statfs_bsize(buf): i64 { return load64(buf + STATFS_BSIZE); }
 # tests/gates/platform/syscall_wrapper_pass.sh asserted the CONSTANT MUST NOT EXIST on that
 # same stale premise; that assertion is inverted at v6.5.37.
 #
-# ⚠ A forked child of a FOREGROUND `exec_and_wait` process does not run until the foreground
-# run ends (IF=0, not preempted). fork is for processes under the scheduler — spawned via
-# `spawn_path`#43 — which is how a server like agora runs anyway.
+# The child is an ordinary SCHEDULED process from the fork on: since agnos 1.57.7 its RFLAGS
+# always has IF set (`syscall_hw.cyr`, "THE CHILD'S RFLAGS ALWAYS HAS IF SET"), so a child forked
+# by a foreground `exec_and_wait` process runs alongside it. (This read "does not run until the
+# foreground run ends (IF=0, not preempted)" until 6.6.10 — true before 1.57.7. CHANGELOG [6.6.10])
+# It inherits the parent's fd table (vfs_fd_inherit copies the entries by value).
 # ⚠ `waitpid`#4 gained WAIT-ANY in the same cut: `sys_waitpid(-1)` returns a finished child's
-# exit code, -2 while children are still running, -1 when there are none. A fork-per-
-# connection loop wants that, not the single-pid poll.
+# WAIT STATUS (decode with the W* helpers), -2 while children are still running, -1 when there
+# are none. A fork-per-connection loop wants that, not the single-pid poll.
 fn sys_fork(): i64 { return syscall(SYS_FORK); }
 
 # agnos has NO fstat-by-fd syscall — the kernel exposes only path-based
@@ -1773,7 +1896,9 @@ fn sys_sock_send(conn_id, buf, len): i64 { return syscall(SYS_SOCK_SEND, conn_id
 # Non-blocking drain from a conn (#49): bytes drained, 0 = WOULD_BLOCK,
 # -1 = EOF / bad arg (the inverted-from-Linux sense the recv loop honors).
 fn sys_sock_recv(conn_id, buf, maxlen): i64 { return syscall(SYS_SOCK_RECV, conn_id, buf, maxlen); }
-# Close a conn (#50; FIN+ACK if established) + free its buffers. 0, or -1.
+# Close a conn (#50; FIN+ACK if established) + free its buffers. 0, or -1. The accept-mark clear
+# here is defensive only (see _agnos_accept_from): nothing can bind the id before an accept or a
+# connect rewrites the mark anyway.
 fn sys_sock_close(conn_id): i64 {
     _agnos_accept_mark(conn_id, 0);
     return syscall(SYS_SOCK_CLOSE, conn_id);

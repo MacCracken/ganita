@@ -118,9 +118,12 @@ fn _uts_field(a, b, dst, scratch, cap): i64 {
 
 # Wall clock into a 16-byte struct timeval (tv_sec i64 @ +0, tv_usec i32 @ +8
 # with 4 bytes of tail pad — byte layout measured identically on ecb and ach).
-# clock_gettime is deliberately NOT used here: syscall(228) is unrouted on
-# x86-macOS (lib/chrono.cyr:27, "that arch is HELD"), so it would work on ecb and
-# be silently dead on ach — the exact "fixed one fork, not the other" shape.
+# clock_gettime is deliberately NOT used here: Darwin has no clock_gettime syscall, and
+# syscall(228)'s two Mach-O reroutes RETURN nanoseconds rather than filling a timespec
+# (arm64 binds _clock_gettime_nsec_np and never touches the buffer; x86 composes it from
+# this same gettimeofday — EMACHO_CLOCK_X86, routed since v6.5.16). This note said 228 was
+# "unrouted on x86-macOS" until 6.6.10; gettimeofday is still the one source that fills a
+# struct timeval identically on both Macs.
 #
 # ⚠⚠ THE THIRD ARGUMENT IS NOT OPTIONAL AND MUST BE AN EXPLICIT NULL.
 # Darwin's gettimeofday syscall is
@@ -137,6 +140,9 @@ fn _uts_field(a, b, dst, scratch, cap): i64 {
 # third arg at a sentinel: ecb wrote 0x3AFC14FB55 (÷24 MHz timebase = 10523 s =
 # the box's uptime), ach wrote 0x35568623C86E1 ns (= 938 ks, likewise its
 # uptime); with the third arg 0, the sentinel was untouched on both.
+# ⚠ The compiler's own x86 reroute of syscall(228) (EMACHO_CLOCK_X86) made exactly this
+# mistake from v6.5.16 to 6.6.9 — it set rdi and rsi and never zeroed rdx — so every
+# clock_now_* on Intel-Mac wrote mach time through a stale rdx. CVE-51, CHANGELOG [6.6.10].
 fn _macos_gettimeofday(tv): i64 {
     #ifdef CYRIUS_TARGET_MACOS
     return syscall(SYS_GETTIMEOFDAY, tv, 0, 0);
