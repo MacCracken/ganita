@@ -4,6 +4,52 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.8] — 2026-09-28 — `pow` is within 1 ulp everywhere
+
+Toolchain **6.6.7 → 6.6.9** (the vendored `lib/` is the full 6.6.9 snapshot). No
+public signature changed. **531 assertions** (was 521; one of the new ones folds 108
+reference rows).
+
+### Fixed — `ganita_f64_pow` (and `f64_pow`, `ganita_f32_pow`) was hundreds of ulp out
+
+Both finite paths lost accuracy, silently:
+
+- the general path `exp(y·ln x)` turns the rounding of `y·ln x` into a relative error
+  of about |y·ln x| ulp — **909 ulp** at |y·ln x| = 667, and only 46 % of 20,000
+  log-uniform inputs came back correctly rounded;
+- the 1.2.4 binary-exponentiation path (integral |y| ≤ 1024) doubles its relative
+  error at every squaring — **772 ulp** for `pow(1.0000144, -916)`, 1 % correctly
+  rounded. It was exact only when every intermediate square was.
+
+Every finite case now goes through `_gn_pow_pos`, a port of fdlibm's `e_pow.c` core:
+`log2(x)` and `y·log2(x)` carried in about 70 bits, then `2^(p_h + p_l)` by an integer
+plus a rational approximation, with subnormal results scaled in one rounding. Measured
+against a correctly rounded reference: **≤ 1 ulp** on both 20,000-input premise sweeps
+(was 909 / 772; 94 % / 90 % exact), with bit-identical results on x86_64 and aarch64 (qemu);
+a bit-exact model of the same algorithm is ≤ 1 ulp on 200,000 inputs over the whole exponent
+range, subnormals included. An integer power that is representable is
+still exact (`pow(7, 2)`, `pow(10, 15)`, `pow(10, 22)`, `pow(3, 33)`, `pow(2, -1074)`).
+The C99 Annex F special cases (1.2.7) are answered first, unchanged.
+
+Every f64 operation in the new code is an `f64_*` call and every word manipulation is
+integer arithmetic on bit patterns: no builtin's result is an operand of `+ - * /`,
+because cyrius 6.6.10 makes that a float operation, and the fold must mean the same on
+every toolchain.
+
+### Tests
+
+- `math: f64 pow — within 1 ulp of the correctly rounded value, everywhere (1.2.8)`:
+  108 reference rows (glibc `pow`, each re-checked against an 80-digit decimal power) —
+  56 across the exponent range, 12 with `x` within 1e-7 of 1 and |y| up to 3e9, 10
+  subnormal bases, 10 subnormal results, and the 20 worst inputs of the two old paths —
+  plus 8 exactness / range rows. **1.2.7 fails 94 of the 108.**
+
+### Changed
+
+- **Toolchain pin 6.6.7 → 6.6.9.** `lib/` re-vendored with `cyrius lib sync --full`
+  (111 files, `diff -rq` clean against the 6.6.9 snapshot); `dist/` regenerated with
+  `cyrius distlib --all` (`--check` current, `consumer-check.sh` clean).
+
 ## [1.2.7] — 2026-09-27 — `pow` follows the C99 Annex F table
 
 Toolchain **6.6.4 → 6.6.7** (the vendored `lib/` is the full 6.6.7 snapshot). No

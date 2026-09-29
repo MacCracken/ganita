@@ -1,6 +1,6 @@
 # hashseed.cyr — per-process hash seed + finalizer, shared by every hashmap variant.
 # Usage: include "lib/hashseed.cyr"
-# Requires: syscalls.cyr (SYS_GETRANDOM / sys_getrandom), atomic.cyr (atomic_cas)
+# Includes its own definers: syscalls.cyr (SYS_GETRANDOM / sys_getrandom), atomic.cyr (atomic_cas).
 #
 # ⭐ WHY THIS IS ITS OWN MODULE. `lib/hashmap.cyr` and `lib/hashmap_fast.cyr` each carried a
 # VERBATIM copy of the same unseeded FNV-1a — the second one's own comment says "same as

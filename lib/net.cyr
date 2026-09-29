@@ -12,7 +12,21 @@
 # platform-branched (#ifdef CYRIUS_TARGET_MACOS). Verified on arm64 macOS (ecb)
 # v6.0.59 — see 2026-06-04-macos-net-socket-syscalls-unported.md.
 # Usage: include "lib/net.cyr"
-# Requires: agnosys/syscalls.cyr, alloc.cyr, tagged.cyr
+# Includes its own definers (6.6.9): syscalls.cyr, alloc.cyr, string.cyr, result.cyr, and io.cyr
+# for the resolver.
+
+# 6.6.9: the line above used to be a Requires list for the caller (naming a retired agnosys
+# path), and a bare include compiled with ~11 undefined functions — sys_read/sys_write, alloc,
+# memset, Ok/Err/ok_via/err_via — and was a hard error on agnos, whose socket wrappers live in
+# the syscall peer. CHANGELOG [6.6.9]
+include "lib/syscalls.cyr"
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/result.cyr"
+# The resolver (net_resolve_ipv4) reads /etc/hosts and /etc/resolv.conf through lib/io.cyr's
+# file_open — the agnos-ABI-bridged open. Include-once, so an existing caller pays nothing.
+# CHANGELOG [6.6.9]
+include "lib/io.cyr"
 
 # Syscall numbers
 var NSYS_SOCKET = 41;
@@ -62,7 +76,6 @@ enum IpOpt {
     IP_ADD_MEMBERSHIP = 12;
     IP_DROP_MEMBERSHIP = 13;
 }
-var _NET_O_NONBLOCK = 0x0004;
 var _NET_EINPROGRESS = 36;
 #else
 enum SockOpt {
@@ -82,7 +95,6 @@ enum IpOpt {
     IP_ADD_MEMBERSHIP = 35;
     IP_DROP_MEMBERSHIP = 36;
 }
-var _NET_O_NONBLOCK = 2048;
 var _NET_EINPROGRESS = 115;
 #endif
 
@@ -412,6 +424,26 @@ fn sock_send(fd, buf, len) : Result {
     return Ok(n);
 }
 
+# Send ALL `len` bytes, looping over short writes. Returns `len`, or -errno (a failed or
+# timed-out write — -EAGAIN when SO_SNDTIMEO expires, -EPIPE on a closed peer — with an unknown
+# prefix already sent; the connection is then unusable for framed data). An interrupted write
+# (-EINTR) is retried. No Result box, so no allocation.
+# ⛔ WHY: a blocking stream write may return FEWER bytes than asked — a signal, or SO_SNDTIMEO
+# (which lib/ws_server.cyr's and lib/http.cyr's callers set through sock_set_send_timeout) — and
+# every caller that dropped sock_send's count silently truncated its frame or request: a
+# WebSocket peer then read the next frame's header out of this one's payload. CHANGELOG [6.6.8]
+fn sock_send_all(fd, buf, len): i64 {
+    var off = 0;
+    while (off < len) {
+        var n = sys_write(fd, buf + off, len - off);
+        if (n == 0 - 4) { continue; }               # EINTR: nothing was written; retry
+        if (n < 0) { return n; }
+        if (n == 0) { return 0 - 5; }               # EIO: a stream write never returns 0 for len > 0
+        off = off + n;
+    }
+    return len;
+}
+
 # Receive data from socket. Returns Result(bytes_read).
 fn sock_recv(fd, buf, len) : Result {
     var n = sys_read(fd, buf, len);
@@ -613,11 +645,12 @@ fn net_set_multicast_if(fd, iface): i64 {
 # added the matching aarch64-Linux ESYSXLAT renumbers (socket 41→198, connect
 # 42→203, fcntl 72→25, poll 7→ppoll 73 w/ timespec shift, …), without which the
 # raw x86 numbers mis-routed on native ARM (socket→pivot_root). The
-# Darwin-specific flag/option values (O_NONBLOCK, EINPROGRESS, SOL_SOCKET,
-# SO_ERROR) are passed verbatim, so they come from the platform-branched
-# constants above (_NET_O_NONBLOCK / _NET_EINPROGRESS / SockOpt). Linux:
-# O_NONBLOCK=2048, EINPROGRESS=115, SOL_SOCKET=1, SO_ERROR=4. F_GETFL=3,
-# F_SETFL=4, POLLOUT=4 are the same on both.
+# Darwin-specific option values (EINPROGRESS, SOL_SOCKET, SO_ERROR) are passed
+# verbatim, so they come from the platform-branched constants above
+# (_NET_EINPROGRESS / SockOpt). Linux: EINPROGRESS=115, SOL_SOCKET=1,
+# SO_ERROR=4; POLLOUT=4 is the same on both. v6.6.8: the O_NONBLOCK toggle is
+# fd_set_nonblocking / fd_restore_flags (lib/syscalls_linux_common.cyr), whose
+# per-target flag is private — this file's own `_NET_O_NONBLOCK` copy is gone.
 var _NET_CONN_NB_OK = 0;
 var _NET_CONN_NB_ERR = 0 - 1;
 var _NET_CONN_NB_TIMEOUT = 0 - 2;
@@ -668,8 +701,9 @@ fn net_connect_nb(fd, addr, port, timeout_ms): i64 {
 # connect()s, polls POLLOUT for `timeout_ms` on EINPROGRESS, reads back SO_ERROR,
 # and restores blocking mode on every exit path. Returns _NET_CONN_NB_OK /
 # _NET_CONN_NB_TIMEOUT / _NET_CONN_NB_ERR. Syscall numbers (72/42/7/55) are
-# Mach-O-translated by the backend SYSXLAT; the flag/opt VALUES come from the
-# platform-branched _NET_O_NONBLOCK / _NET_EINPROGRESS / SOL_SOCKET / SO_ERROR.
+# Mach-O-translated by the backend SYSXLAT; the opt VALUES come from the
+# platform-branched _NET_EINPROGRESS / SOL_SOCKET / SO_ERROR, and O_NONBLOCK is
+# fd_set_nonblocking's (v6.6.8).
 fn net_connect_sa_nb(fd, sa, salen, timeout_ms): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     # AGNOS has no fcntl / connect-by-sockaddr (and is IPv4-only via the #47
@@ -677,9 +711,10 @@ fn net_connect_sa_nb(fd, sa, salen, timeout_ms): i64 {
     return _NET_CONN_NB_ERR;
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    var saved_flags = syscall(72, fd, 3, 0);                # F_GETFL
+    # v6.6.8: a failed F_SETFL is now an error too — it used to be ignored, which ran the
+    # "bounded" connect in BLOCKING mode. CHANGELOG [6.6.8]
+    var saved_flags = fd_set_nonblocking(fd);               # F_GETFL + F_SETFL O_NONBLOCK
     if (saved_flags < 0) { return _NET_CONN_NB_ERR; }
-    syscall(72, fd, 4, saved_flags | _NET_O_NONBLOCK);      # F_SETFL O_NONBLOCK
     var result = _NET_CONN_NB_ERR;
     var cr = syscall(42, fd, sa, salen);                    # connect
     if (cr == 0) {
@@ -701,7 +736,7 @@ fn net_connect_sa_nb(fd, sa, salen, timeout_ms): i64 {
                     result = _NET_CONN_NB_TIMEOUT;
                 } }
         } }
-    syscall(72, fd, 4, saved_flags);                        # F_SETFL <saved> — restore blocking
+    fd_restore_flags(fd, saved_flags);                      # F_SETFL <saved> — restore blocking
     return result;
     #endif
 }
@@ -736,17 +771,16 @@ fn net_connect_nb6(fd, addr16, port, timeout_ms): i64 {
 # v6.2.10: Exported O_NONBLOCK toggles so consumers (e.g. a server's accept-loop
 # listen socket) compose the platform-correct flag instead of hardcoding a Linux
 # value. sock_set_nonblocking returns the SAVED flags (pass to
-# sock_clear_nonblocking to restore), or <0 on F_GETFL failure. AGNOS sockets
-# are blocking with no fcntl → no-op (returns 0).
+# sock_clear_nonblocking to restore), or <0 on F_GETFL / F_SETFL failure. AGNOS
+# sockets are blocking with no fcntl → no-op (returns 0). v6.6.8: both are the
+# socket-named spellings of fd_set_nonblocking / fd_restore_flags, which work on
+# any fd; a failed F_SETFL is now reported instead of ignored.
 fn sock_set_nonblocking(fd): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return 0;
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    var saved = syscall(72, fd, 3, 0);                      # F_GETFL
-    if (saved < 0) { return saved; }
-    syscall(72, fd, 4, saved | _NET_O_NONBLOCK);            # F_SETFL O_NONBLOCK
-    return saved;
+    return fd_set_nonblocking(fd);
     #endif
 }
 
@@ -756,8 +790,343 @@ fn sock_clear_nonblocking(fd, saved): i64 {
     return 0;
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    return syscall(72, fd, 4, saved);                       # F_SETFL <saved>
+    return fd_restore_flags(fd, saved);
     #endif
+}
+
+# ── Name resolution (v6.6.9) ──
+#
+# ⛔ WHY THIS EXISTS: lib/http.cyr handed `sock_connect` the host STRING pointer where it wants a
+# packed address, so `http_get("http://example.com/")` dialled the low 32 bits of a heap pointer
+# and reached no host at all — and this file had no resolver for it to call. These are the
+# resolver: an IPv4 literal, `localhost`, /etc/hosts, then one DNS A query. They take and return
+# the packed network-byte-order form `sock_connect` / `sock_bind` use (INADDR_LOOPBACK's shape),
+# and -1 for "does not resolve"; 255.255.255.255 packs to 0xFFFFFFFF, which is not -1.
+# IPv4 only: no AAAA query, no `search`/`ndots` expansion (lib/sandhi.cyr is the full client).
+# CHANGELOG [6.6.9]
+
+# Parse a strict dotted-quad IPv4 literal ("10.0.0.1") into the packed network-byte-order
+# address. Returns -1 for anything else: not exactly four parts, an empty part, a part above
+# 255, a part with a LEADING ZERO ("010" is octal to inet_aton and decimal to other parsers, so
+# it is refused rather than guessed), or any byte that is not a digit or a dot.
+fn net_parse_ipv4(s): i64 {
+    if (s == 0) { return 0 - 1; }
+    var addr = 0;
+    var part = 0;
+    var cur = 0;
+    var digits = 0;
+    var i = 0;
+    var c = load8(s);
+    while (c != 0) {
+        if (c == 46) {
+            if (digits == 0) { return 0 - 1; }
+            if (part >= 3) { return 0 - 1; }
+            addr = addr | (cur << (part * 8));
+            part = part + 1;
+            cur = 0;
+            digits = 0;
+        } elif (c >= 48 && c <= 57) {
+            if (digits == 1 && cur == 0) { return 0 - 1; }
+            cur = cur * 10 + (c - 48);
+            digits = digits + 1;
+            if (cur > 255) { return 0 - 1; }
+        } else {
+            return 0 - 1;
+        }
+        i = i + 1;
+        c = load8(s + i);
+    }
+    if (digits == 0) { return 0 - 1; }
+    if (part != 3) { return 0 - 1; }
+    return addr | (cur << 24);
+}
+
+# Length of a host name without its one optional trailing dot ("a.b." is "a.b").
+fn _net_name_len(s): i64 {
+    var n = strlen(s);
+    if (n > 0 && load8(s + n - 1) == 46) { n = n - 1; }
+    return n;
+}
+
+# 1 when a[0..alen) and b[0..blen) are the same name, ASCII case-insensitively.
+fn _net_name_ieq(a, alen, b, blen): i64 {
+    if (alen != blen) { return 0; }
+    var i = 0;
+    while (i < alen) {
+        var x = load8(a + i);
+        var y = load8(b + i);
+        if (x >= 65 && x <= 90) { x = x + 32; }
+        if (y >= 65 && y <= 90) { y = y + 32; }
+        if (x != y) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# 1 for `localhost` and every `*.localhost` name, any case, trailing dot or not. RFC 6761 §6.3:
+# these always mean the loopback address and are never sent to a DNS server.
+fn _net_is_localhost(host): i64 {
+    var n = _net_name_len(host);
+    if (_net_name_ieq(host, n, "localhost", 9) == 1) { return 1; }
+    if (n > 10 && _net_name_ieq(host + n - 10, 10, ".localhost", 10) == 1) { return 1; }
+    return 0;
+}
+
+# Index of the first byte at or after `i` in line[0..n) that is not a space or tab.
+fn _net_skip_ws(line, n, i): i64 {
+    while (i < n && (load8(line + i) == 32 || load8(line + i) == 9)) { i = i + 1; }
+    return i;
+}
+
+# Index just past the field that starts at `i` (it ends at a space, tab, `#` or the line end).
+fn _net_field_end(line, n, i): i64 {
+    while (i < n && load8(line + i) != 32 && load8(line + i) != 9 && load8(line + i) != 35) {
+        i = i + 1;
+    }
+    return i;
+}
+
+# Parse line[i..e) as an IPv4 literal (-1 when it is not one: IPv6, a name, too long).
+fn _net_field_ipv4(line, i, e): i64 {
+    if (e - i > 15) { return 0 - 1; }
+    var tok[16];
+    memcpy(&tok, line + i, e - i);
+    store8(&tok + e - i, 0);
+    return net_parse_ipv4(&tok);
+}
+
+# One configuration line. `want` == 0: a resolv.conf `nameserver A.B.C.D` line gives its
+# address. Otherwise: a hosts(5) line `A.B.C.D name alias...` gives A.B.C.D when `want` is one
+# of its names. Everything from `#` on is a comment. Returns the address or -1.
+fn _net_conf_line(line, n, want): i64 {
+    var i = _net_skip_ws(line, n, 0);
+    var e = _net_field_end(line, n, i);
+    if (e == i) { return 0 - 1; }
+    if (want == 0) {
+        if (e - i != 10) { return 0 - 1; }
+        if (memeq(line + i, "nameserver", 10) != 1) { return 0 - 1; }
+        i = _net_skip_ws(line, n, e);
+        return _net_field_ipv4(line, i, _net_field_end(line, n, i));
+    }
+    var addr = _net_field_ipv4(line, i, e);
+    if (addr == 0 - 1) { return 0 - 1; }
+    var wlen = _net_name_len(want);
+    i = _net_skip_ws(line, n, e);
+    while (i < n && load8(line + i) != 35) {
+        e = _net_field_end(line, n, i);
+        var flen = e - i;
+        if (flen > 0 && load8(line + e - 1) == 46) { flen = flen - 1; }
+        if (_net_name_ieq(line + i, flen, want, wlen) == 1) { return addr; }
+        i = _net_skip_ws(line, n, e);
+    }
+    return 0 - 1;
+}
+
+# Scan a configuration file line by line (see _net_conf_line for `want`) and return the first
+# address it yields, or -1. Streams in 1 KiB reads, so a large blocklist-style hosts file costs
+# no heap; a line longer than 1 KiB is skipped whole rather than read truncated.
+fn _net_conf_scan(path, want): i64 {
+    var fd = file_open(path, 0, 0);
+    if (fd < 0) { return 0 - 1; }
+    var chunk[1024];
+    var line[1024];
+    var ll = 0;
+    var over = 0;
+    var found = 0 - 1;
+    var go = 1;
+    while (go == 1 && found == 0 - 1) {
+        var n = file_read(fd, &chunk, 1024);
+        if (n <= 0) {
+            go = 0;
+            if (ll > 0 && over == 0) { found = _net_conf_line(&line, ll, want); }
+        } else {
+            var i = 0;
+            while (i < n && found == 0 - 1) {
+                var c = load8(&chunk + i);
+                if (c == 10) {
+                    if (over == 0) { found = _net_conf_line(&line, ll, want); }
+                    ll = 0;
+                    over = 0;
+                } elif (ll < 1024) {
+                    if (c == 13) { c = 32; }        # CRLF files: the CR is whitespace
+                    store8(&line + ll, c);
+                    ll = ll + 1;
+                } else {
+                    over = 1;
+                }
+                i = i + 1;
+            }
+        }
+    }
+    file_close(fd);
+    return found;
+}
+
+# A 16-bit DNS transaction id from the kernel CSPRNG — a guessable id is what lets an off-path
+# attacker forge the answer (the Kaminsky class). /dev/urandom if getrandom fails; -1 when
+# neither yields 2 bytes, and the caller fails the lookup.
+# ⛔ NEVER add a weak fallback (clock, stack address, pid): a predictable TXID is worse than a
+# failed lookup, which is exactly what CVE-19 closed. CHANGELOG [6.6.9]
+fn _net_dns_id(): i64 {
+    var b[8];
+    store64(&b, 0);
+    if (sys_getrandom(&b, 2, 0) == 2) { return load16(&b); }
+    var fd = file_open("/dev/urandom", 0, 0);
+    if (fd >= 0) {
+        var n = file_read(fd, &b, 2);
+        file_close(fd);
+        if (n == 2) { return load16(&b); }
+    }
+    return 0 - 1;
+}
+
+# Write an A/IN query for `host` with transaction id `id` into `q` (at least 272 bytes).
+# Returns its length, or -1 for a name DNS cannot carry: empty, over 253 bytes, an empty label
+# ("a..b", ".a"), a label over 63 bytes, or a byte no host name contains (control, space, DEL).
+fn _net_dns_build(q, id, host): i64 {
+    var hl = _net_name_len(host);
+    if (hl == 0 || hl > 253) { return 0 - 1; }
+    memset(q, 0, 12);
+    store8(q, (id >> 8) & 0xFF);
+    store8(q + 1, id & 0xFF);
+    store8(q + 2, 1);                       # RD: ask the server to recurse
+    store8(q + 5, 1);                       # QDCOUNT = 1
+    var lab = 12;
+    var w = 13;
+    var llen = 0;
+    var i = 0;
+    while (i < hl) {
+        var c = load8(host + i);
+        if (c == 46) {
+            if (llen == 0) { return 0 - 1; }
+            store8(q + lab, llen);
+            lab = w;
+            w = w + 1;
+            llen = 0;
+        } else {
+            if (c <= 32 || c == 127) { return 0 - 1; }
+            llen = llen + 1;
+            if (llen > 63) { return 0 - 1; }
+            store8(q + w, c);
+            w = w + 1;
+        }
+        i = i + 1;
+    }
+    if (llen == 0) { return 0 - 1; }
+    store8(q + lab, llen);
+    store8(q + w, 0);
+    store8(q + w + 1, 0);
+    store8(q + w + 2, 1);                   # QTYPE A
+    store8(q + w + 3, 0);
+    store8(q + w + 4, 1);                   # QCLASS IN
+    return w + 5;
+}
+
+# Offset just past the (possibly compressed) name at `off` in r[0..n), or -1 if it runs off
+# the end or uses a reserved label type. Pointers are not followed — only skipped.
+fn _net_dns_skip(r, n, off): i64 {
+    while (off < n) {
+        var b = load8(r + off);
+        if (b == 0) { return off + 1; }
+        if ((b & 0xC0) == 0xC0) {
+            if (off + 2 > n) { return 0 - 1; }
+            return off + 2;
+        }
+        if ((b & 0xC0) != 0) { return 0 - 1; }
+        off = off + 1 + b;
+    }
+    return 0 - 1;
+}
+
+# Read the big-endian u16 at r + off.
+fn _net_be16(r, off): i64 { return (load8(r + off) << 8) | load8(r + off + 1); }
+
+# Judge the datagram r[0..n) against the query q[0..qlen). Returns the first A/IN address in
+# its answer section; -1 when it IS the reply to this query but carries none (NXDOMAIN,
+# SERVFAIL, NODATA, a malformed record); -2 when it is NOT the reply to this query — wrong id,
+# not a response, or a different question — so the caller keeps listening and a stray or forged
+# datagram cannot end the lookup. Every read is bounded by `n`.
+fn _net_dns_answer(r, n, q, qlen): i64 {
+    if (n < qlen) { return 0 - 2; }
+    if (load8(r) != load8(q) || load8(r + 1) != load8(q + 1)) { return 0 - 2; }
+    if ((load8(r + 2) & 0x80) == 0) { return 0 - 2; }
+    if (_net_be16(r, 4) != 1) { return 0 - 2; }
+    if (memeq(r + 12, q + 12, qlen - 12) != 1) { return 0 - 2; }
+    if ((load8(r + 3) & 0x0F) != 0) { return 0 - 1; }
+    var an = _net_be16(r, 6);
+    var off = qlen;
+    var k = 0;
+    while (k < an) {
+        off = _net_dns_skip(r, n, off);
+        if (off < 0) { return 0 - 1; }
+        if (off + 10 > n) { return 0 - 1; }
+        var typ = _net_be16(r, off);
+        var cls = _net_be16(r, off + 2);
+        var rdl = _net_be16(r, off + 8);
+        off = off + 10;
+        if (off + rdl > n) { return 0 - 1; }
+        if (typ == 1 && cls == 1 && rdl == 4) {
+            return (load8(r + off) | (load8(r + off + 1) << 8) | (load8(r + off + 2) << 16)
+              | (load8(r + off + 3) << 24));
+        }
+        off = off + rdl;
+        k = k + 1;
+    }
+    return 0 - 1;
+}
+
+# Resolve `host` by ONE DNS A query over UDP to the nameserver `ns` (packed, network byte
+# order) at `port`. Returns the first A address of the reply, or -1: a name DNS cannot carry,
+# no entropy for the query id, no socket, NXDOMAIN / no A record, or no reply (two sends, 2 s
+# each). Datagrams that are not the reply to this query are ignored, and the socket is
+# connected so only `ns` is heard.
+# No heap: the query and reply buffers are on the stack (512 B — no EDNS is offered).
+fn net_dns_query_ipv4(host, ns, port): i64 {
+    var q[512];
+    var r[512];
+    var id = _net_dns_id();
+    if (id < 0) { return 0 - 1; }
+    var qlen = _net_dns_build(&q, id, host);
+    if (qlen < 0) { return 0 - 1; }
+    var ft, fd = udp_socket();
+    if (is_err_result(ft) == 1) { return 0 - 1; }
+    var ct, cv = sock_connect(fd, ns, port);
+    if (is_err_result(ct) == 1) { sock_close(fd); return 0 - 1; }
+    sock_set_recv_timeout(fd, 2, 0);
+    var found = 0 - 2;
+    var tries = 0;
+    while (found == 0 - 2 && tries < 2) {
+        if (sock_send_all(fd, &q, qlen) != qlen) { found = 0 - 1; }
+        var reads = 0;
+        while (found == 0 - 2 && reads < 8) {
+            var rt, rn = sock_recv(fd, &r, 512);
+            if (is_err_result(rt) == 1) { reads = 8; }
+            elif (rn <= 0) { reads = 8; }
+            else { found = _net_dns_answer(&r, rn, &q, qlen); reads = reads + 1; }
+        }
+        tries = tries + 1;
+    }
+    sock_close(fd);
+    if (found < 0) { return 0 - 1; }
+    return found;
+}
+
+# Resolve a host name or IPv4 literal to the packed network-byte-order address `sock_connect`
+# takes, or -1. In order: a dotted-quad literal; `localhost` and any `*.localhost` name, which
+# are always 127.0.0.1 (RFC 6761); the IPv4 entries of /etc/hosts; one DNS A query to the first
+# IPv4 `nameserver` in /etc/resolv.conf — 127.0.0.1 when it names none, as glibc does. agnos
+# has no BSD UDP socket, so there only the first three steps can succeed.
+fn net_resolve_ipv4(host): i64 {
+    if (host == 0) { return 0 - 1; }
+    if (load8(host) == 0) { return 0 - 1; }
+    var lit = net_parse_ipv4(host);
+    if (lit != 0 - 1) { return lit; }
+    if (_net_is_localhost(host) == 1) { return INADDR_LOOPBACK(); }
+    var h = _net_conf_scan("/etc/hosts", host);
+    if (h != 0 - 1) { return h; }
+    var ns = _net_conf_scan("/etc/resolv.conf", 0);
+    if (ns == 0 - 1) { ns = INADDR_LOOPBACK(); }
+    return net_dns_query_ipv4(host, ns, 53);
 }
 
 # === Simple TCP server pattern ===

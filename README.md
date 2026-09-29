@@ -13,13 +13,14 @@ Written in [Cyrius](https://github.com/MacCracken/cyrius).
 
 ## Status
 
-**1.2.7** — `pow` follows the C99 Annex F table (infinities, NaN, ±0). See
+**1.2.8** — `pow` is within 1 ulp of the correctly rounded value everywhere (was hundreds of ulp out). See
 [`CHANGELOG.md`](CHANGELOG.md) for the full history and
 [`docs/development/state.md`](docs/development/state.md) for the live snapshot.
 Recent releases in brief:
 
 | | |
 |---|---|
+| **1.2.8** | `pow` within 1 ulp everywhere — an fdlibm `e_pow` core replaces `exp(y·ln x)` (909 ulp) and the squaring path (772 ulp); toolchain 6.6.9 |
 | **1.2.7** | `pow` answers the C99 Annex F special values (was NaN for every infinite base/exponent off the integral path, and for `pow(1, NaN)`); toolchain 6.6.7 |
 | **1.2.6** | `ganita_f64_cbrt`, correctly rounded for every f64 (and so every f32); `inv`/`qr`/`pseudo_inv` stop discarding scratch; element cap settled by ADR 0002; toolchain 6.6.4 |
 | **1.2.5** | toolchain 6.6.0 → 6.6.2 |

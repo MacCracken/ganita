@@ -1,6 +1,6 @@
 # fdlopen.cyr — foreign-dlopen: full-libc access for static cyrius binaries
 # Usage: include "lib/fdlopen.cyr"
-# Requires: string.cyr, syscalls.cyr, mmap.cyr, dynlib.cyr, fnptr.cyr
+# Includes its own definers (6.6.9): alloc.cyr, string.cyr, mmap.cyr, dynlib.cyr, fnptr.cyr.
 #
 # The pattern pfalcon/foreign-dlopen + Cosmopolitan libc use to get
 # a fully-initialised glibc into a static binary's address space
@@ -104,6 +104,14 @@
 # Darwin + Windows stubbed (foreign-dlopen is inherently glibc-shaped —
 # Darwin uses dyld, Windows uses its own PE loader, both work
 # differently).
+
+# 6.6.9: alloc / memcpy / cyr_munmap / the dynlib_auxv_* helpers were all called and none
+# included. CHANGELOG [6.6.9]
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/mmap.cyr"
+include "lib/dynlib.cyr"
+include "lib/fnptr.cyr"
 
 # Error codes — cyrius enums don't accept negative literals, so these
 # live as plain constants. Returned as negative values from init:

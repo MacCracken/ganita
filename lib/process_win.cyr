@@ -189,19 +189,113 @@ fn _win_create_process(wcmdline, hStdOut, wenv, pi): i64 {
     return syscall(61445, &a);                   # CreateProcessW
 }
 
-# Wait for the process in `pi` to exit, return its exit code, and close
-# both the process and thread handles.
+# ⛔ 6.6.8 — A DEADLINE ON WINDOWS TOO, AND NO "exit 0" FOR A WAIT THAT NEVER HAPPENED.
+# Two defects in the waits below:
+#   * `_win_wait_close` ignored what WaitForSingleObject and GetExitCodeProcess returned. It
+#     zeroed the code buffer first, so a failed GetExitCodeProcess reported "exit 0" — the
+#     fail-open direction — and a WAIT_FAILED read STILL_ACTIVE (259) as an exit code. Both are
+#     now -1 (not observed), like the POSIX verbs' unreaped child.
+#   * nothing here could be bounded: every wait was INFINITE and `proc_set_timeout_ms` was a
+#     POSIX-only symbol, so `cyrius audit` on Windows waited for a hung cyrlint for ever. The
+#     deadline now exists here with the POSIX meaning: 0 (the default) waits for ever; a
+#     positive bound TerminateProcess-es the child when it expires and the verb reports -2
+#     (`run` / `wait_pid`: Err(110), ETIMEDOUT). A CAPTURING verb drains its pipe BEFORE it can
+#     wait, and ReadFile on that pipe blocks until the child exits, so those verbs arm a
+#     watchdog THREAD (CreateThread, 0xF007) that waits on the process with the bound and
+#     terminates it — the child's exit closes the pipe and the drain returns. Win32 has no
+#     process tree to end: a grandchild holding the pipe is outside this bound.
+# CHANGELOG [6.6.8]
+var _PROC_DEADLINE_MS = 0;
+var _proc_deadline_kills = 0;
+
+# Bound every child these verbs wait for to `ms` milliseconds (0 = for ever, the default).
+# Returns the previous value. Same contract as lib/process.cyr's POSIX peer.
+fn proc_set_timeout_ms(ms): i64 {
+    var prev = _PROC_DEADLINE_MS;
+    _PROC_DEADLINE_MS = ms;
+    return prev;
+}
+
+# The deadline in force, in ms (0 = none).
+fn proc_timeout_ms(): i64 { return _PROC_DEADLINE_MS; }
+
+# How many children this process has ended at a deadline, ever.
+fn proc_deadline_kills(): i64 { return _proc_deadline_kills; }
+
+# Wait for process handle `h` (bounded by the deadline in force) and return its exit code;
+# -2 when the deadline ended it, -1 when the wait or GetExitCodeProcess failed (the code is
+# then UNKNOWN — never a guessed 0). Does not close `h`.
+fn _win_wait_handle(h): i64 {
+    var ms = 4294967295;                          # INFINITE
+    if (_PROC_DEADLINE_MS > 0) { ms = _PROC_DEADLINE_MS; }
+    var wr = syscall(61441, h, ms) & 4294967295;  # WaitForSingleObject
+    var killed = 0;
+    if (wr == 258) {                              # WAIT_TIMEOUT
+        _win_terminate(h, 1);
+        wr = syscall(61441, h, 4294967295) & 4294967295;
+        killed = 1;
+        _proc_deadline_kills = _proc_deadline_kills + 1;
+    }
+    if (killed == 1) { return 0 - 2; }
+    if (wr != 0) { return 0 - 1; }                # WAIT_FAILED (or anything but signalled)
+    var code[8];
+    store64(&code, 0);
+    if (syscall(61442, h, &code) == 0) { return 0 - 1; }   # GetExitCodeProcess failed
+    return load32(&code);
+}
+
+# Wait for the process in `pi` to exit (bounded by the deadline in force), return its exit
+# code (-2 deadline, -1 unknown — see `_win_wait_handle`), and close both the process and
+# thread handles.
 fn _win_wait_close(pi): i64 {
     var hProcess = load64(pi + 0);
     var hThread = load64(pi + 8);
-    syscall(61441, hProcess, 4294967295);        # WaitForSingleObject(INFINITE)
-    var code[8];
-    store64(&code, 0);
-    syscall(61442, hProcess, &code);             # GetExitCodeProcess
-    var ec = load32(&code);
+    var ec = _win_wait_handle(hProcess);
     syscall(3, hThread);                          # CloseHandle(hThread)
     syscall(3, hProcess);                         # CloseHandle(hProcess)
     return ec;
+}
+
+# The watchdog thread body (a cyrius fn compiled for PE is a valid ThreadProc: the one
+# argument arrives in RCX). `a` = {hProcess, ms, fired}. Allocates nothing — the bump
+# allocator is not thread-safe.
+fn _win_watchdog(a): i64 {
+    var wr = syscall(61441, load64(a), load64(a + 8)) & 4294967295;
+    if (wr == 258) {
+        _win_terminate(load64(a), 1);
+        store64(a + 16, 1);
+    }
+    return 0;
+}
+
+# Arm a watchdog on `pi`'s process when a deadline is in force. `wd` = the caller's 24-byte
+# block (it must outlive `_win_watch_end`). Returns the thread handle, 0 when none is armed.
+fn _win_watch_start(pi, wd): i64 {
+    store64(wd, load64(pi));
+    store64(wd + 8, _PROC_DEADLINE_MS);
+    store64(wd + 16, 0);
+    if (_PROC_DEADLINE_MS <= 0) { return 0; }
+    var ta[48];
+    store64(&ta,      0);                         # lpThreadAttributes
+    store64(&ta + 8,  0);                         # dwStackSize (default)
+    store64(&ta + 16, &_win_watchdog);            # lpStartAddress
+    store64(&ta + 24, wd);                        # lpParameter
+    store64(&ta + 32, 0);                         # dwCreationFlags
+    store64(&ta + 40, 0);                         # lpThreadId
+    return syscall(61447, &ta);                   # CreateThread
+}
+
+# Join the watchdog; returns 1 if it had to terminate the child (counted once, here).
+fn _win_watch_end(t, wd): i64 {
+    if (t != 0) {
+        syscall(61441, t, 4294967295);
+        syscall(3, t);
+    }
+    if (load64(wd + 16) == 1) {
+        _proc_deadline_kills = _proc_deadline_kills + 1;
+        return 1;
+    }
+    return 0;
 }
 
 # v6.4.26 — force-terminate a spawned process. `hProcess` is the process HANDLE
@@ -225,16 +319,20 @@ fn _win_wait_timeout(pi, ms, killed_out): i64 {
     var hProcess = load64(pi + 0);
     var hThread = load64(pi + 8);
     store64(killed_out, 0);
-    var wr = syscall(61441, hProcess, ms);        # WaitForSingleObject(hProcess, ms)
+    var wr = syscall(61441, hProcess, ms) & 4294967295;   # WaitForSingleObject(hProcess, ms)
     if (wr == 258) {                              # WAIT_TIMEOUT (0x102) → enforce deadline
         _win_terminate(hProcess, 137);            # TerminateProcess(hProcess, 137)
-        syscall(61441, hProcess, 4294967295);     # WaitForSingleObject(INFINITE) — reap
+        wr = syscall(61441, hProcess, 4294967295) & 4294967295;   # INFINITE — reap
         store64(killed_out, 1);
     }
+    # 6.6.8: -1 when the wait or GetExitCodeProcess FAILED — the zeroed buffer used to read
+    # as "exit 0" (see `_win_wait_handle`).
+    var ec = 0 - 1;
     var code[8];
     store64(&code, 0);
-    syscall(61442, hProcess, &code);              # GetExitCodeProcess
-    var ec = load32(&code);
+    if (wr == 0) {
+        if (syscall(61442, hProcess, &code) != 0) { ec = load32(&code); }   # GetExitCodeProcess
+    }
     syscall(3, hThread);                           # CloseHandle(hThread)
     syscall(3, hProcess);                          # CloseHandle(hProcess)
     return ec;
@@ -312,7 +410,10 @@ fn run(cmd, arg1, arg2): Result {
     var pi[24];
     var ok = _win_create_process(wcmd, 0, 0, &pi);
     if (ok == 0) { return Err(1); }
-    return Ok(_win_wait_close(&pi));
+    var ec = _win_wait_close(&pi);
+    if (ec == 0 - 2) { return Err(110); }         # ETIMEDOUT — the POSIX peer's PROC_ETIMEDOUT
+    if (ec == 0 - 1) { return Err(10); }          # the exit code is unknown (PROC_ECHILD)
+    return Ok(ec);
 }
 
 # Run a command and capture stdout (+stderr) into buf. Returns Result(bytes).
@@ -325,8 +426,11 @@ fn run_capture(cmd, arg1, arg2, buf, buflen): Result {
     var ok = _win_create_process(wcmd, hWrite, 0, &pi);
     if (ok == 0) { syscall(3, hRead); syscall(3, hWrite); return Err(1); }
     syscall(3, hWrite);                           # parent drops write end → EOF on child exit
+    var wd[24];
+    var wt = _win_watch_start(&pi, &wd);
     var total = _win_drain(hRead, buf, buflen);
     syscall(3, hRead);
+    _win_watch_end(wt, &wd);
     _win_wait_close(&pi);
     return Ok(total);
 }
@@ -344,12 +448,10 @@ fn spawn(cmd, arg1, arg2): Result {
 
 # Wait for a previously-spawned process handle. Returns Result(exit_code).
 fn wait_pid(pid): Result {
-    syscall(61441, pid, 4294967295);              # WaitForSingleObject(INFINITE)
-    var code[8];
-    store64(&code, 0);
-    syscall(61442, pid, &code);                   # GetExitCodeProcess
-    var ec = load32(&code);
+    var ec = _win_wait_handle(pid);               # bounded by the deadline in force (6.6.8)
     syscall(3, pid);                              # CloseHandle
+    if (ec == 0 - 2) { return Err(110); }
+    if (ec == 0 - 1) { return Err(10); }
     return Ok(ec);
 }
 
@@ -378,8 +480,9 @@ fn exec_vec(args): i64 {
 # Run command with cstr args vec, capture stdout (+stderr — one pipe on Windows), and
 # report how it ended in `status_out`'s two i64 slots, as the POSIX verb does: [0] = the
 # GetExitCodeProcess code (an NTSTATUS such as 0xC0000005 for a crash — never 0), -1 when
-# nothing could be spawned; [1] = 0 (Win32 has no signals). Returns bytes read, -1 when
-# nothing ran. CHANGELOG [6.6.7]
+# nothing could be spawned or the code could not be read (6.6.8: it used to read as 0), -2
+# when the deadline (`proc_set_timeout_ms`) ended it; [1] = 0 (Win32 has no signals).
+# Returns bytes read, -1 when nothing ran. CHANGELOG [6.6.7] [6.6.8]
 fn exec_capture_status(args, buf, buflen, status_out): i64 {
     store64(status_out, 0 - 1);
     store64(status_out + 8, 0);
@@ -392,9 +495,14 @@ fn exec_capture_status(args, buf, buflen, status_out): i64 {
     var ok = _win_create_process(wcmd, hWrite, 0, &pi);
     if (ok == 0) { syscall(3, hRead); syscall(3, hWrite); return 0 - 1; }
     syscall(3, hWrite);
+    var wd[24];
+    var wt = _win_watch_start(&pi, &wd);
     var total = _win_drain(hRead, buf, buflen);
     syscall(3, hRead);
-    store64(status_out, _win_wait_close(&pi));
+    var fired = _win_watch_end(wt, &wd);
+    var ec = _win_wait_close(&pi);
+    if (fired == 1) { ec = 0 - 2; }
+    store64(status_out, ec);
     return total;
 }
 
@@ -441,8 +549,11 @@ fn exec_capture_str(args, buf, buflen): i64 {
     var ok = _win_create_process(wcmd, hWrite, 0, &pi);
     if (ok == 0) { syscall(3, hRead); syscall(3, hWrite); return 0 - 1; }
     syscall(3, hWrite);
+    var wd[24];
+    var wt = _win_watch_start(&pi, &wd);
     var total = _win_drain(hRead, buf, buflen);
     syscall(3, hRead);
+    _win_watch_end(wt, &wd);
     _win_wait_close(&pi);
     return total;
 }

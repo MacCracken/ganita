@@ -3,16 +3,16 @@
 # Requires: alloc.cyr (alloc/alloc_via/default_alloc), fnptr.cyr (fncall1),
 #           syscalls.cyr (sys_read/sys_close/sys_sleep_ms).
 #
-# AGNOS's frozen syscall surface has no epoll_create1 / fcntl / clone-fork /
-# wait4 — the epoll/timerfd/fork machinery the Linux async loop is built on
-# does not exist (SYS_EPOLL_CREATE = #19 has no `1` variant; there is no
-# SYS_FCNTL / sys_fork / SYS_WAIT4). And async is a SERVER-path runtime: the
-# only consumers (daimon serve_async, sandhi sandhi_server_run_async) are
-# inbound-TCP servers, which is AGNOS Phase B — not reachable on the agnos
-# CLIENT path (sit). So this peer makes async.cyr COMPILE on agnos and behave
-# correctly-if-degraded, mirroring the v6.2.3 thread.cyr → thread_agnos.cyr
-# serial fallback (the cooperative-iron single-core model). Resolves issue
-# 2026-06-15-cyrius-thread-agnos-clone-dispatch.md §2.
+# AGNOS has no epoll_create1 / fcntl / clone / wait4 — the epoll/timerfd/clone
+# machinery the Linux async loop is built on does not exist (SYS_EPOLL_CREATE = #19
+# has no `1` variant; there is no SYS_FCNTL / SYS_WAIT4). ⚠ It DOES have fork#96
+# (1.56.55), a from-disk spawn with argv (#43, 1.57.6) and a blocking waitpid (1.57.7);
+# nothing below uses them yet (6.6.8). And async is a SERVER-path runtime: the only
+# consumers (daimon serve_async, sandhi sandhi_server_run_async) are inbound-TCP servers,
+# which is AGNOS Phase B — not reachable on the agnos CLIENT path (sit). So this peer
+# makes async.cyr COMPILE on agnos and behave correctly-if-degraded, mirroring the
+# v6.2.3 thread.cyr → thread_agnos.cyr serial fallback (the cooperative-iron
+# single-core model). Resolves issue 2026-06-15-cyrius-thread-agnos-clone-dispatch.md §2.
 #
 # The public surface MUST match lib/async.cyr's so consumers stay target-
 # agnostic: async_new / async_new_in / async_spawn / async_run / async_sleep_ms
@@ -171,13 +171,14 @@ fn async_interval(rt, fp, arg, ms, tok): i64 {
     return 0;
 }
 
-# async subprocess (agnos): AGNOS has no clone-fork, so a reactor-driven subprocess
-# is unsupported on the serial client target. Returns 0 / -1 (unscheduled); present so
-# consumers stay target-agnostic. Mirror of async.cyr's P2 surface. v6.4.36.
+# async subprocess (agnos): not ported — there is no reactor to drive it on the serial client
+# target (the spawn itself exists: lib/process_agnos.cyr uses #43 + WAIT_BLOCK, 6.6.8).
+# Returns 0 (unscheduled); present so consumers stay target-agnostic. Mirror of async.cyr's P2
+# surface. v6.4.36.
 fn async_spawn_process(rt, path, argv, envp): i64 {
     return 0;
 }
-# spawn + wait + timeout (agnos): no clone-fork, so unsupported. Returns -1. v6.4.36.
+# spawn + wait + timeout (agnos): not ported (no deadline wait over #43 yet). Returns -1. v6.4.36.
 fn async_run_process(rt, path, argv, envp, ms): i64 {
     return 0 - 1;
 }
@@ -286,9 +287,12 @@ fn async_relay_once(rt, rfd, wfd, buf, len): i64 {
     return sys_write(wfd, buf, n);
 }
 
-# Run `fp(arg)` with a timeout. AGNOS has no fork, so there is no second
-# process to bound; run the body INLINE (serial — mirrors thread_agnos.cyr's
-# inline-body model) and return its result. `ms` is advisory / ignored here.
+# Run `fp(arg)` — the timeout is NOT enforced on agnos. The body runs INLINE (serial, like
+# thread_agnos.cyr's inline-body model) and its result is returned; `ms` is ignored, so a body
+# that never returns never returns here either. ⚠ This is a port that has not been done, not a
+# kernel limit: agnos has had fork#96 since 1.56.55 (sys_fork in the peer), which is the
+# primitive the Linux version bounds its child with. The comment here used to say "AGNOS has no
+# fork", which stopped being true two kernel lines ago. CHANGELOG [6.6.8]
 fn async_timeout(fp, arg, ms): i64 {
     return fncall1(fp, arg);
 }

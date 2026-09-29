@@ -53,9 +53,10 @@ enum SysNr {
     # SYS_IOCTL above, and safe for the same reason: since v6.5.25 an unrouted literal
     # syscall number returns -38/-ENOSYS instead of emitting a raw `0F 05` that traps as
     # STATUS_ILLEGAL_INSTRUCTION. NOT rerouted: Windows has no sendmsg/sendto (ws2_32's
-    # WSASendMsg is a different contract and takes an OVERLAPPED), no truncate/ftruncate
-    # (SetEndOfFile needs a seek first) and no memfd (a named section object is a different
-    # object model). The stub wrappers below decline explicitly rather than issuing them.
+    # WSASendMsg is a different contract and takes an OVERLAPPED) and no memfd (a named
+    # section object is a different object model); the stub wrappers below decline explicitly
+    # rather than issuing them. truncate/ftruncate are REAL since 6.6.9, built on SetEndOfFile
+    # (0xF03F) + a seek — the numbers themselves stay unrouted, use the wrappers.
     # ⚠ SYS_NANOSLEEP is the exception — the PE backend HAS rerouted 35 to kernel32 Sleep
     # since v6.1.17 (ENANOSLEEP_PE), so sys_nanosleep issues it for real.
     SYS_SENDTO = 44;
@@ -71,6 +72,17 @@ enum SysNr {
     # wide path), so a row would be a lie; the stubs below decline explicitly. CHANGELOG [6.6.6]
     SYS_STATFS = 137;
     SYS_FSTATFS = 138;
+    # v6.6.8 — namespaces, root, capabilities, cross-process memory, mknodat: the same
+    # "the constant exists so cross-platform source COMPILES" contract, NOT rerouted — Windows
+    # has none of these as a syscall. The stubs below decline explicitly. CHANGELOG [6.6.8]
+    SYS_UNSHARE = 272;
+    SYS_CHROOT = 161;
+    SYS_PIVOT_ROOT = 155;
+    SYS_CAPGET = 125;
+    SYS_CAPSET = 126;
+    SYS_PROCESS_VM_READV = 310;
+    SYS_PROCESS_VM_WRITEV = 311;
+    SYS_MKNODAT = 259;
 }
 
 # File descriptors mirror Linux convention. GetStdHandle maps
@@ -118,23 +130,36 @@ enum OFlags {
     #     appender would. (With O_CREAT the disposition is CREATE_ALWAYS, which needs no
     #     extra access, so the real append survives there.)
     #
-    # ⚠ STILL NOT HONOURED, and deliberately so — these two are dwFlagsAndAttributes bits
-    # whose Win32 near-equivalents do NOT mean what POSIX means, so mapping them is a
-    # semantic decision, not a port: FILE_FLAG_OPEN_REPARSE_POINT opens the symlink
-    # instead of REFUSING like O_NOFOLLOW does (lib/sigil.cyr's keyfile path relies on the
-    # refusal), and a Windows directory handle cannot be ReadFile'd the way O_DIRECTORY's
-    # caller expects. Defined so portable code still compiles.
-    #
-    # ⛔ AND NAME WHAT THAT COSTS, now that O_EXCL IS honoured. `luks_write_keyfile`
-    # (lib/sigil.cyr:4179) opens `O_WRONLY|O_CREAT|O_TRUNC|O_EXCL|O_NOFOLLOW` and treats
-    # the refusal as its guarantee that it created the keyfile itself. On PE that becomes
-    # CreateFileW CREATE_NEW, which RESOLVES a final reparse point instead of refusing it:
-    # measured on real cass 2026-09-19 — CREATE_NEW over a dangling symlink SUCCEEDS and
-    # creates the symlink's TARGET, where the same flags on Linux fail (verified both ways
-    # with the same source). So on Windows an O_EXCL|O_NOFOLLOW create is NOT the Linux
-    # refusal: a pre-planted symlink at the keyfile path redirects the write. A Windows
-    # caller that needs the Linux guarantee must stat the path first (FILE_ATTRIBUTE_REPARSE_POINT)
-    # or open with FILE_FLAG_OPEN_REPARSE_POINT and check — neither is wired yet. CHANGELOG [6.6.6]
+    # ⭐ 6.6.9 — O_NOFOLLOW, O_DIRECTORY and O_EXCL HAVE THEIR POSIX MEANING ON PE. The note
+    # that stood here called the first two a "semantic decision" and left them ignored; the
+    # cost was measured on real cass: CreateFileW resolves a final reparse point for EVERY
+    # disposition, so `O_CREAT|O_EXCL` over a DANGLING symlink created the symlink's TARGET
+    # (with or without O_NOFOLLOW), and `O_WRONLY|O_TRUNC|O_NOFOLLOW` on a symlink truncated
+    # the file it named. The map now (EOPEN_PE's `_pe_open_attr_flags` + `sys_open` below):
+    #   · O_CREAT|O_EXCL → CREATE_NEW + FILE_FLAG_OPEN_REPARSE_POINT. CREATE_NEW never opens
+    #     an existing object, so the flag cannot make it open a link; the name exists, so the
+    #     create fails. Race-free, no check. (The raw syscall gets this too.)
+    #   · O_NOFOLLOW → FILE_FLAG_OPEN_REPARSE_POINT, then `sys_open` asks the OPENED HANDLE
+    #     (GetFileInformationByHandleEx, FileAttributeTagInfo): a NAME-SURROGATE reparse point
+    #     (symlink, junction) is closed and refused with -ELOOP (-40). A junction or a link to a
+    #     DIRECTORY is a directory object that CreateFileW refuses without BACKUP_SEMANTICS —
+    #     before there is a handle to ask — so a FAILED O_NOFOLLOW open asks the name why, with a
+    #     read-only O_DIRECTORY|O_NOFOLLOW probe that only picks the errno (-40 for a surrogate,
+    #     -21 for a real directory under write access, else the original -1). Any OTHER reparse
+    #     point (OneDrive placeholder, dedup) is reopened normally, as the default taken
+    #     2026-09-27 says — those are files, not redirections — and that reopen by name must be
+    #     the SAME FILE as the verified handle (file id), or it is refused. With O_TRUNC the open
+    #     is made WITHOUT the truncation and the verified handle is truncated afterwards
+    #     (SetEndOfFile), so a link object is never clobbered by the refusal either.
+    #   · O_DIRECTORY → FILE_FLAG_BACKUP_SEMANTICS (the only way CreateFileW opens a directory)
+    #     plus the handle check: a non-directory is -ENOTDIR (-20), a directory opened for
+    #     writing (or with O_CREAT/O_TRUNC) is -EISDIR (-21). BACKUP_SEMANTICS is NEVER set
+    #     without O_DIRECTORY: it would let O_WRONLY open a directory, so a plain open() of a
+    #     directory stays -1 on Windows (fail-closed; Linux answers a read fd).
+    # ⚠ The refusals live in `sys_open` (every stdlib open funnels through it). A RAW
+    # `syscall(2, p, O_NOFOLLOW, 0)` still never follows a link — the attribute word is the
+    # emitter's — but it hands back the LINK's handle instead of -40, and O_TRUNC on it
+    # truncates the link object, not the target. CHANGELOG [6.6.9]
     O_DIRECTORY = 65536;
     O_NOFOLLOW = 131072;
 }
@@ -163,12 +188,152 @@ fn sys_read(fd, buf, count) {
 
 # Open a file and return a descriptor. Rerouted to
 # kernel32!CreateFileW; `flags` (Linux-shaped) is decomposed into
-# Win32 `dwDesiredAccess` + `dwCreationDisposition` inside the
-# reroute. `mode` is passed as the security-attributes hint
-# (usually 0). Returns a handle usable by sys_read/write/close or
-# -1 on failure.
+# Win32 `dwDesiredAccess` + `dwCreationDisposition` +
+# `dwFlagsAndAttributes` inside the reroute. `mode` has no Win32
+# equivalent and is dropped. Returns a handle usable by
+# sys_read/write/close, or a negative value: -1 for a Win32 failure,
+# -40 (-ELOOP) for O_NOFOLLOW on a symlink or junction (to a file or a
+# directory), -20 (-ENOTDIR) / -21 (-EISDIR) for O_DIRECTORY, and -21 for
+# O_NOFOLLOW with write access / O_CREAT / O_TRUNC on a real directory
+# (O_DIRECTORY|O_NOFOLLOW on a link is -ENOTDIR, as on Linux and Darwin).
+# See the OFlags note. CHANGELOG [6.6.9]
 fn sys_open(path, flags, mode) {
-    return syscall(SYS_OPEN, path, flags, mode);
+    # Neither O_NOFOLLOW nor O_DIRECTORY; or O_CREAT|O_EXCL, whose CREATE_NEW never follows.
+    if ((flags & 196608) == 0) { return syscall(SYS_OPEN, path, flags, mode); }
+    if ((flags & 192) == 192) { return syscall(SYS_OPEN, path, flags, mode); }
+    return _win_open_checked(path, flags, mode);
+}
+
+# Attributes (low dword) and reparse tag (high dword) of an OPEN handle, via
+# GetFileInformationByHandleEx(FileAttributeTagInfo = 9) — reroute 0xF03D. -1 if the query
+# fails. Asking the handle, not the path, is what makes the O_NOFOLLOW / O_DIRECTORY checks
+# race-free: whatever the name pointed at by then, this is the object we hold. CHANGELOG [6.6.9]
+fn _win_handle_tag(h): i64 {
+    var ti[16];
+    store64(&ti, 0);
+    if (syscall(61501, h, 9, &ti, 8) == 0) { return 0 - 1; }
+    return load64(&ti);
+}
+
+# Is an attribute/tag pair a NAME SURROGATE reparse point (a symlink or a junction — the
+# kinds that redirect a name)? FILE_ATTRIBUTE_REPARSE_POINT 0x400 + tag bit 29.
+fn _win_is_surrogate(at): i64 {
+    if ((at & 1024) == 0) { return 0; }
+    if (((at >> 32) & 0x20000000) == 0) { return 0; }
+    return 1;
+}
+
+# 1 when handles `a` and `b` are the SAME file: GetFileInformationByHandleEx(FileIdInfo = 0x12)
+# on each — volume serial + 128-bit file id, 24 bytes — compared whole. 0 when they differ or
+# either query fails (fail closed). What lets a second open by NAME be trusted: whatever the
+# name points at by then, the two handles are compared, not the name. CHANGELOG [6.6.9]
+fn _win_same_file(a, b): i64 {
+    var ia[32];
+    var ib[32];
+    if (syscall(61501, a, 18, &ia, 24) == 0) { return 0; }
+    if (syscall(61501, b, 18, &ib, 24) == 0) { return 0; }
+    if (load64(&ia) != load64(&ib)) { return 0; }
+    if (load64(&ia + 8) != load64(&ib + 8)) { return 0; }
+    if (load64(&ia + 16) != load64(&ib + 16)) { return 0; }
+    return 1;
+}
+
+# Why an O_NOFOLLOW open WITHOUT O_DIRECTORY failed. Such an open carries no
+# FILE_FLAG_BACKUP_SEMANTICS, so CreateFileW refuses every DIRECTORY object before sys_open
+# holds a handle to ask — and a junction, or a symlink to a directory, IS a directory object:
+# the refusal came back as a bare -1 where Linux says -ELOOP. Probe the name read-only with
+# O_DIRECTORY|O_NOFOLLOW (BACKUP_SEMANTICS + OPEN_REPARSE_POINT: never follows, never
+# truncates, never creates) and ask THAT handle: a name surrogate is -ELOOP (-40); a real
+# directory under write access / O_CREAT / O_TRUNC is -EISDIR (-21), as on Linux; anything else
+# keeps the original answer `err` — including the documented plain-directory divergence (-1).
+# The probe only CHOOSES AN ERRNO; nothing it opens is handed back. CHANGELOG [6.6.9]
+fn _win_nofollow_refusal(path, flags, err): i64 {
+    var p = syscall(SYS_OPEN, path, 196608, 0);   # O_RDONLY | O_DIRECTORY | O_NOFOLLOW
+    if (p < 0) { return err; }
+    var at = _win_handle_tag(p);
+    syscall(SYS_CLOSE, p);
+    if (at == 0 - 1) { return err; }
+    if (_win_is_surrogate(at) == 1) { return 0 - 40; }
+    if ((at & 16) != 0) {
+        if ((flags & 579) != 0) { return 0 - 21; }   # write access, O_CREAT or O_TRUNC
+    }
+    return err;
+}
+
+# The O_NOFOLLOW / O_DIRECTORY half of sys_open. The emitter has already made the open itself
+# safe (FILE_FLAG_OPEN_REPARSE_POINT under O_NOFOLLOW, so the TARGET of a link is never
+# touched); this decides what the caller is told. See the OFlags note. CHANGELOG [6.6.9]
+fn _win_open_checked(path, flags, mode): i64 {
+    var nf = flags & 131072;
+    var dr = flags & 65536;
+    var f = flags;
+    var tr = 0;
+    if (dr != 0) {
+        # A directory handle is a READ handle: the write, create and truncate bits only
+        # decide EISDIR below. Opening read-only keeps a mistaken O_DIRECTORY|O_TRUNC on a
+        # FILE from truncating it on the way to -ENOTDIR.
+        f = flags & (0 - 1 - 1603);   # drop O_ACCMODE(3), O_CREAT(64), O_TRUNC(512), O_APPEND(1024)
+    } elif (nf != 0) {
+        tr = flags & 512;             # O_TRUNC waits until the handle is verified
+        f = flags - tr;
+    }
+    var h = syscall(SYS_OPEN, path, f, mode);
+    if (h < 0) {
+        if (nf != 0) { if (dr == 0) { return _win_nofollow_refusal(path, flags, h); } }
+        return h;
+    }
+    var at = _win_handle_tag(h);
+    if (at == 0 - 1) { syscall(SYS_CLOSE, h); return 0 - 1; }   # fail closed
+    if (nf != 0) {
+        if (_win_is_surrogate(at) == 1) {
+            syscall(SYS_CLOSE, h);
+            # With O_DIRECTORY too, the unfollowed link is simply not a directory: Linux AND
+            # Darwin answer -ENOTDIR there, not -ELOOP (measured on both).
+            if (dr != 0) { return 0 - 20; }
+            return 0 - 40;
+        }
+        if ((at & 1024) != 0) {
+            # A reparse point that is not a redirection (cloud placeholder, dedup): open it
+            # the ordinary way, so the filter driver presents the file. That reopen is by NAME
+            # and follows links, so it is made WITHOUT O_TRUNC (`f`), the verified handle stays
+            # open meanwhile, and the two must be the same file — a name swapped for a link in
+            # between is refused (-1) instead of opened, and the truncation below applies only
+            # to the checked handle.
+            var h2 = syscall(SYS_OPEN, path, f - nf, mode);
+            if (h2 < 0) { syscall(SYS_CLOSE, h); return h2; }
+            var same = _win_same_file(h, h2);
+            syscall(SYS_CLOSE, h);
+            if (same != 1) { syscall(SYS_CLOSE, h2); return 0 - 1; }
+            h = h2;
+        }
+    }
+    if (dr != 0) {
+        if ((at & 16) == 0) { syscall(SYS_CLOSE, h); return 0 - 20; }
+        if ((flags & 579) != 0) { syscall(SYS_CLOSE, h); return 0 - 21; }   # write access, O_CREAT or O_TRUNC
+    }
+    if (tr != 0) {
+        if (_win_truncate_verified(h, path) != 0) { syscall(SYS_CLOSE, h); return 0 - 1; }
+    }
+    return h;
+}
+
+# Truncate the file behind a VERIFIED handle to 0 bytes. SetEndOfFile (0xF03F) needs
+# FILE_WRITE_DATA, which an O_RDONLY handle lacks and an O_APPEND one deliberately lacks (its
+# access is FILE_APPEND_DATA, NT's per-write append), so those truncate through a second
+# O_WRONLY handle opened with FILE_FLAG_OPEN_REPARSE_POINT (it can never reach through a link)
+# and truncated only when it is the SAME FILE as `h` (`_win_same_file`) — a name swapped in
+# between, for a link or for another file, is refused. 0 on success, -1 on failure.
+# CHANGELOG [6.6.9]
+fn _win_truncate_verified(h, path): i64 {
+    if (syscall(61503, h) != 0) { return 0; }
+    var t = syscall(SYS_OPEN, path, 131073, 0);   # O_WRONLY | O_NOFOLLOW
+    if (t < 0) { return 0 - 1; }
+    var r = 0 - 1;
+    if (_win_same_file(h, t) == 1) {
+        if (syscall(61503, t) != 0) { r = 0; }
+    }
+    syscall(SYS_CLOSE, t);
+    return r;
 }
 
 # Close the descriptor `fd`. Rerouted to kernel32!CloseHandle.
@@ -295,6 +460,10 @@ fn sys_kill(pid, sig): i64 { return 0 - 1; }
 fn sys_chmod(path, mode): i64 { return 0; }
 # Best-effort dup2 stub: returns the requested newfd (handle dup is rerouted).
 fn sys_dup2(oldfd, newfd): i64 { return newfd; }
+# pipe — Windows has no anonymous-pipe syscall on the reroute table. Fail closed with -1 so a
+# caller's `< 0` path runs (lib/regression.cyr, lib/pam.cyr's Linux-only body); before this the
+# name was UNDEFINED on PE and every call site compiled to a ud2 trap. CHANGELOG [6.6.9] bite 7.
+fn sys_pipe(fds): i64 { return 0 - 1; }
 # mkdir — routed to kernel32!CreateDirectoryW by the PE backend's syscall(83)
 # reroute (src/backend/pe/emit.cyr _pe_ensure_createdir, v5.11.22). Returns 0 on
 # success, -1 on failure. (Was a no-op `return 0` stub through v6.3.42 — VR-01
@@ -412,11 +581,102 @@ fn sys_socketpair(domain, type, protocol, fds): i64 { return 0 - 1; }
 fn sys_sendmsg(fd, msghdr, flags): i64 { return 0 - 38; }
 # Send a datagram to an address. Declines on Windows for the same reason as sys_sendmsg.
 fn sys_sendto(fd, buf, len, flags, dstaddr, dstaddrlen): i64 { return 0 - 38; }
-# Set a file's length by descriptor. Declines on Windows: SetEndOfFile truncates at the
-# CURRENT file pointer, so an honest peer has to seek first and restore after.
-fn sys_ftruncate(fd, length): i64 { return 0 - 38; }
-# Set a file's length by path. Declines on Windows, same reason as sys_ftruncate.
-fn sys_truncate(path, length): i64 { return 0 - 38; }
+# Set a file's length by descriptor — REAL since 6.6.9 (it declined with -38 before). Windows
+# sets the end of file at the CURRENT file pointer (SetEndOfFile, reroute 0xF03F), so this
+# seeks to `length`, sets it, and puts the pointer back where the caller had it, which is what
+# ftruncate(2) leaves alone. Growing zero-fills, as POSIX requires. 0 on success, -22
+# (-EINVAL) for a negative length, -1 on a Win32 failure (a handle without write access, for
+# one). ⚠ That includes an O_APPEND descriptor, where Linux succeeds: the PE open of O_APPEND
+# grants FILE_APPEND_DATA WITHOUT FILE_WRITE_DATA (NT's per-write append), and SetEndOfFile
+# needs the latter. Truncate by path (sys_truncate), or open without O_APPEND. CHANGELOG [6.6.9]
+fn sys_ftruncate(fd, length): i64 {
+    if (length < 0) { return 0 - 22; }
+    var cur = syscall(SYS_LSEEK, fd, 0, 1);
+    if (cur < 0) { return 0 - 1; }
+    if (syscall(SYS_LSEEK, fd, length, 0) < 0) { return 0 - 1; }
+    var ok = syscall(61503, fd);
+    syscall(SYS_LSEEK, fd, cur, 0);
+    if (ok == 0) { return 0 - 1; }
+    return 0;
+}
+# Set a file's length by path — REAL since 6.6.9: opens the path for writing (following a
+# link, as truncate(2) does), then sys_ftruncate. Same returns. CHANGELOG [6.6.9]
+fn sys_truncate(path, length): i64 {
+    if (length < 0) { return 0 - 22; }
+    var h = syscall(SYS_OPEN, path, 1, 0);   # O_WRONLY
+    if (h < 0) { return 0 - 1; }
+    var r = sys_ftruncate(h, length);
+    syscall(SYS_CLOSE, h);
+    return r;
+}
+
+# Widen a UTF-8 (ASCII) path into `dst` as UTF-16LE with '/' → '\', at most `cap` - 1 units
+# plus a NUL. Returns the unit count. The peer's own copy: it includes nothing, so it cannot
+# borrow lib/fs_win.cyr's `_fs_widen`, and a stack buffer needs no allocator. CHANGELOG [6.6.9]
+fn _win_widen(dst, src, cap): i64 {
+    var i = 0;
+    while (i < cap - 1) {
+        var c = load8(src + i);
+        if (c == 0) { break; }
+        if (c == 47) { c = 92; }
+        store16(dst + i * 2, c);
+        i = i + 1;
+    }
+    store16(dst + i * 2, 0);
+    return i;
+}
+
+# symlink(target, linkpath) — REAL since 6.6.9: CreateSymbolicLinkW (reroute 0xF03E). Windows
+# has two link kinds and POSIX has one, so the kind is taken from what `target` names NOW,
+# resolved the way the link will resolve it (a relative target against the LINK's directory):
+# a directory gets SYMBOLIC_LINK_FLAG_DIRECTORY, anything else — including a target that does
+# not exist yet, a dangling link — a file link. SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
+# is asked first (Developer Mode lets a normal user create links with it); a Windows too old
+# to know the flag refuses it, so the call is retried without. ⚠ Without Developer Mode a
+# NON-elevated process cannot create a link at all and this returns -1 — a Windows policy,
+# not a missing route. 0 on success, -1 on failure. CHANGELOG [6.6.9]
+fn sys_symlink(target, linkpath): i64 {
+    var wl[1040];
+    var wt[1040];
+    var wr[2080];
+    _win_widen(&wl, linkpath, 519);
+    var tn = _win_widen(&wt, target, 519);
+    # Resolve the target as the link will: absolute ('\...', 'X:...') as-is, else against
+    # the link's directory (the part of linkpath up to its last separator).
+    var abs = 0;
+    if (tn > 0) {
+        if (load16(&wt) == 92) { abs = 1; }
+    }
+    if (tn > 1) {
+        if (load16(&wt + 2) == 58) { abs = 1; }
+    }
+    var ri = 0;
+    if (abs == 0) {
+        var ls = 0 - 1;
+        var li = 0;
+        while (load16(&wl + li * 2) != 0) {
+            if (load16(&wl + li * 2) == 92) { ls = li; }
+            li = li + 1;
+        }
+        while (ri <= ls) {
+            store16(&wr + ri * 2, load16(&wl + ri * 2));
+            ri = ri + 1;
+        }
+    }
+    var ti = 0;
+    while (ti <= tn) {
+        store16(&wr + (ri + ti) * 2, load16(&wt + ti * 2));
+        ti = ti + 1;
+    }
+    var kind = 0;
+    var at = syscall(61465, &wr);                 # GetFileAttributesW
+    if (at != 4294967295) {
+        if ((at & 16) != 0) { kind = 1; }         # SYMBOLIC_LINK_FLAG_DIRECTORY
+    }
+    if (syscall(61502, &wl, &wt, kind | 2) != 0) { return 0; }
+    if (syscall(61502, &wl, &wt, kind) != 0) { return 0; }
+    return 0 - 1;
+}
 # Filesystem statistics by path. Declines on Windows: the nearest peer is GetDiskFreeSpaceExW,
 # a kernel32 import with three out-params and a wide path — a different contract, not a
 # renumber. Callers already bail on r < 0. v6.6.6.
@@ -435,6 +695,51 @@ fn sys_nanosleep(req, rem): i64 { return syscall(SYS_NANOSLEEP, req, rem); }
 # Yield the remainder of this thread's timeslice. Declines on Windows: the peer is
 # SwitchToThread/Sleep(0), a kernel32 import this backend does not reroute.
 fn sys_sched_yield(): i64 { return 0 - 38; }
+# ── v6.6.8: PE peers for the namespace / root / capability / cross-process-memory / mknodat
+# wrappers in lib/syscalls_linux_common.cyr. Windows has none of these as a syscall (job
+# objects, AppContainers, token privileges and ReadProcessMemory are different object
+# models, not renumbers), so each declines with -38/-ENOSYS; the caller's `r < 0` fires.
+# Present so a portable consumer (kavach, takumi, shakti) BUILDS for PE. CHANGELOG [6.6.8]
+# Enter new namespaces. Declines: Windows has no namespaces.
+fn sys_unshare(flags): i64 { return 0 - 38; }
+# Change the root directory. Declines: Windows has no chroot.
+fn sys_chroot(path): i64 { return 0 - 38; }
+# Swap the root mount. Declines: Windows has no mount tree to pivot.
+fn sys_pivot_root(new_root, put_old): i64 { return 0 - 38; }
+# Read capability sets. Declines: Windows privileges live on an access token.
+fn sys_capget(hdr, data): i64 { return 0 - 38; }
+# Set capability sets. Declines, same reason as sys_capget.
+fn sys_capset(hdr, data): i64 { return 0 - 38; }
+# Read another process's memory. Declines: ReadProcessMemory takes a process HANDLE.
+fn sys_process_vm_readv(pid, local_iov, liovcnt, remote_iov, riovcnt, flags): i64 { return 0 - 38; }
+# Write another process's memory. Declines, same reason as sys_process_vm_readv.
+fn sys_process_vm_writev(pid, local_iov, liovcnt, remote_iov, riovcnt, flags): i64 { return 0 - 38; }
+# Create a filesystem node (FIFO / device). Declines: Windows named pipes live in \\.\pipe\.
+fn sys_mknodat(dirfd, path, mode, dev): i64 { return 0 - 38; }
+# ── v6.6.8: PE peers for the fcntl surface in lib/syscalls_linux_common.cyr. Windows has no
+# fcntl (non-blocking I/O is ioctlsocket(FIONBIO) on a SOCKET, or OVERLAPPED on a HANDLE —
+# different object models, not a renumber), so all three decline with -38/-ENOSYS. A caller
+# that relies on a non-blocking read learns it cannot have one, which a silent `return 0`
+# would hide. ⚠ None of them may NAME O_NONBLOCK: this peer declares none, and an undefined
+# variable is a hard compile error for every PE consumer. The F_* names exist so portable
+# source compiles. CHANGELOG [6.6.8]
+enum FcntlCmd {
+    F_DUPFD = 0;
+    F_GETFD = 1;
+    F_SETFD = 2;
+    F_GETFL = 3;
+    F_SETFL = 4;
+}
+# The one F_SETFD descriptor flag.
+enum FdFlag {
+    FD_CLOEXEC = 1;
+}
+# fcntl(2). Declines on Windows.
+fn sys_fcntl(fd, cmd, arg): i64 { return 0 - 38; }
+# Make an fd non-blocking. Declines on Windows (no fcntl status flags).
+fn fd_set_nonblocking(fd): i64 { return 0 - 38; }
+# Restore saved fd status flags. Declines on Windows.
+fn fd_restore_flags(fd, saved): i64 { return 0 - 38; }
 
 # ── PE peers for the linux_common wrappers a cross-platform consumer names on paths that
 # are dead on Windows (yukti's optical / eject / netlink-monitor / network-probe / mount /

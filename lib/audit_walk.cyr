@@ -8,7 +8,8 @@
 #   audit_fmt_walk(cyrfmt_path, dirs_vec)
 #       Run cyrfmt on every non-symlink, non-distlib-bundle *.cyr
 #       file in the given dirs. Sets globals AW_FMT_FAIL (0/1),
-#       AW_FMT_SKIPPED, AW_FMT_FAIL_FILES (vec<str>).
+#       AW_FMT_SKIPPED, AW_FMT_FAIL_FILES (vec<str>), and — 6.6.8 —
+#       AW_FMT_ERRORS / AW_FMT_ERROR_FILES (files cyrfmt did not finish on).
 #
 #   audit_lint_walk(cyrlint_path, dirs_vec)
 #       Run cyrlint on every non-symlink, non-distlib-bundle *.cyr
@@ -45,14 +46,30 @@
 #   2. "# Bundled distribution of " — scripts/bundle.sh output
 #      (sakshi only, predates cyrius distlib).
 #
-# Requires: lib/string.cyr, lib/fmt.cyr, lib/alloc.cyr, lib/io.cyr,
-#           lib/vec.cyr, lib/str.cyr, lib/fs.cyr, lib/process.cyr,
-#           lib/syscalls.cyr.
+# 6.6.9: the includes below were a "Requires:" note for the caller; a bare include was a hard error
+# (`undefined variable 'O_RDONLY'`) plus ~25 undefined functions.
+# CHANGELOG [6.6.9]
+include "lib/syscalls.cyr"
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/fs.cyr"
+include "lib/process.cyr"
 
 # Globals exposed to caller after audit_fmt_walk runs.
 var AW_FMT_FAIL = 0;
 var AW_FMT_SKIPPED = 0;
 var AW_FMT_FAIL_FILES = 0;   # vec<str> of basenames
+# ⛔ 6.6.8 — THE FMT WALKER FAILS CLOSED TOO. It compared cyrfmt's stdout with the file and
+# threw the exit status away, so a cyrfmt that crashed (or hung to the deadline) with no
+# output on an EMPTY .cyr gave 0 == 0 bytes and the file read as formatted — and a refusal
+# that did print (its "cannot read file" goes to stdout) was reported as "needs
+# reformatting", the wrong reason. A run that did not exit 0 on its own is now an ERROR that
+# names the file and why; callers fail on AW_FMT_ERRORS as on the lint/doc ones.
+var AW_FMT_ERRORS = 0;
+var AW_FMT_ERROR_FILES = 0;  # vec<Str> of "path: reason" notes
 
 # Globals exposed to caller after audit_lint_walk runs.
 var AW_LINT_TOTAL = 0;
@@ -287,6 +304,9 @@ fn audit_fmt_walk(cyrfmt_path, dirs_vec): i64 {
     AW_FMT_FAIL = 0;
     AW_FMT_SKIPPED = 0;
     AW_FMT_FAIL_FILES = vec_new();
+    AW_FMT_ERRORS = 0;
+    AW_FMT_ERROR_FILES = vec_new();
+    var st[16];
     var cap = 2000000;
     var orig_buf = alloc(cap);
     var fmt_buf  = alloc(cap);
@@ -326,8 +346,12 @@ fn audit_fmt_walk(cyrfmt_path, dirs_vec): i64 {
                         var args = vec_new();
                         vec_push(args, cyrfmt_path);
                         vec_push(args, str_data(full));
-                        var fmt_n = exec_capture(args, fmt_buf, cap);
-                        if (fmt_n != orig_n) {
+                        var fmt_n = exec_capture_status(args, fmt_buf, cap, &st);
+                        var bad = _aw_exit_verdict(full, &st);
+                        if (bad != 0) {
+                            AW_FMT_ERRORS = AW_FMT_ERRORS + 1;
+                            vec_push(AW_FMT_ERROR_FILES, bad);
+                        } elif (fmt_n != orig_n) {
                             AW_FMT_FAIL = 1;
                             vec_push(AW_FMT_FAIL_FILES, name);
                         } else {
@@ -430,6 +454,18 @@ fn _aw_run_verdict(full, st, parsed, want): i64 {
     if (load64(st + 8) == 1) { return _aw_note(full, "the tool crashed, signal ", code - 128); }
     if (parsed < 0) { return _aw_note(full, "the tool refused or failed (no summary line), exit ", code); }
     if (code != want) { return _aw_note(full, "exit status disagrees with the summary line, exit ", code); }
+    return 0;
+}
+
+# The exit-status half of `_aw_run_verdict`, for a tool with no summary trailer (cyrfmt):
+# trustworthy only when it exited 0 on its own. 0 or a note naming the file and the reason.
+# CHANGELOG [6.6.8]
+fn _aw_exit_verdict(full, st): i64 {
+    var code = load64(st);
+    if (code == 0 - 1) { return _aw_note(full, "the tool could not be run", 0 - 1); }
+    if (code == 0 - 2) { return _aw_note(full, "timed out and was killed at the deadline", 0 - 1); }
+    if (load64(st + 8) == 1) { return _aw_note(full, "the tool crashed, signal ", code - 128); }
+    if (code != 0) { return _aw_note(full, "the tool refused or failed, exit ", code); }
     return 0;
 }
 

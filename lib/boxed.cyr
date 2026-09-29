@@ -1,6 +1,6 @@
 # boxed.cyr — runtime-tagged BOX primitives (the general tagged-union representation)
 # Usage: include "lib/boxed.cyr"
-# Requires: alloc.cyr
+# Includes its own definer, alloc.cyr.
 #
 # ⭐ v6.6.2 — RESTORED. `tagged_new` was deleted at v6.6.0 on a survey that could not see its
 # consumers, and this module brings the capability back under names that cannot be confused

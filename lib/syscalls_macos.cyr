@@ -153,6 +153,19 @@ enum SysNr {
     # lib/syscalls_linux_common.cyr, never a hardcoded Linux offset. CHANGELOG [6.6.6]
     SYS_STATFS = 137;
     SYS_FSTATFS = 138;
+    # v6.6.8 — LINUX numbers with NO Darwin peer and NO _msx row: Darwin has no unshare,
+    # pivot_root, capget/capset, process_vm_* or mknodat, and its chroot is not offered (no
+    # consumer needs it on macOS). The shared wrappers decline with -78 under
+    # #ifdef CYRIUS_TARGET_MACOS, so the numbers are never emitted on this target; the names
+    # exist so cross-platform source COMPILES. macho_route_parity.sh allow-lists them.
+    SYS_UNSHARE = 272;
+    SYS_CHROOT = 161;
+    SYS_PIVOT_ROOT = 155;
+    SYS_CAPGET = 125;
+    SYS_CAPSET = 126;
+    SYS_PROCESS_VM_READV = 310;
+    SYS_PROCESS_VM_WRITEV = 311;
+    SYS_MKNODAT = 259;
     # v6.1.3 — bare-name fs syscalls + POSIX *at() family (Linux numbers;
     # EMACHO_SYSXLAT maps the emitted ones to Darwin/BSD at emit time).
     SYS_LSTAT = 6;
@@ -183,6 +196,16 @@ enum SysNr {
     # (rc 140) — the v6.5.15 fchmod shape. CHANGELOG [6.5.16]
     SYS_GETTIMEOFDAY = 1116;  # private alias → EMACHO_SYSXLAT → BSD 116
     SYS_SYSCTL = 1202;        # private alias → EMACHO_SYSXLAT → BSD 202
+}
+
+# ================================================================
+# Seccomp architecture tag (v6.6.8)
+# ================================================================
+# The x86_64 AUDIT_ARCH value. Declared here because this peer also declares SYS_SECCOMP:
+# the seccomp surface COMPILES on macOS (so portable source does) and declines at runtime
+# (sys_seccomp returns -78). Same value as lib/syscalls_x86_64_linux.cyr. CHANGELOG [6.6.8]
+enum AuditArch {
+    AUDIT_ARCH_NATIVE = 0xC000003E;
 }
 
 # ================================================================

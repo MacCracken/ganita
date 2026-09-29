@@ -1,7 +1,6 @@
 # str.cyr — string type (fat pointer: data + length)
 # Usage: include "lib/str.cyr"
-# Requires: include "lib/alloc.cyr" for dynamic strings
-# Requires: include "lib/string.cyr" for strlen/memcpy
+# Includes its own definers (6.6.9): alloc.cyr, string.cyr, fmt.cyr (str_from_int_a), vec.cyr (str_split_a).
 #
 # v5.8.11 §3: Str's runtime layout is byte-identical to the
 # stack-slice<u8> convention in lib/slice.cyr — heap-allocated
@@ -13,6 +12,14 @@
 # are fn-frame-scoped. Pick whichever shape fits the use case.
 # `slice_from_cstr` / `slice_from_buf` (lib/slice.cyr) are
 # stack-slice analogs of str_from / str_new.
+
+# 6.6.9: this file wrote its requirements down for the caller ("Requires: include lib/alloc.cyr")
+# instead of including them, so a bare include compiled with eleven undefined functions — each a
+# ud2 stub. Include-once: a caller that already has them pays nothing. CHANGELOG [6.6.9]
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/vec.cyr"
 
 struct Str { data; len; }
 

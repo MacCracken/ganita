@@ -1,24 +1,26 @@
-# regression_agnos.cyr — AGNOS (ring-3) stubs for regression.cyr's fork+exec
-# process/SSH helpers.
+# regression_agnos.cyr — AGNOS (ring-3) peers of regression.cyr's process / SSH helpers.
 # Usage: included by lib/regression.cyr under #ifdef CYRIUS_TARGET_AGNOS.
-# Requires: alloc.cyr (only for exec_capture_status status_out writes).
+# Requires: the agnos syscall peer; alloc.cyr (only for exec_capture_status status_out writes).
 #
-# AGNOS's frozen syscall surface has no fork/dup2/execve/chdir/wait4 — the
-# POSIX fork+redirect+execve model these helpers use can't map onto agnos's
-# in-memory-ELF SYS_SPAWN (#3) primitive (no stdin/stdout redirect, no /bin
-# paths). So every fork+exec verb is UNSUPPORTED on agnos and fail-closed here,
-# exactly as lib/process_agnos.cyr fail-closes its run_capture/exec_capture
-# ("capture unsupported on agnos" → -1). Each stub returns the same sentinel
-# its host counterpart returns on a fork failure, so callers' existing
-# `< 0` / `== 0` error paths stay correct. The PORTABLE regression verbs
-# (display, buffer-scan, regression_network_probe, regression_ssh_target) are
-# NOT here — they stay shared in regression.cyr (network_probe has its own
-# agnos branch over the net.cyr socket adapter). Resolves the regression.cyr
-# layer of issue 2026-06-15-cyrius-thread-agnos-clone-dispatch.md.
+# ⚠ WHAT IS HERE, AND WHY MOST OF IT STILL FAILS CLOSED (rewritten 6.6.8). The host verbs are
+# written against POSIX: fork + dup2 + execve, `/dev/null`, a cwd, `ssh` / `scp` / `codesign` on
+# $PATH, and poll(2) for the deadlines. agnos has no execve, no /dev/null, no cwd, none of
+# those tools and no poll(2). It DOES now have what a spawn needs — a from-disk spawn with a real argv and a
+# clean fd table (spawn_path#43, agnos 1.57.6), fd redirects into the child (#62) and a
+# blocking wait (WAIT_BLOCK, 1.57.7) — and lib/process_agnos.cyr is built on them as of
+# CHANGELOG [6.6.8]. The spawn-and-capture verbs below have NOT been ported to that yet: they
+# still return the sentinel their host counterpart returns on a fork failure (so a caller's
+# `< 0` / `== 0` error path stays correct), which is "not run", never a fabricated result.
+# The ssh / scp / codesign / exec-in-dir verbs have nothing to port to on agnos.
+# The two pipe pumps ARE real here: they need only read / write on an fd.
+# The PORTABLE verbs (display, buffer-scan, regression_network_probe, regression_ssh_target)
+# are NOT here — they stay shared in regression.cyr.
 #
-# Stdlib convention these mirror: 0..127 normal exit; -1 fork/exec failure;
-# -2 timeout. On agnos there is no child, so the "fork failed" sentinel is the
-# honest result.
+# Stdlib convention these mirror: 0..127 normal exit; -1 fork/exec failure; -2 timeout.
+
+#ifdef CYRIUS_TARGET_AGNOS
+include "lib/syscalls.cyr"
+#endif
 
 # Pipe a source file to a binary's stdin, capture stdout — unsupported on agnos.
 fn regression_pipe_to_bin_capture(bin_path, src_path, out_path, envp): i64 { return 0 - 1; }
@@ -40,6 +42,84 @@ fn regression_exec_run(bin_path, envp): i64 { return 0 - 1; }
 fn regression_exec_with_arg_capture(bin_path, arg, buf, buflen, envp): i64 { return 0; }
 # Exec binary with one arg, capture stdout+stderr — unsupported on agnos; 0 captured.
 fn regression_exec_with_arg_capture_both(bin_path, arg, buf, buflen, envp): i64 { return 0; }
+# ...and report how it ended — unsupported on agnos: nothing ran, so status_out is the failure
+# ([0] = -1, [1] = 0) and 0 bytes are captured. It was MISSING here, so any agnos build that
+# called it failed to compile (the POSIX verb landed in 6.6.7 without its peer). CHANGELOG [6.6.8]
+fn regression_exec_with_arg_capture_both_status(bin_path, arg, buf, buflen, envp, status_out): i64 {
+    if (status_out != 0) { store64(status_out, 0 - 1); store64(status_out + 8, 0); }
+    return 0;
+}
+# The stdout-only twin of the above — unsupported on agnos for the same reason, same answer.
+# Added with the three deadline verbs below when the POSIX module grew them (6.6.8 bite 8)
+# without peers, which agnos_process_peer_parity caught on the merged tree. CHANGELOG [6.6.8]
+fn regression_exec_with_arg_capture_status(bin_path, arg, buf, buflen, envp, status_out): i64 {
+    if (status_out != 0) { store64(status_out, 0 - 1); store64(status_out + 8, 0); }
+    return 0;
+}
+# No verb here runs a child under a deadline, so none has ever been ended at one.
+fn regression_deadline_kills(): i64 { return 0; }
+# The bound that fired for the most recent deadline kill — 0, since none ever has here.
+fn regression_last_deadline_ms(): i64 { return 0; }
+# Nothing here forks a child tree, so there is nothing to end; 0 descendants were running.
+fn regression_terminate_children(grace_ms): i64 { return 0; }
+
+# ⚠ The two pumps call agnos-only wrappers (the O_NONBLOCK read/write, and the socket adapter's
+# deadline _agnos_dl_start / _agnos_dl_over — uptime_us#95 with its refused-calibration fallback,
+# the one clock rule agnos_monotonic_clock_rdtsc enforces), so they are
+# guarded: this module still compiles alone on any host (stdlib_modules_self_sufficient).
+#ifdef CYRIUS_TARGET_AGNOS
+# Write all `n` bytes of `buf` to `fd`. Returns the bytes written — short means the reader
+# stopped draining (or is gone: agnos has no SIGPIPE, the write answers -1). `timeout_ms > 0`
+# gives up after that long WITHOUT PROGRESS, as the POSIX pump does; agnos has no poll(2), so
+# it uses the O_NONBLOCK write (0 = no room yet), a 1 ms sleep and the peer's deadline clock. `timeout_ms <= 0` is the
+# blocking write. These two pumps were MISSING here (CHANGELOG [6.6.8]).
+fn regression_pipe_write_all(fd, buf, n, timeout_ms): i64 {
+    var written = 0;
+    var dl[32];
+    _agnos_dl_start(&dl, timeout_ms * 1000);
+    while (written < n) {
+        var w = 0;
+        if (timeout_ms > 0) { w = sys_write_nb(fd, buf + written, n - written); }
+        else { w = sys_write(fd, buf + written, n - written); }
+        if (w < 0) { return written; }
+        if (w == 0) {
+            if (timeout_ms <= 0) { return written; }
+            if (_agnos_dl_over(&dl) == 1) { return written; }
+            sys_sleep_ms(1);
+        } else {
+            written = written + w;
+            _agnos_dl_start(&dl, timeout_ms * 1000);   # progress: the idle bound starts again
+        }
+    }
+    return written;
+}
+
+# Drain `fd` into `buf` (at most `cap`) until EOF. Returns the bytes read. `timeout_ms > 0`
+# gives up after that long without progress (O_NONBLOCK read: -2 / -3 = nothing yet); with
+# `timeout_ms <= 0` the read blocks, and a -2 from a pre-1.57.8 kernel (which answered it for
+# an empty pipe instead of blocking) is retried, never taken as EOF.
+fn regression_pipe_read_all(fd, buf, cap, timeout_ms): i64 {
+    var total = 0;
+    var dl[32];
+    _agnos_dl_start(&dl, timeout_ms * 1000);
+    while (total < cap) {
+        var r = 0;
+        if (timeout_ms > 0) { r = sys_read_nb(fd, buf + total, cap - total); }
+        else { r = sys_read(fd, buf + total, cap - total); }
+        if (r == 0 - 2) { r = 0 - 3; }
+        if (r == 0 - 3) {
+            if (timeout_ms > 0) { if (_agnos_dl_over(&dl) == 1) { return total; } }
+            sys_sleep_ms(1);
+        } else {
+            if (r <= 0) { return total; }
+            total = total + r;
+            _agnos_dl_start(&dl, timeout_ms * 1000);
+        }
+    }
+    return total;
+}
+#endif
+
 # SSH reachability skip-check — unsupported on agnos; reports not reachable.
 fn regression_ssh_skip_check(target): i64 { return 0; }
 # scp a local file to a remote host — unsupported on agnos.

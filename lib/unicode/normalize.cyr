@@ -54,6 +54,10 @@
 
 include "lib/unicode/_decode.cyr"
 include "lib/unicode/_normalize_data.cyr"
+# 6.6.9: str_normalize / str_eq_normalized take and build Str values (alloc, str_new, str_data,
+# str_len, str_eq) and this file included neither module. CHANGELOG [6.6.9]
+include "lib/alloc.cyr"
+include "lib/str.cyr"
 
 # NormalForm enum — passed to str_normalize / str_eq_normalized.
 # K-forms shipped at v5.8.60 once str_data cap was raised at .59.

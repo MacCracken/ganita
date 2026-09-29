@@ -1,7 +1,6 @@
 # tls.cyr — TLS client via libssl.so.3 (fdlopen bridge)
 # Usage: include "lib/tls.cyr"
-# Requires: alloc.cyr, syscalls.cyr, net.cyr, mmap.cyr, fnptr.cyr,
-#           string.cyr, dynlib.cyr, FDLOPEN.CYR (load-bearing as of v5.6.37)
+# Includes its own definers: fdlopen.cyr (the libssl bridge, 6.6.9) and tls_native.cyr.
 #
 # Formal contract: `docs/development/lib-tls-contract.md` (v5.10.42).
 # That doc is the invariant layer — verb return semantics, lifecycle
@@ -9,14 +8,11 @@
 # MUST preserve those guarantees unless the contract is amended in
 # the same patch.
 #
-# **IMPORTANT (v5.6.37+):** callers MUST `include "lib/fdlopen.cyr"`
-# before `include "lib/tls.cyr"` so this file's references to
-# `fdlopen_init_full` / `fdlopen_dlopen` / `fdlopen_dlsym` resolve.
-# tls.cyr doesn't auto-include fdlopen because the preprocessor
-# output cap (1 MB expanded) is tight for programs that pull
-# in many heavy stdlib modules (e.g. `tests/tcyr/compiler/large_input.tcyr`
-# already runs at 98% of cap) — an auto-include would put them
-# over.
+# 6.6.9: this file INCLUDES lib/fdlopen.cyr (below). It used to tell callers to include it first,
+# on the grounds that the preprocessor's 1 MB output cap could not absorb it; that cap is 24 MB
+# (lex_pp.cyr), and a caller that skipped the include got fdlopen_helper_available /
+# fdlopen_init_full / fdlopen_dlopen / fdlopen_dlsym as ud2 stubs — every libssl call a SIGILL.
+# CHANGELOG [6.6.9]
 #
 # Loads libssl.so.3 + libcrypto.so.3 at runtime via `fdlopen`'s
 # ld.so-bootstrapped real glibc `dlopen` + `dlsym`. This is the
@@ -65,6 +61,7 @@
 # libssl-only build the native path isn't compiled and selecting it returns -1.
 # Consumers use the same tls_* API + typed tls_set_*() verbs regardless of
 # backend (the handle stays opaque).
+include "lib/fdlopen.cyr"
 #ifndef CYRIUS_TLS_LIBSSL
 include "lib/tls_native.cyr"
 #endif

@@ -1,7 +1,13 @@
 # dynlib.cyr — pure Cyrius dynamic library loader (ELF .so)
 # Usage: include "lib/dynlib.cyr"
-# Requires: string.cyr, syscalls.cyr, mmap.cyr
+# Includes its own definers: string.cyr, alloc.cyr, mmap.cyr, fnptr.cyr, result.cyr.
 
+# 6.6.9: the loader maps segments with cyr_mmap / cyr_munmap and PROT_* (mmap.cyr) and copies
+# with the string.cyr helpers; mmap.cyr was listed for the caller instead of included, so a
+# bare include was a hard error (`undefined variable 'PROT_READ'`). CHANGELOG [6.6.9]
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/mmap.cyr"
 include "lib/fnptr.cyr"
 # v5.8.31: Result-returning *_r variants (dynlib_open_r,
 # dynlib_sym_r) for typed error returns.
@@ -915,6 +921,13 @@ fn dynlib_bootstrap_tls(): i64 {
     # `msr TPIDR_EL0` for the native path. CHANGELOG [6.6.4]
     return 0;
     #endif
+    # v6.6.8: x86-macOS declines too. Darwin has no arch_prctl — its raw 158 reached Darwin
+    # unrouted, a SIGSYS kill — and the loader this bootstraps (ld-linux-x86-64.so.2) does not
+    # exist there. fdlopen_dynlib_decline.tcyr's x86 non-Linux arm claimed this decline
+    # ("decline on macOS/PE already") and asserted nothing; it asserts it now. CHANGELOG [6.6.8]
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0;
+    #endif
     var tls = alloc(4096);
     if (tls == 0) { return 0; }
     var i = 0;
@@ -924,10 +937,15 @@ fn dynlib_bootstrap_tls(): i64 {
     # arch_prctl(ARCH_SET_FS=0x1002, tls) — x86_64 syscall 158, and x86-only: the aarch64
     # arm declined above, and this guard keeps the raw number out of arch-neutral code (the
     # raw_syscall_literals_routed gate).
+    # ⚠ The #ifndef MACOS is what keeps the NUMBER out of a macOS build; the early return
+    # above alone would leave an unreachable-but-compiled 158 warning on every x86-macOS build
+    # that includes this file.
+    #ifndef CYRIUS_TARGET_MACOS
     #ifdef CYRIUS_ARCH_X86
     var rc = syscall(158, 0x1002, tls);
     if (rc != 0) { return 0; }
     return tls;
+    #endif
     #endif
     #ifndef CYRIUS_ARCH_X86
     return 0;

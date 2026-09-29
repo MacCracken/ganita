@@ -1,8 +1,8 @@
 # tls_native.cyr — Sovereign, pure-Cyrius TLS protocol-layer stack
 # Usage: include "lib/tls_native.cyr"
-# Requires: lib/syscalls.cyr (sockets), lib/alloc.cyr, lib/sigil.cyr
+# Includes its own definers: lib/syscalls.cyr (sockets), lib/alloc.cyr, lib/sigil.cyr
 #           (crypto primitives: ChaCha20-Poly1305, AES-GCM, HKDF, SHA-2,
-#            X25519, ECDSA, X.509)
+#            X25519, ECDSA, X.509) and the folded sigil's sidecar leaves (below).
 #
 # **Status (corrected 2026-06-04 — the prior "v6.0.10 SCAFFOLD / every fn
 # returns NOT_IMPLEMENTED" header was stale and false; the stack works):**

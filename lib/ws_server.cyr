@@ -1,11 +1,15 @@
 # lib/ws_server.cyr — server-side WebSocket (RFC 6455)
 #
 # Companion to lib/ws.cyr (client-side).
-# Requires: alloc.cyr, string.cyr, fmt.cyr, str.cyr, syscalls.cyr, base64.cyr,
-#           sha1.cyr, net.cyr, tagged.cyr, http_server.cyr (for handshake parsing).
+# Requires (NOT self-sufficient yet — the PENDING tier of
+# tests/gates/toolchain/stdlib_modules_self_sufficient.sh): alloc.cyr, string.cyr, fmt.cyr,
+# str.cyr, syscalls.cyr, sha1.cyr, net.cyr, tagged.cyr, plus base64_encode from lib/bayan.cyr
+# (base64.cyr was folded into bayan) and sandhi_server_find_header from lib/sandhi.cyr
+# (http_server.cyr was folded into sandhi). Both are distlib bundles that strip their own
+# includes, so this file cannot compile alone until they are raw-includable.
 #
-# Design: integrates with lib/http_server.cyr — an HTTP handler detects a WS
-# upgrade request, calls ws_server_handshake(cfd, buf, n) to upgrade in
+# Design: integrates with sandhi's HTTP server (formerly lib/http_server.cyr) — an HTTP
+# handler detects a WS upgrade request, calls ws_server_handshake(cfd, buf, n) to upgrade in
 # place, then runs the read/write loop. When the loop exits, the http
 # handler returns and http_server_run closes cfd as normal.
 #
@@ -75,7 +79,9 @@ fn ws_server_state(ws): i64 { return load64(ws + 8); }
 
 # Parse req_buf as a WebSocket upgrade. On success: send 101 Switching
 # Protocols + Sec-WebSocket-Accept, return upgraded ws handle. On failure
-# (not a valid WS upgrade): return 0 — caller should respond 400.
+# (not a valid WS upgrade): return 0 — caller should respond 400. Also 0 when
+# the 101 response could not be sent in full (v6.6.8): the peer never saw the
+# upgrade, so there is no WebSocket to hand back.
 fn ws_server_handshake(cfd, req_buf, req_len): i64 {
     var upgrade = sandhi_server_find_header(req_buf, req_len, "Upgrade");
     var conn    = sandhi_server_find_header(req_buf, req_len, "Connection");
@@ -116,7 +122,8 @@ fn ws_server_handshake(cfd, req_buf, req_len): i64 {
     str_builder_add_cstr(sb, accept_b64);
     str_builder_add_cstr(sb, "\r\n\r\n");
     var resp = str_data(str_builder_build(sb));
-    sock_send(cfd, resp, strlen(resp));
+    var rlen = strlen(resp);
+    if (sock_send_all(cfd, resp, rlen) != rlen) { return 0; }
 
     return ws_server_new(cfd);
 }
@@ -196,7 +203,12 @@ fn ws_server_recv_frame(ws, payload_buf, max, opcode_out): i64 {
     return len;
 }
 
-# Send a frame. Server-to-client frames are NOT masked per RFC 6455.
+# Send a frame. Server-to-client frames are NOT masked per RFC 6455. Returns 0, or -errno when
+# the frame could not be sent in full.
+# ⚠ v6.6.8: both writes go through sock_send_all. This used to call sock_send and drop its count,
+# so a short write (SO_SNDTIMEO, a signal) sent a TRUNCATED frame and returned 0 — the peer then
+# parsed the next frame's header out of this frame's missing payload. A failed frame leaves the
+# stream desynchronised; the caller must close the connection. CHANGELOG [6.6.8]
 fn ws_server_send_frame(ws, opcode, data, len): i64 {
     var fd = ws_server_fd(ws);
     var hdr[14];
@@ -223,8 +235,12 @@ fn ws_server_send_frame(ws, opcode, data, len): i64 {
         store8(&hdr + pos + 8,  len & 0xFF);
         pos = pos + 9;
     }
-    sock_send(fd, &hdr, pos);
-    if (len > 0) { sock_send(fd, data, len); }
+    var hr = sock_send_all(fd, &hdr, pos);
+    if (hr < 0) { return hr; }
+    if (len > 0) {
+        var dr = sock_send_all(fd, data, len);
+        if (dr < 0) { return dr; }
+    }
     return 0;
 }
 

@@ -1,6 +1,11 @@
 # ws.cyr — WebSocket protocol (RFC 6455)
 # Usage: include "lib/ws.cyr"
-# Requires: net.cyr, string.cyr, alloc.cyr, base64.cyr, syscalls.cyr
+# Requires (NOT self-sufficient yet — the PENDING tier of
+# tests/gates/toolchain/stdlib_modules_self_sufficient.sh): net.cyr, string.cyr, alloc.cyr,
+# syscalls.cyr, and base64_encode from lib/bayan.cyr (base64.cyr was folded into bayan). bayan
+# is a distlib bundle that strips its own includes, so including it here does not make this
+# file compile alone; that waits on raw-includable fold bundles (roadmap, "Fold bundles that
+# are raw-includable").
 #
 # Client-side WebSocket over existing TCP connections.
 # Handles framing, masking, ping/pong, close handshake.
@@ -102,7 +107,10 @@ fn ws_connect(sock, path, host): i64 {
     var key[32];
     var req = _ws_handshake_request(path, host, &key);
     if (req == 0) { store64(ws + 8, WS_CLOSED); return ws; }   # CVE-19: no entropy → fail closed
-    sys_write(sock, req, strlen(req));
+    # v6.6.8: the whole request or nothing — a short write left the server reading half a
+    # handshake. CHANGELOG [6.6.8]
+    var qlen = strlen(req);
+    if (sock_send_all(sock, req, qlen) != qlen) { store64(ws + 8, WS_CLOSED); return ws; }
 
     # Read response (simplified — check for 101)
     var resp[512];
@@ -162,8 +170,11 @@ fn _ws_send_frame(ws, opcode, data, len): i64 {
     store8(&hdr + hlen + 3, (mask >> 24) & 0xFF);
     hlen = hlen + 4;
 
-    # Send header
-    sys_write(fd, &hdr, hlen);
+    # Send header. v6.6.8: both writes go through sock_send_all — they used to be bare
+    # sys_write calls whose counts were dropped, so a short write (SO_SNDTIMEO, a signal) sent a
+    # truncated frame and still returned `len`. A failed frame desynchronises the stream; the
+    # caller must close. CHANGELOG [6.6.8]
+    if (sock_send_all(fd, &hdr, hlen) < 0) { return 0 - 1; }
 
     # Mask and send payload
     var masked = alloc(len);
@@ -173,7 +184,7 @@ fn _ws_send_frame(ws, opcode, data, len): i64 {
         store8(masked + i, load8(data + i) ^ mb);
         i = i + 1;
     }
-    sys_write(fd, masked, len);
+    if (sock_send_all(fd, masked, len) < 0) { return 0 - 1; }
     return len;
 }
 

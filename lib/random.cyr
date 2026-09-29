@@ -9,6 +9,11 @@
 #
 # Added v5.7.35 (agnosys luks-surfaced).
 
+# 6.6.9: random_bytes calls sys_getrandom (the syscall peer), and this file included nothing, so
+# a bare include compiled with an undefined function — a ud2 stub at the first draw.
+# CHANGELOG [6.6.9]
+include "lib/syscalls.cyr"
+
 # Flags accepted by `sys_getrandom(buf, len, flags)`. Bitwise-or
 # combinable. The default (flags = 0) is "block until seeded,
 # read from the kernel CSPRNG" — what callers want 99% of the

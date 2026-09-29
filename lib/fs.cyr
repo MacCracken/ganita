@@ -8,7 +8,8 @@
 #   freestanding.
 # fs.cyr — filesystem operations
 # Usage: include "lib/fs.cyr"
-# Requires: string.cyr, alloc.cyr, str.cyr, vec.cyr, agnosys/syscalls.cyr
+# Includes its own definers (syscalls, alloc, string, str, vec) — `include "lib/fs.cyr"` alone
+# compiles clean on every target. CHANGELOG [6.6.9] bite 7.
 #
 # Path operations, directory listing, file info.
 
@@ -23,6 +24,11 @@ var DT_LNK = 10;
 # v6.1.18: Windows has no getdents64 — directory enumeration is FindFirstFileW.
 # fs_win.cyr supplies the Windows dir_list/is_dir; the getdents64 bodies below
 # are excluded on PE (#ifndef CYRIUS_TARGET_WIN). Mirrors args.cyr/process.cyr.
+include "lib/syscalls.cyr"
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/str.cyr"
+include "lib/vec.cyr"
 #ifdef CYRIUS_TARGET_WIN
 include "lib/fs_win.cyr"
 #endif
@@ -420,9 +426,16 @@ var DIR_WALK_MAX_DEPTH = 64;
 #
 # readlink is the portable test — it returns the target length (>= 0) for a symlink and
 # -EINVAL for anything else. Present on x86-linux (#89), macOS (#89), aarch64-linux (via
-# readlinkat #78) and agnos. Windows has no readlink wrapper and `fs_win.cyr` supplies
-# its own dir_list/is_dir, so the PE arm returns 0 (junction handling is a separate
-# concern tracked with the Windows fs surface).
+# readlinkat #78) and agnos.
+# ⛔ 6.6.9 — THE PE ARM RETURNED 0 FOR EVERYTHING, which failed OPEN in two places:
+# `dir_walk` descended every junction and directory symlink on Windows (the loop guard
+# above never fired there), and cyrius's own symlinked-lib write refusal
+# (`_dep_dest_is_linked`, the v6.5.37 rule) could not see a link on Windows at all. It now
+# asks the filesystem: FILE_ATTRIBUTE_REPARSE_POINT (GetFileAttributesW, which does NOT
+# follow a final link, so a dangling one answers) and then the reparse TAG
+# (FindFirstFileW's dwReserved0, WIN32_FIND_DATAW+36). Only a NAME SURROGATE counts —
+# symlink 0xA000000C, junction 0xA0000003 (tag bit 29); a OneDrive placeholder or a dedup
+# file is a reparse point that is still a file, and is not reported. CHANGELOG [6.6.9]
 # ⚠ agnos's peer is the LENGTH-CARRYING form — `sys_readlink(path, pathlen, buf, buflen)`,
 # 4 args, mirroring its `sys_open(name, namelen, flags)` ABI — while Linux/macOS take 3.
 # Caught by `folds_agnos_parity.sh`, which compiles every folded stdlib for agnos as well
@@ -431,6 +444,32 @@ var DIR_WALK_MAX_DEPTH = 64;
 # agnos ABI errors for months — this is the same class, caught the same way.
 fn is_symlink(path: Str): i64 {
     #ifdef CYRIUS_TARGET_WIN
+    # Widened HERE, bounded by str_len: a Str need not be NUL-terminated (str_sub shares its
+    # parent's bytes), so `_fs_widen`'s read-to-NUL is not safe for an arbitrary Str. Both
+    # buffers are on the STACK — dir_walk calls this for every entry, and a bump-allocated
+    # pair per call leaked ~600 B + 2x the path each time. A path past 519 characters answers
+    # 0: the PE image is not long-path-aware, so GetFileAttributesW fails past MAX_PATH anyway.
+    var pn = str_len(path);
+    var pd = str_data(path);
+    if (pn > 519) { return 0; }
+    var wp[1040];
+    var wi = 0;
+    while (wi < pn) {
+        var wc = load8(pd + wi);
+        if (wc == 0) { break; }
+        if (wc == 47) { wc = 92; }                  # '/' → '\'
+        store16(&wp + wi * 2, wc);
+        wi = wi + 1;
+    }
+    store16(&wp + wi * 2, 0);
+    var attrs = syscall(61465, &wp);                # GetFileAttributesW (no final-link follow)
+    if (attrs == 4294967295) { return 0; }          # INVALID_FILE_ATTRIBUTES
+    if ((attrs & 1024) == 0) { return 0; }          # not FILE_ATTRIBUTE_REPARSE_POINT
+    var fd[592];                                    # WIN32_FIND_DATAW
+    var h = syscall(61462, &wp, &fd);               # FindFirstFileW on the name itself
+    if (h == 0 - 1) { return 0; }
+    syscall(61464, h);                              # FindClose
+    if ((load32(&fd + 36) & 0x20000000) != 0) { return 1; }   # dwReserved0 = tag; name surrogate
     return 0;
     #endif
     #ifndef CYRIUS_TARGET_WIN

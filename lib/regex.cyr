@@ -1,9 +1,16 @@
 # regex.cyr — Thompson NFA / Pike matcher (v5.7.18) + glob helpers.
 # Usage: include "lib/regex.cyr"
-# Requires: string.cyr, alloc.cyr, str.cyr
+# Includes its own definers (6.6.9): string.cyr, alloc.cyr, str.cyr, vec.cyr.
 #
 # Glob helpers (top): glob_match, str_glob, find_all, str_replace, str_replace_all.
 # Full regex engine (below): regex_compile, regex_match, regex_search, regex_group_*.
+
+# 6.6.9: str_replace / find_all / the regex groups call string, alloc, str and vec helpers; a
+# bare include left ten of them undefined. CHANGELOG [6.6.9]
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/str.cyr"
+include "lib/vec.cyr"
 
 # Match a glob pattern against a string
 # Supports: * (zero or more chars), ? (exactly one char)

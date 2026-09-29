@@ -1,6 +1,6 @@
 # thread.cyr — thread creation, joining, and synchronization
 # Usage: include "lib/thread.cyr"
-# Requires: syscalls.cyr, alloc.cyr, mmap.cyr (PROT_*), atomic.cyr (via mutex)
+# Includes its own definers (6.6.9): syscalls.cyr, alloc.cyr, mmap.cyr (PROT_*), sync.cyr, atomic.cyr.
 #
 # Threads share the process address space (CLONE_VM).
 # Each thread gets its own stack via mmap.
@@ -22,7 +22,12 @@
 # selects the backend (Linux futex / Windows SRWLOCK / macOS spinlock / agnos
 # no-op) and include-once dedup collapses the both-included case to one definition.
 # The channel code below (and in thread_win/thread_agnos) uses these symbols;
-# sync.cyr needs alloc + atomic, which thread.cyr's Requires line already mandates.
+# sync.cyr includes its own definers (6.6.9); so does this file — the syscall peer, alloc and
+# mmap.cyr were a Requires line for the caller, and a bare include was a hard error.
+# CHANGELOG [6.6.9]
+include "lib/syscalls.cyr"
+include "lib/alloc.cyr"
+include "lib/mmap.cyr"
 include "lib/sync.cyr"
 
 # v6.0.53: Win32 has no clone/futex — the Linux thread body below (SYS_CLONE +

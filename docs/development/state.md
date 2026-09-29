@@ -2,10 +2,17 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-09-27 (1.2.7 — `pow` follows the C99 Annex F table,
-> toolchain 6.6.7).
+> Last refreshed: 2026-09-28 (1.2.8 — `pow` within 1 ulp everywhere,
+> toolchain 6.6.9).
 
 ## Version
+
+**1.2.8** — **`pow` is within 1 ulp everywhere.** Both finite paths of `ganita_f64_pow`
+were hundreds of ulp out: `exp(y·ln x)` up to 909 ulp (|y·ln x| = 667) and the 1.2.4
+squaring path for integral |y| ≤ 1024 up to 772. Every finite case now runs a port of
+fdlibm's `e_pow` core (≤ 1 ulp on both 20,000-input sweeps; representable integer
+powers exact). Toolchain **6.6.7 → 6.6.9**, `lib/` re-vendored (**111** files). No public
+signature changed. **531 assertions** (was 521).
 
 **1.2.7** — **`pow` follows the C99 Annex F table.** `ganita_f64_pow` (and the
 `f64_pow` / `ganita_f32_pow` names over it) returned NaN for every infinite base or
@@ -127,9 +134,9 @@ initial carve out of cyrius stdlib (2026-06-10, cyrius v6.1.26).
 
 ## Toolchain
 
-- **Cyrius pin**: `6.6.7` (`cyrius.cyml [package].cyrius`, since 1.2.7).
-  `cyrius version` reports `manifest-pin: 6.6.7` with no drift line —
-  `cyrius lib sync --full` re-copied all 111 files from the 6.6.7 snapshot.
+- **Cyrius pin**: `6.6.9` (`cyrius.cyml [package].cyrius`, since 1.2.8).
+  `cyrius version` reports `manifest-pin: 6.6.9` with no drift line —
+  `cyrius lib sync --full` re-copied all 111 files from the 6.6.9 snapshot.
 - **`lib/` matches the pin exactly**: 111 files, 0 differ. Verify by comparing
   the trees against `~/.cyrius/versions/<pin>/lib`, not by trusting
   `cyrius lib sync --full`'s exit code.

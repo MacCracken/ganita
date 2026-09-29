@@ -1,6 +1,6 @@
 # trait.cyr — trait system for Cyrius
 # Usage: include "lib/trait.cyr"
-# Requires: alloc.cyr, string.cyr, fnptr.cyr, vec.cyr, fmt.cyr
+# Includes its own definers (6.6.9): alloc.cyr, fnptr.cyr, fmt.cyr, str.cyr.
 #
 # Traits are implemented as vtables — heap-allocated arrays of function pointers.
 # Each type that implements a trait creates a vtable with the trait's methods.
@@ -10,6 +10,13 @@
 # `impl Trait for Type` can be added later as sugar over this pattern.
 #
 # A "trait object" is: { vtable_ptr: i64, data_ptr: i64 } = 16 bytes
+
+# 6.6.9: vtables are alloc'd and dispatched through fncall*, and the Display impls call fmt_int
+# and str_from / str_print — none of which this file included. CHANGELOG [6.6.9]
+include "lib/alloc.cyr"
+include "lib/fnptr.cyr"
+include "lib/fmt.cyr"
+include "lib/str.cyr"
 
 # ================================================================
 # Trait object (fat pointer: vtable + data)

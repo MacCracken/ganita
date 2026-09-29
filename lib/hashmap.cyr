@@ -1,6 +1,6 @@
 # hashmap.cyr — hash table, choose-your-key-type at construction
 # Usage: include "lib/hashmap.cyr"
-# Requires: alloc.cyr, string.cyr, str.cyr, fnptr.cyr (for map_iter)
+# Includes its own definers: alloc.cyr, string.cyr, str.cyr, vec.cyr, fmt.cyr, fnptr.cyr, hashseed.cyr.
 #
 # Open addressing with linear probing. Three key-type surfaces
 # coexist — pick at construction time:
@@ -54,6 +54,13 @@
 
 include "lib/fnptr.cyr"
 include "lib/hashseed.cyr"   # v6.5.39: per-process seed + finalizer (hash-flooding DoS)
+# 6.6.9: the Str-keyed surface (str_*), memset/streq/strlen, map_keys (vec_*) and map_print
+# (fmt_int) were all called, none included. CHANGELOG [6.6.9]
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/str.cyr"
+include "lib/vec.cyr"
+include "lib/fmt.cyr"
 
 # v5.8.26 — key_type symbolic constants. Replaces raw 0/1/2
 # integer literals at the 6 read/write sites in this file.

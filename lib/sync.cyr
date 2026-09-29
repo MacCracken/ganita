@@ -1,5 +1,5 @@
 # sync.cyr — portable process-internal mutex.
-# Usage: include "lib/atomic.cyr", "lib/alloc.cyr", then "lib/sync.cyr".
+# Usage: include "lib/sync.cyr" (it includes syscalls.cyr, alloc.cyr and atomic.cyr itself, 6.6.9).
 #
 # WHY THIS EXISTS (issue 2026-06-09-no-portable-mutex-stdlib.md, from patra):
 # the only stdlib mutex used to live inside lib/thread.cyr, bundled with the
@@ -33,6 +33,13 @@
 # Provides: MUTEX_SIZE, mutex_new(), mutex_lock(m), mutex_unlock(m).
 # (No trylock: Windows SRWLOCK has no routed TryAcquire, so a non-blocking
 # acquire isn't portable yet — keep the surface to what every backend supports.)
+
+# 6.6.9: the usage line used to tell the caller to include atomic.cyr and alloc.cyr first; a
+# bare include was a hard error on Linux (`undefined variable 'SYS_FUTEX'` — the syscall peer
+# was never named at all) and left alloc / atomic_* undefined everywhere. CHANGELOG [6.6.9]
+include "lib/syscalls.cyr"
+include "lib/alloc.cyr"
+include "lib/atomic.cyr"
 
 var MUTEX_SIZE = 8;
 

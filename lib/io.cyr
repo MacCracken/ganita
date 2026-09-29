@@ -247,7 +247,10 @@ fn _xdir_exists(path): i64 {
     # and nothing else can tell "already there" from "could not create".
     # ⚠ The 0xF019 reroute takes an ALREADY-WIDE path, unlike the mkdir/unlink reroutes
     # which widen inline — hence the widen loop here. ASCII-only, matching `_fs_widen`.
-    var wp = alloc(1024);
+    # A STACK buffer (v6.6.8): it was alloc(1024) stored through unchecked, so a refused
+    # allocation wrote the wide path to address 0. 511 UTF-16 units + NUL fit exactly.
+    var wbuf[1024];
+    var wp = &wbuf;
     var wi = 0;
     while (load8(path + wi) != 0) {
         if (wi >= 510) { break; }
@@ -280,9 +283,10 @@ fn _xdir_exists(path): i64 {
 # Create a symlink at `linkpath` pointing to `target`.
 #
 # AGNOS is 4-arg length-carrying (`target, targetlen, linkpath, linkpathlen`) where
-# POSIX is 2-arg — the same divergence class as xmkdir. Windows has no POSIX symlink
-# and no CreateSymbolicLinkW reroute wired, so it degrades to -1 the way xrmdir and
-# xstat already do; wire the reroute when a consumer needs it. CHANGELOG [6.5.7]
+# POSIX is 2-arg — the same divergence class as xmkdir. Windows goes through the
+# CreateSymbolicLinkW peer (reroute 0xF03E, since 6.6.9; it returned -1 before), which
+# needs Developer Mode or an elevated process — a Windows policy, reported as -1.
+# CHANGELOG [6.5.7], [6.6.9]
 fn xsymlink(target, linkpath): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     var tn = 0;
@@ -291,13 +295,8 @@ fn xsymlink(target, linkpath): i64 {
     while (load8(linkpath + ln) != 0) { ln = ln + 1; }
     return sys_symlink(target, tn, linkpath, ln);
     #endif
-    #ifdef CYRIUS_TARGET_WIN
-    return 0 - 1;   # no CreateSymbolicLinkW reroute wired
-    #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    #ifndef CYRIUS_TARGET_WIN
     return sys_symlink(target, linkpath);
-    #endif
     #endif
 }
 
@@ -728,6 +727,7 @@ fn _io_append_dec(buf, pos, val): i64 {
 fn _io_tmp_name(path): i64 {
     var plen = strlen(path);
     var buf = alloc(plen + 48);
+    if (buf == 0) { return 0; }   # v6.6.8: was memcpy'd through unchecked
     memcpy(buf, path, plen);
     memcpy(buf + plen, ".cyrtmp.", 8);
     var pos = plen + 8;
@@ -768,6 +768,7 @@ fn _io_link_join(link, target, tn): i64 {
         i = i + 1;
     }
     var out = alloc(cut + tn + 1);
+    if (out == 0) { return 0; }   # v6.6.8: was memcpy'd through unchecked
     memcpy(out, link, cut);
     memcpy(out + cut, target, tn);
     store8(out + cut + tn, 0);
@@ -777,20 +778,24 @@ fn _io_link_join(link, target, tn): i64 {
 # The path a REPLACE of `path` must write: `path` itself, or — when it is a symlink — the file
 # the chain finally names (40 hops, then -ELOOP (-40)). A negative errno or a NUL-terminated
 # path. Windows has no readlink route, so there it is always `path`. CHANGELOG [6.6.6]
+# A refused allocation is -ENOMEM (-12); all three were stored through unchecked. CHANGELOG [6.6.8]
 fn _io_replace_target(path): i64 {
     var cur = path;
     var lb = alloc(4097);
+    if (lb == 0) { return 0 - 12; }
     var hops = 0;
     while (hops < 40) {
         var n = xreadlink(cur, lb, 4096);
         if (n <= 0) { return cur; }   # not a link (or absent: it will be created)
         if (load8(lb) == 47) {
             var ab = alloc(n + 1);
+            if (ab == 0) { return 0 - 12; }
             memcpy(ab, lb, n);
             store8(ab + n, 0);
             cur = ab;
         } else {
             cur = _io_link_join(cur, lb, n);
+            if (cur == 0) { return 0 - 12; }
         }
         hops = hops + 1;
     }
@@ -809,6 +814,7 @@ fn _io_replace_target(path): i64 {
 # file_replace_atomic, which writes the file the link names. CHANGELOG [6.6.6]
 fn file_write_atomic(path, buf, len): i64 {
     var tmp = _io_tmp_name(path);
+    if (tmp == 0) { return 0 - 12; }   # -ENOMEM; `path` untouched. CHANGELOG [6.6.8]
     var fd = file_open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0x1A4);
     if (fd < 0) { return fd; }
     _io_keep_mode(fd, path);   # v6.6.6: an existing file keeps its permission bits
@@ -840,20 +846,58 @@ fn file_replace_atomic(path, buf, len): i64 {
 }
 
 # Create `path` ONLY if it does not already exist (no-clobber), returning the new
-# write fd or -EEXIST (-17). On Linux/macOS this is enforced atomically at the
-# kernel via O_CREAT|O_EXCL. AGNOS has no exclusive-create AO_* bit (its AO_* set
-# is RDONLY/WRONLY/RDWR/CREAT/TRUNC/APPEND/DIRECTORY only), so there it degrades to
-# a file_exists pre-check + plain O_CREAT — RESIDUAL: NOT atomic. v6.4.58: Windows is
-# now atomic too — EOPEN_PE maps O_CREAT|O_EXCL (mask 0xC0) → CREATE_NEW, so the open
-# itself fails with ERROR_FILE_EXISTS when the target already exists (no clobber, no
-# race). See issue 2026-07-12-windows-atomic-write-residuals.md (item A).
+# write fd or -EEXIST (-17). A name that exists AS ANYTHING refuses — a file, a
+# directory, or a symlink, INCLUDING one that dangles (POSIX O_CREAT|O_EXCL never
+# follows a final link). Atomic on every target — the kernel refuses, there is no
+# check-then-create window:
+#   · Linux/macOS: O_CREAT|O_EXCL.
+#   · Windows: CREATE_NEW + FILE_FLAG_OPEN_REPARSE_POINT (EOPEN_PE). 6.6.9 added the flag:
+#     before it CREATE_NEW RESOLVED a dangling symlink and created its target.
+#   · AGNOS: AO_CREAT|AO_EXCL (kernel 1.56.56; file_open maps O_EXCL since 6.6.4). 6.6.9
+#     replaced the non-atomic `file_exists` pre-check that stood here since 6.4.58.
+# Windows and agnos answer a refusal with a bare -1 (no -errno convention), so on those
+# the refusal is CLASSIFIED afterwards: if the name now exists (not following a link) the
+# answer is -17. That check only names the error; it cannot let a create through.
+# CHANGELOG [6.6.9]
 fn file_create_exclusive(path, mode): i64 {
-    #ifdef CYRIUS_TARGET_AGNOS
-    if (file_exists(path) == 1) { return -17; }   # -EEXIST (non-atomic residual)
-    return file_open(path, O_WRONLY | O_CREAT, mode);
+    var fd = file_open(path, O_WRONLY | O_CREAT | O_EXCL, mode);
+    #ifdef CYRIUS_TARGET_WIN
+    if (fd == 0 - 1) {
+        if (_io_name_exists(path) == 1) { return 0 - 17; }
+    }
     #endif
+    #ifdef CYRIUS_TARGET_AGNOS
+    if (fd == 0 - 1) {
+        if (_io_name_exists(path) == 1) { return 0 - 17; }
+    }
+    #endif
+    return fd;
+}
+
+# Does `path` name anything — a file, a directory or a symlink (dangling or not)? Not
+# following a final link, which is what O_EXCL's EEXIST means. Only file_create_exclusive's
+# error classification uses it, and only on the two targets whose refusal is a bare -1
+# (Windows, agnos); elsewhere it answers 0 and is never called.
+fn _io_name_exists(path): i64 {
+    #ifdef CYRIUS_TARGET_WIN
+    # GetFileAttributesW does not follow a final reparse point: a dangling link answers.
+    if (sys_access(path, 0) == 0) { return 1; }
+    return 0;
+    #endif
+    #ifdef CYRIUS_TARGET_AGNOS
+    # lstat#102 (agnos 1.56.x+): stat that does NOT follow the final link, so a dangling one
+    # answers. (readlink cannot stand in for it: agnos refuses a buffer shorter than the
+    # target instead of truncating — measured on agnos-qemu 1.57.10.)
+    var pn = 0;
+    while (load8(path + pn) != 0) { pn = pn + 1; }
+    var st[64];
+    if (sys_lstat(path, pn, &st) >= 0) { return 1; }
+    return 0;
+    #endif
+    #ifndef CYRIUS_TARGET_WIN
     #ifndef CYRIUS_TARGET_AGNOS
-    return file_open(path, O_WRONLY | O_CREAT | O_EXCL, mode);
+    return 0;   # Linux/macOS answer -EEXIST themselves; nothing classifies there
+    #endif
     #endif
 }
 
@@ -1171,7 +1215,8 @@ fn _env_load(): i64 {
     return 0;
 }
 
-# Read environment variable by name. Returns pointer to value or 0 if not found.
+# Read environment variable by name. Returns pointer to a heap copy of the value, or 0 if
+# not found (or if that copy could not be allocated — v6.6.8).
 # Reads from /proc/self/environ (null-separated KEY=VALUE pairs).
 fn getenv(name): i64 {
     # agnos has no /proc/self/environ; the kernel stages envp on the exec init
@@ -1224,6 +1269,7 @@ fn getenv(name): i64 {
                 var vlen = 0;
                 while (vstart + vlen < n && load8(buf + vstart + vlen) != 0) { vlen = vlen + 1; }
                 var result = alloc(vlen + 1);
+                if (result == 0) { return 0; }   # v6.6.8: a refused copy is a miss, not a store to 0
                 memcpy(result, buf + vstart, vlen);
                 store8(result + vlen, 0);
                 return result;

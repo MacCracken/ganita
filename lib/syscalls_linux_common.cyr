@@ -460,6 +460,113 @@ fn sys_umount2(target, flags): i64 {
     #endif
 }
 
+# ================================================================
+# Namespaces, root, capabilities, cross-process memory (v6.6.8)
+# ================================================================
+# ⛔ WHY THESE EXIST. None of these calls had a name in either Linux peer, so kavach, takumi,
+# shakti and mirshi each wrote a number — and on aarch64 every number they could write ran a
+# DIFFERENT call, silently: x86 161 (chroot) was sethostname, 272 (unshare) kcmp, 155
+# (pivot_root) getpgid, 125/126 (capget/capset) sched_get_priority_max/min; the native 51/41
+# were unreachable behind the socket compat rows. Both peers now spell the x86 numbers and
+# ESYSXLAT renumbers them (src/backend/aarch64/emit.cyr).
+# ⚠ Darwin has none of these (its chroot is not offered: no consumer needs it on macOS), so
+# each declines with -78 (Darwin ENOSYS) and the number never reaches the Mach-O emit — the
+# sys_memfd_create shape. The PE and agnos peers carry -38 stubs. CHANGELOG [6.6.8]
+
+# Move this process into new namespaces. `flags` is CLONE_NEW* (CLONE_NEWNS 0x20000,
+# CLONE_NEWUSER 0x10000000, CLONE_NEWPID 0x20000000, CLONE_NEWNET 0x40000000, ...).
+# `sys_unshare(0)` is a valid no-op that returns 0.
+fn sys_unshare(flags): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return syscall(SYS_UNSHARE, flags);
+    #endif
+}
+
+# Change the root directory to `path` (a NUL-terminated cstr). Needs CAP_SYS_CHROOT; the
+# path is resolved first, so a missing path is -ENOENT for every caller.
+fn sys_chroot(path): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return syscall(SYS_CHROOT, path);
+    #endif
+}
+
+# Make `new_root` the root mount and move the old root to `put_old`. Needs CAP_SYS_ADMIN in
+# the mount namespace's user namespace (unprivileged: -EPERM before any path is read).
+fn sys_pivot_root(new_root, put_old): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return syscall(SYS_PIVOT_ROOT, new_root, put_old);
+    #endif
+}
+
+# Read a thread's capability sets. `hdr` is struct __user_cap_header_struct {u32 version;
+# i32 pid} (version 0x20080522 = _LINUX_CAPABILITY_VERSION_3, pid 0 = self); `data` is two
+# struct __user_cap_data_struct {u32 effective, permitted, inheritable} (24 bytes), or 0 to
+# PROBE: a bad version with data 0 returns 0 and writes the kernel's preferred version into
+# hdr.version.
+fn sys_capget(hdr, data): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return syscall(SYS_CAPGET, hdr, data);
+    #endif
+}
+
+# Set the calling thread's capability sets (same `hdr` / `data` layout as sys_capget).
+fn sys_capset(hdr, data): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return syscall(SYS_CAPSET, hdr, data);
+    #endif
+}
+
+# Copy from another process's memory: `local_iov`/`remote_iov` are arrays of struct iovec
+# {void *base; u64 len}. Returns the byte count copied or -errno. `flags` must be 0.
+fn sys_process_vm_readv(pid, local_iov, liovcnt, remote_iov, riovcnt, flags): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return syscall(SYS_PROCESS_VM_READV, pid, local_iov, liovcnt, remote_iov, riovcnt, flags);
+    #endif
+}
+
+# Copy into another process's memory (same shape as sys_process_vm_readv).
+fn sys_process_vm_writev(pid, local_iov, liovcnt, remote_iov, riovcnt, flags): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return syscall(SYS_PROCESS_VM_WRITEV, pid, local_iov, liovcnt, remote_iov, riovcnt, flags);
+    #endif
+}
+
+# Create a filesystem node relative to `dirfd` (AT_FDCWD for the cwd). `mode` carries the
+# type bits: S_IFIFO 0o010000 (4096) makes a FIFO — `sys_mknodat(AT_FDCWD, p, 4096 | 0600,
+# 0)` is mkfifo(3); S_IFREG/S_IFCHR/S_IFBLK the rest (devices need CAP_MKNOD). `dev` is the
+# device number, 0 otherwise.
+# ⚠ Darwin declines (-78): no Mach-O row exists for it, and a composed arm (over mknod or
+# mkfifo) waits for a consumer that needs one there.
+fn sys_mknodat(dirfd, path, mode, dev): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return syscall(SYS_MKNODAT, dirfd, path, mode, dev);
+    #endif
+}
+
 # Flush all filesystem buffers to disk. Returns 0 (always).
 fn sys_sync(): i64 {
     syscall(SYS_SYNC);
@@ -817,6 +924,64 @@ fn sys_listen(fd, backlog): i64 {
     return syscall(SYS_LISTEN, fd, backlog);
 }
 
+# ================================================================
+# fcntl + the O_NONBLOCK toggle (v6.6.8)
+# ================================================================
+# ⛔ WHY. There was no fcntl wrapper, so every consumer that wanted a non-blocking fd wrote
+# `syscall(SYS_FCNTL, fd, 4, fl | <O_NONBLOCK>)` and re-derived the flag at the call site —
+# and the Linux value, 2048, is Darwin's O_EXCL, which F_SETFL ignores: on macOS the fd
+# stayed BLOCKING (sigil's bounded capture drain, daimon, cyim-lsp, cyrius-doom). The only
+# exported toggle was net.cyr's socket-named sock_set_nonblocking.
+# ⚠ THE FLAG IS PRIVATE AND PER-TARGET, NOT THE PUBLIC `O_NONBLOCK`. Enum constants are
+# global and the LAST definition wins retroactively, program-wide: yukti <= 2.3.12's
+# `enum EjectConst { O_NONBLOCK = 2048; }` turned every O_NONBLOCK in a macOS program into
+# O_EXCL, including code compiled before it. A wrapper built on the public name inherits
+# whatever a fold redefines it to; the literal below cannot be poisoned.
+# The command numbers are the same on Linux (x86_64 and aarch64) and Darwin.
+# CHANGELOG [6.6.8]
+enum FcntlCmd {
+    F_DUPFD = 0;
+    F_GETFD = 1;
+    F_SETFD = 2;
+    F_GETFL = 3;
+    F_SETFL = 4;
+}
+# The one F_SETFD descriptor flag.
+enum FdFlag {
+    FD_CLOEXEC = 1;
+}
+
+# fcntl(2): `cmd` is F_GETFD / F_SETFD / F_GETFL / F_SETFL / ... (Darwin adds F_GETPATH = 50).
+# Returns the command's result, or -errno.
+fn sys_fcntl(fd, cmd, arg): i64 {
+    return syscall(SYS_FCNTL, fd, cmd, arg);
+}
+
+# The O_NONBLOCK bit of THIS target (Darwin 4, Linux 2048), private so no enum can poison it.
+fn _fd_o_nonblock(): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 4;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return 2048;
+    #endif
+}
+
+# Make `fd` non-blocking. Returns the SAVED status flags (>= 0) to hand to fd_restore_flags,
+# or -errno if F_GETFL or F_SETFL failed (a failed F_SETFL is reported, never swallowed).
+fn fd_set_nonblocking(fd): i64 {
+    var fl = sys_fcntl(fd, 3, 0);                   # F_GETFL
+    if (fl < 0) { return fl; }
+    var r = sys_fcntl(fd, 4, fl | _fd_o_nonblock()); # F_SETFL
+    if (r < 0) { return r; }
+    return fl;
+}
+
+# Restore the status flags fd_set_nonblocking saved. Returns 0 or -errno.
+fn fd_restore_flags(fd, saved): i64 {
+    return sys_fcntl(fd, 4, saved);                 # F_SETFL
+}
+
 # Accept a connection on a listening socket; `flags` accepts
 # SOCK_CLOEXEC | SOCK_NONBLOCK to set them atomically.
 # v6.5.16: Darwin has NO accept4 — it is absent from the syscall table on both macOS
@@ -838,12 +1003,16 @@ fn sys_accept4(fd, srcaddr, srcaddrlen, flags): i64 {
     #ifdef CYRIUS_TARGET_MACOS
     var afd = syscall(43, fd, srcaddr, srcaddrlen);
     if (afd < 0) { return afd; }
+    # v6.6.8: through the fcntl wrappers, and a failed flag write is REPORTED — the accepted
+    # fd is closed and the error returned — rather than handing back a blocking or inheritable
+    # fd the caller asked not to get. CHANGELOG [6.6.8]
     if ((flags & 2048) != 0) {                          # Linux SOCK_NONBLOCK
-        var fl = syscall(SYS_FCNTL, afd, 3, 0);         # F_GETFL
-        syscall(SYS_FCNTL, afd, 4, fl | 4);             # F_SETFL |= Darwin O_NONBLOCK (4)
+        var nb = fd_set_nonblocking(afd);               # Darwin O_NONBLOCK (4), privately
+        if (nb < 0) { sys_close(afd); return nb; }
     }
     if ((flags & 524288) != 0) {                        # Linux SOCK_CLOEXEC
-        syscall(SYS_FCNTL, afd, 2, 1);                  # F_SETFD FD_CLOEXEC
+        var ce = sys_fcntl(afd, 2, 1);                  # F_SETFD FD_CLOEXEC
+        if (ce < 0) { sys_close(afd); return ce; }
     }
     return afd;
     #endif

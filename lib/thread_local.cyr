@@ -1,6 +1,6 @@
 # thread_local.cyr — per-thread slot storage (Thread-Local Storage)
 # Usage: include "lib/thread_local.cyr"
-# Requires: syscalls.cyr, alloc.cyr
+# Includes its own definers (6.6.9): syscalls.cyr, alloc.cyr, atomic.cyr.
 #
 # Each thread gets its own 4KB block addressed via the CPU's
 # thread-pointer register: `%fs` on x86_64, `TPIDR_EL0` on aarch64.
@@ -83,6 +83,10 @@ var TLOCAL_MAX_SLOTS = 128;
 # needs the atomics directly rather than free-riding on whatever included it (self-sufficient
 # modules — a lib file references nothing it does not include).
 include "lib/atomic.cyr"
+# 6.6.9: the slot blocks come from alloc (and alloc_init on first use); neither the allocator nor
+# the syscall peer was included. CHANGELOG [6.6.9]
+include "lib/syscalls.cyr"
+include "lib/alloc.cyr"
 
 #ifdef CYRIUS_TARGET_MACOS
 var _tlocal_macos[128];     # 128 i64 slots (top-level var[N] = N*8 bytes), zero-init .bss
@@ -250,9 +254,26 @@ fn thread_local_alloc(): i64 {
 # aarch64: msr TPIDR_EL0, tls
 # Returns 0 on success, non-zero on failure (x86 only; aarch64 never
 # fails at EL0).
+# v6.6.8: never called on macOS (thread_local_init returns before it; the slots live in a
+# process-global array there), but the x86 arm still COMPILED there, and Darwin has no
+# arch_prctl — every x86-macOS build that included this file warned "syscall 158 not routed".
+# Declined with -ENOSYS rather than guarded to nothing, so a future caller gets an error and
+# not a fall-off-the-end 0 that reads as success. CHANGELOG [6.6.8]
 fn _tlocal_install(tls): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    # cx: no thread-pointer register, and thread_local_init never gets here (see there). Declined
+    # like macOS rather than left with no arm at all, which returned whatever sat in the return
+    # register (cx_tcyr_runs.sh's empty-body axis; reachable once 6.6.9 made this file compile
+    # alone for cx). CHANGELOG [6.6.9]
+    #ifdef CYRIUS_TARGET_CX
+    return 0 - 38;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
     #ifdef CYRIUS_ARCH_X86
     return syscall(158, 0x1002, tls);
+    #endif
     #endif
     #ifdef CYRIUS_ARCH_AARCH64
     asm {
@@ -271,6 +292,9 @@ fn _tlocal_install(tls): i64 {
 fn thread_local_init(): i64 {
     #ifdef CYRIUS_TARGET_MACOS
     return 1;     # process-global _tlocal_macos is zero-init .bss; nothing to install
+    #endif
+    #ifdef CYRIUS_TARGET_CX
+    return 1;     # cx is a single-threaded VM: the process-global fallback IS its TLS (6.6.9)
     #endif
     #ifdef CYRIUS_TARGET_AGNOS
     return 1;     # process-global _tlocal_agnos is zero-init; nothing to install
@@ -299,6 +323,9 @@ fn thread_local_get(slot): i64 {
     #endif
     #ifdef CYRIUS_TARGET_AGNOS
     return load64(&_tlocal_agnos + slot * 8);
+    #endif
+    #ifdef CYRIUS_TARGET_CX
+    return load64(&_tlocal_fallback + slot * 8);   # single-threaded VM (6.6.9)
     #endif
     # Foreign host: %fs belongs to glibc — read from the process-global fallback.
     if (_tlocal_foreign == 1) { return load64(&_tlocal_fallback + slot * 8); }
@@ -331,6 +358,10 @@ fn thread_local_set(slot, val): i64 {
     #endif
     #ifdef CYRIUS_TARGET_AGNOS
     store64(&_tlocal_agnos + slot * 8, val);
+    return 0;
+    #endif
+    #ifdef CYRIUS_TARGET_CX
+    store64(&_tlocal_fallback + slot * 8, val);    # single-threaded VM (6.6.9)
     return 0;
     #endif
     # Foreign host: %fs belongs to glibc — write to the process-global fallback.

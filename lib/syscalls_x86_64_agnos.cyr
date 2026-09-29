@@ -670,6 +670,13 @@ var AGNOS_SOCK_RECV_TIMEOUT_S = 30;
 var AGNOS_SOCK_RECV_MAX_SPINS = 6000;
 var _agnos_sock_rcvto_us: i64[8];
 var _agnos_sock_sndto_us: i64[8];
+# v6.6.8: the listen slot each kernel conn_id was last ACCEPTED from (slot + 1; 0 = none), indexed
+# by conn_id 0..7. sys_sock_accept writes it and _agnos_sock_bind consumes it, so an accepted
+# socket starts with its LISTENER's recv/send timeouts — Linux copies SO_RCVTIMEO/SO_SNDTIMEO into
+# the accepted socket, and the fresh slot here used to fall back to the 30 s default instead.
+# sys_sock_connect and sys_sock_close clear the mark, so a conn_id the kernel recycles for an
+# OUTBOUND connection never inherits a listener's deadline. CHANGELOG [6.6.8]
+var _agnos_accept_from: i64[8];
 
 # ================================================================
 # Wrappers — mirror the consumer sys_* surface with agnos numbers.
@@ -725,6 +732,50 @@ fn sys_ftruncate(fd, length): i64 { return 0 - 38; }
 fn sys_truncate(path, length): i64 { return 0 - 38; }
 # Create an anonymous in-memory file. agnos has no memfd; shared memory is sys_mmap.
 fn sys_memfd_create(name, flags): i64 { return 0 - 38; }
+
+# ── v6.6.8: agnos peers for the namespace / root / capability / cross-process-memory /
+# mknodat wrappers. ⛔ Same rule as the block above — NO `SYS_*` Linux constant is minted
+# for any of them, because a Linux number here would issue whatever agnos call owns it.
+# agnos has no namespaces, chroot, pivot_root, capability sets, cross-process copy or
+# device nodes, so each is an explicit -38/-ENOSYS stub. CHANGELOG [6.6.8]
+# Enter new namespaces. agnos has no namespaces.
+fn sys_unshare(flags): i64 { return 0 - 38; }
+# Change the root directory. agnos has no chroot.
+fn sys_chroot(path): i64 { return 0 - 38; }
+# Swap the root mount. agnos has no pivot_root.
+fn sys_pivot_root(new_root, put_old): i64 { return 0 - 38; }
+# Read capability sets. agnos has no capability sets.
+fn sys_capget(hdr, data): i64 { return 0 - 38; }
+# Set capability sets. agnos has no capability sets.
+fn sys_capset(hdr, data): i64 { return 0 - 38; }
+# Read another process's memory. agnos has no cross-process copy.
+fn sys_process_vm_readv(pid, local_iov, liovcnt, remote_iov, riovcnt, flags): i64 { return 0 - 38; }
+# Write another process's memory. agnos has no cross-process copy.
+fn sys_process_vm_writev(pid, local_iov, liovcnt, remote_iov, riovcnt, flags): i64 { return 0 - 38; }
+# Create a filesystem node (FIFO / device). agnos has no device nodes or FIFOs.
+fn sys_mknodat(dirfd, path, mode, dev): i64 { return 0 - 38; }
+
+# ── v6.6.8: agnos peers for the fcntl surface. agnos has no fcntl and no per-fd status
+# flags, so all three decline with -38/-ENOSYS — NOT sock_set_nonblocking's `return 0`,
+# because a pipe drain that needs a non-blocking read must learn it cannot have one. No
+# SYS_FCNTL is minted (the block above says why). CHANGELOG [6.6.8]
+enum FcntlCmd {
+    F_DUPFD = 0;
+    F_GETFD = 1;
+    F_SETFD = 2;
+    F_GETFL = 3;
+    F_SETFL = 4;
+}
+# The one F_SETFD descriptor flag.
+enum FdFlag {
+    FD_CLOEXEC = 1;
+}
+# fcntl(2). agnos has no fcntl.
+fn sys_fcntl(fd, cmd, arg): i64 { return 0 - 38; }
+# Make an fd non-blocking. agnos has no fd status flags.
+fn fd_set_nonblocking(fd): i64 { return 0 - 38; }
+# Restore saved fd status flags. agnos has no fd status flags.
+fn fd_restore_flags(fd, saved): i64 { return 0 - 38; }
 
 # at-family constants. The Linux values, defined here so the PORTABLE surface is
 # complete: this peer is STANDALONE (it does not include syscalls_linux_common.cyr,
@@ -1706,7 +1757,12 @@ fn sys_nanosleep(req, rem): i64 {
 # Raw TCP. sock_connect(#47) does socket()+connect() in one and BLOCKS
 # ~8s; dst_ip is the kernel ip4() form (oct1<<24)|…|oct4 (net.cyr byte-
 # swaps its network-order addr before calling). conn_id 0..7, or -1.
-fn sys_sock_connect(dst_ip, dst_port, src_port): i64 { return syscall(SYS_SOCK_CONNECT, dst_ip, dst_port, src_port); }
+# v6.6.8: a conn_id it returns is OUTBOUND, so any accept mark left on that id is dropped.
+fn sys_sock_connect(dst_ip, dst_port, src_port): i64 {
+    var c = syscall(SYS_SOCK_CONNECT, dst_ip, dst_port, src_port);
+    _agnos_accept_mark(c, 0);
+    return c;
+}
 # Send `len` bytes over an ESTABLISHED conn (#48). BLOCKS only the caller (agnos 1.57.7) and
 # returns `len` once every byte is ACKed — or the COMMITTED count, possibly 0, after ~8 s with
 # no ACK progress (0 means "no progress yet", NOT an error), the committed count if the conn dies
@@ -1718,7 +1774,10 @@ fn sys_sock_send(conn_id, buf, len): i64 { return syscall(SYS_SOCK_SEND, conn_id
 # -1 = EOF / bad arg (the inverted-from-Linux sense the recv loop honors).
 fn sys_sock_recv(conn_id, buf, maxlen): i64 { return syscall(SYS_SOCK_RECV, conn_id, buf, maxlen); }
 # Close a conn (#50; FIN+ACK if established) + free its buffers. 0, or -1.
-fn sys_sock_close(conn_id): i64 { return syscall(SYS_SOCK_CLOSE, conn_id); }
+fn sys_sock_close(conn_id): i64 {
+    _agnos_accept_mark(conn_id, 0);
+    return syscall(SYS_SOCK_CLOSE, conn_id);
+}
 
 # sock_peer(conn_id) — #106, agnos 1.57.7: the REMOTE address of a conn the caller owns, packed
 # `(peer_ip << 16) | peer_port` (ip in the kernel ip4() form, port host order) — one register, so
@@ -1795,7 +1854,13 @@ var SOCK_LISTEN_LOOPBACK = 0x100000000;
 # sock_accept(listen_id): drive net_poll then tcp_accept → the next ESTABLISHED
 # conn_id 0..7 (a normal conn for #48/#49/#50), or -1 (none pending = WOULD_BLOCK
 # / bad listen_id).
-fn sys_sock_accept(listen_id): i64 { return syscall(SYS_SOCK_ACCEPT, listen_id); }
+# v6.6.8: it also marks the conn with the listen slot it came from (_agnos_accept_from), so the
+# fd _agnos_sock_bind wraps it in inherits the listener's timeouts.
+fn sys_sock_accept(listen_id): i64 {
+    var c = syscall(SYS_SOCK_ACCEPT, listen_id);
+    if (c >= 0) { _agnos_accept_mark(c, _agnos_listen_slot_of(listen_id) + 1); }
+    return c;
+}
 
 # Raw UDP (dig / DNS). #52 packs both ports into arg2 (src<<16|dst) and
 # rides `len` on a4=r10; #53 rides the optional 16-byte `addr_out` on
@@ -1925,6 +1990,7 @@ fn _agnos_conn_init(): i64 {
         store64(&_agnos_listen_ip + i * 8, 0);
         store64(&_agnos_sock_rcvto_us + i * 8, 0);
         store64(&_agnos_sock_sndto_us + i * 8, 0);
+        store64(&_agnos_accept_from + i * 8, 0);
         i = i + 1;
     }
     _agnos_conn_ready = 1;
@@ -1956,10 +2022,44 @@ fn _agnos_sock_open(): i64 {
 # Bind a kernel conn_id to a reserved socket fd (called by net.cyr's
 # agnos sock_connect after #47 returns the id). Stored as conn_id+1 so
 # the zero slot stays "free".
+# v6.6.8: a conn that sys_sock_accept marked starts with its listener's recv/send timeouts (see
+# _agnos_accept_from); the mark is consumed here, so it applies to this bind only.
 fn _agnos_sock_bind(fd, conn_id): i64 {
+    _agnos_conn_init();
     var slot = fd & 7;
     store64(&_agnos_conn_tbl + slot * 8, conn_id + 1);
+    if (conn_id < 0) { return 0; }
+    if (conn_id > 7) { return 0; }
+    var from = load64(&_agnos_accept_from + conn_id * 8);
+    store64(&_agnos_accept_from + conn_id * 8, 0);
+    if (from > 0) {
+        store64(&_agnos_sock_rcvto_us + slot * 8, load64(&_agnos_sock_rcvto_us + (from - 1) * 8));
+        store64(&_agnos_sock_sndto_us + slot * 8, load64(&_agnos_sock_sndto_us + (from - 1) * 8));
+    }
     return 0;
+}
+
+# Record `v` (a listen slot + 1, or 0 to clear) as conn `conn_id`'s accept mark. Ignores an id
+# outside the kernel's 0..7 conn table.
+fn _agnos_accept_mark(conn_id, v): i64 {
+    if (conn_id < 0) { return 0; }
+    if (conn_id > 7) { return 0; }
+    _agnos_conn_init();
+    store64(&_agnos_accept_from + conn_id * 8, v);
+    return 0;
+}
+
+# The fd slot whose LISTEN socket holds kernel listen id `lid`, or -1 (none of ours — a raw #56
+# caller's listener, whose timeouts this adapter never saw).
+fn _agnos_listen_slot_of(lid): i64 {
+    if (lid < 0) { return 0 - 1; }                     # lid + 1 would match a FREE slot's 0
+    _agnos_conn_init();
+    var i = 0;
+    while (i < 8) {
+        if (load64(&_agnos_listen_tbl + i * 8) == lid + 1) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
 }
 
 # Resolve a tagged socket fd to its kernel conn_id, or -1 if the slot is

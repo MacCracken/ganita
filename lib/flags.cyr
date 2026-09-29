@@ -1,6 +1,6 @@
 # flags.cyr — getopt-long-shaped CLI flag parser
 # Usage: include "lib/flags.cyr"
-# Requires: alloc.cyr, string.cyr, syscalls.cyr (sys_write/STDERR_FD)
+# Includes its own definers: alloc.cyr, string.cyr, syscalls.cyr (sys_write/STDERR_FD).
 #
 # A parser for PROGRAMS built on `lib/args.cyr`'s bare argc/argv
 # surface, so each one need not hand-roll a `streq("--foo", argv(i))`

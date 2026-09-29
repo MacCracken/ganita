@@ -92,7 +92,12 @@ Deliberately not in ganita, so that nobody adds them by accident:
 
 ---
 
-## Moving the cyrius pin (done at 1.2.7: 6.6.4 → 6.6.7)
+## Moving the cyrius pin (done at 1.2.7: 6.6.4 → 6.6.7; at 1.2.8: → 6.6.9)
+
+**1.2.8 moved it again, to `cyrius = "6.6.9"`**, by the same sequence (`lib/` re-vendored
+to the 111-file 6.6.9 snapshot, `dist/` regenerated). ⚠ From cyrius 6.6.10 a float
+builtin's result is a FLOAT operand of `+ - * /` (it was an integer one), so ganita's
+source keeps every builtin result out of those operators — see `_gn_pow_pos`.
 
 **Done at 1.2.7 — the pin moved straight to `cyrius = "6.6.7"`** (the sequence below,
 followed as written: `lib/` re-vendored to the 111-file 6.6.7 snapshot, `dist/`

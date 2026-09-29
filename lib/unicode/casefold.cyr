@@ -31,11 +31,17 @@
 #     locales most consumers want.
 #   * The str_*_unicode wrappers live in this file (not lib/str.cyr)
 #     so that lib/str.cyr-only consumers don't transitively pull in
-#     ~100 KB of Unicode data tables. Consumers wanting Str-level case
-#     fold include BOTH `lib/str.cyr` + this file.
+#     ~100 KB of Unicode data tables. This file includes `lib/str.cyr`
+#     itself (6.6.9), so including it alone is enough.
 
 include "lib/unicode/_decode.cyr"
 include "lib/unicode/_casefold_data.cyr"
+# 6.6.9: the str_*_unicode wrappers build Str results (str_new / str_data / str_len / alloc) and
+# this file included neither module, so a bare include left four undefined functions. str.cyr
+# is the Str layer this file sits on; the reverse edge (str.cyr -> unicode) stays absent, as
+# the note above requires. CHANGELOG [6.6.9]
+include "lib/alloc.cyr"
+include "lib/str.cyr"
 
 # ── Simple-table piece dispatchers (4 tables × N pieces each) ─────────
 # Hand-dispatched because cyrius doesn't currently support indexed-by-int

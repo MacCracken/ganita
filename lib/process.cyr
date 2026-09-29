@@ -8,7 +8,7 @@
 #   freestanding.
 # process.cyr — process management
 # Usage: include "lib/process.cyr"
-# Requires: lib/syscalls.cyr, lib/string.cyr, lib/alloc.cyr, lib/tagged.cyr
+# Includes its own definers (6.6.9): syscalls.cyr, alloc.cyr, string.cyr, result.cyr, vec.cyr, str.cyr.
 #
 # v5.10.18 — was hard-blocked on `O_WRONLY` from `lib/io.cyr` for
 # the `/dev/null` redirect in `run_capture`; cyrius's own
@@ -19,6 +19,17 @@
 # literal `1` + a comment to keep this module self-sufficient
 # (matching the pattern in `lib/fdlopen.cyr:234` —
 # `# O_RDONLY`).
+
+# 6.6.9: the rest of that job. Every arm — POSIX, process_win and process_agnos — calls the
+# syscall peer, alloc, strlen, Ok/Err, vec_* and str_data, and this file included none of them,
+# so a bare include was a hard error on Linux (`undefined variable 'SYS_GETPPID'`) and agnos
+# (`SPAWN_ARGV_MAX`) and ~25 undefined functions elsewhere. CHANGELOG [6.6.9]
+include "lib/syscalls.cyr"
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/result.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
 
 # v6.0.51: Win32 has no fork/exec — the Windows process surface lives in a
 # CreateProcessW-based variant. The POSIX implementations below are guarded
@@ -88,6 +99,17 @@ var PROC_ETIMEDOUT = 110;
 # CHANGELOG [6.6.7]
 var PROC_ECHILD = 10;
 
+# ⛔ 6.6.8 — A DEADLINE KILL IS COUNTED WHERE IT HAPPENS. The byte-count capturing verbs
+# (`exec_capture`, `exec_capture_str`, `run_capture`) cannot carry a status, so a child ended
+# at the deadline looked exactly like one that printed less. This count lets an embedder ask
+# "did a deadline fire?" around any call without changing a single return contract (sigil's
+# cryptsetup and deps' git use this module). It counts every child `_proc_wait_deadline`
+# ended AND every capture the idle deadline cut short. CHANGELOG [6.6.8]
+var _proc_deadline_kills = 0;
+
+# How many children this process has ended at a deadline, ever (see above).
+fn proc_deadline_kills(): i64 { return _proc_deadline_kills; }
+
 # Bound every child this module WAITS for to `ms` milliseconds; 0 = wait for ever (the
 # default, and the pre-6.6.6 behaviour). Returns the previous value, so a caller can set a
 # short bound around one call and put the old one back. POSIX only: process_win.cyr /
@@ -118,8 +140,178 @@ fn _proc_child_guard(ppid_before): i64 {
     return 0;
 }
 
+# ⛔ 6.6.8 — A DEADLINE ENDS THE CHILD'S WHOLE TREE, AND ASKS FIRST. The kill below signalled
+# `pid` alone, with SIGKILL: PR_SET_PDEATHSIG is cleared on fork, so a `/bin/sh -c` child's
+# own children (the check driver's OVMF boot runs qemu that way) were reparented to init and
+# kept running, and SIGKILL runs no cleanup, so the shell's `trap 'rm -rf …' EXIT` never
+# removed its 64 MB disk image from RAM-backed /tmp. Now: snapshot the descendants (Linux:
+# /proc/<pid>/task/*/children), SIGTERM the child, then ONE SIGTERM to each descendant it left
+# once it has gone, all within `_PROC_GRACE_MS`, then SIGKILL what is left. Off Linux the
+# child alone is signalled, still TERM first.
+# The twin of lib/regression.cyr's `_regression_kill_tree`. CHANGELOG [6.6.8]
+var _PROC_GRACE_MS = 5000;
+var _proc_tree = 0;      # i64[4096] snapshot, then a 4 KiB dirent buffer, then 64 KiB of text
+var _PROC_TREE_CAP = 4096;
+
+#ifdef CYRIUS_TARGET_LINUX
+# Append `v` (>= 0) in decimal at `p`; returns the byte after it.
+fn _proc_put_dec(p, v): i64 {
+    var t[24];
+    var n = 0;
+    if (v == 0) { store8(&t, 48); n = 1; }
+    while (v > 0) { store8(&t + n, 48 + v % 10); v = v / 10; n = n + 1; }
+    var i = 0;
+    while (i < n) { store8(p + i, load8(&t + n - 1 - i)); i = i + 1; }
+    return p + n;
+}
+
+fn _proc_put_str(p, s): i64 {
+    var i = 0;
+    while (load8(s + i) != 0) { store8(p + i, load8(s + i)); i = i + 1; }
+    return p + i;
+}
+
+# Append the children of thread `tid` of `pid` (tid 0: of every thread) from index `n`.
+fn _proc_tree_add(pid, tid, n): i64 {
+    var path[80];
+    var e = _proc_put_dec(_proc_put_str(&path, "/proc/"), pid);
+    e = _proc_put_str(e, "/task");
+    if (tid > 0) { e = _proc_put_str(_proc_put_dec(_proc_put_str(e, "/"), tid), "/children"); }
+    store8(e, 0);
+    var fd = sys_open(&path, 0, 0);
+    if (fd < 0) { return n; }
+    if (tid == 0) {
+        var db = _proc_tree + _PROC_TREE_CAP * 8;
+        var got = sys_getdents64(fd, db, 4096);
+        while (got > 0) {
+            var off = 0;
+            while (off < got) {
+                var nm = db + off + 19;
+                var t = 0;
+                var j = 0;
+                while (load8(nm + j) >= 48 && load8(nm + j) <= 57) { t = t * 10 + load8(nm + j) - 48; j = j + 1; }
+                if (j > 0 && load8(nm + j) == 0) { n = _proc_tree_add(pid, t, n); }
+                off = off + load16(db + off + 16);
+            }
+            got = sys_getdents64(fd, db, 4096);
+        }
+        sys_close(fd);
+        return n;
+    }
+    var cb = _proc_tree + _PROC_TREE_CAP * 8 + 4096;
+    var len = sys_read(fd, cb, 65535);
+    sys_close(fd);
+    var i = 0;
+    var v = 0 - 1;
+    while (i <= len) {
+        var c = 32;
+        if (i < len) { c = load8(cb + i); }
+        if (c >= 48 && c <= 57) { if (v < 0) { v = 0; } v = v * 10 + c - 48; }
+        else {
+            if (v >= 0 && n < _PROC_TREE_CAP) { store64(_proc_tree + n * 8, v); n = n + 1; }
+            v = 0 - 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+#endif
+
+# Snapshot every descendant of `root` into `_proc_tree`, breadth-first; returns how many
+# (0 off Linux — nothing to walk).
+fn _proc_tree_collect(root): i64 {
+    #ifdef CYRIUS_TARGET_LINUX
+    if (_proc_tree == 0) { _proc_tree = alloc(_PROC_TREE_CAP * 8 + 4096 + 65536); }
+    var n = _proc_tree_add(root, 0, 0);
+    var i = 0;
+    while (i < n) { n = _proc_tree_add(load64(_proc_tree + i * 8), 0, n); i = i + 1; }
+    return n;
+    #endif
+    #ifndef CYRIUS_TARGET_LINUX
+    return 0;
+    #endif
+}
+
+# 1 when `p` is a ZOMBIE: `kill(p, 0)` succeeds on one, so a process that honoured its
+# SIGTERM but was adopted by an ANCESTOR subreaper read "alive" and the grace period was waited
+# out in full. The twin of lib/regression.cyr's `_regression_proc_zombie`. Linux only.
+# CHANGELOG [6.6.8]
+fn _proc_zombie(p): i64 {
+    #ifdef CYRIUS_TARGET_LINUX
+    var path[48];
+    var e = _proc_put_str(_proc_put_dec(_proc_put_str(&path, "/proc/"), p), "/stat");
+    store8(e, 0);
+    var b[512];
+    var fd = sys_open(&path, 0, 0);
+    if (fd < 0) { return 0; }
+    var n = sys_read(fd, &b, 511);
+    sys_close(fd);
+    var i = n - 1;
+    while (i > 0 && load8(&b + i) != 41) { i = i - 1; }   # the LAST ')' ends comm
+    if (i <= 0 || i + 2 >= n) { return 0; }
+    var st = load8(&b + i + 2);
+    if (st == 90 || st == 88) { return 1; }                # 'Z' / 'X'
+    #endif
+    return 0;
+}
+
+# Walk the first `n` snapshot entries: reap each that is OUR zombie, blank each that is gone
+# (so a later SIGKILL cannot reach a recycled pid), and with `sig` == 15 give each live one
+# that has not had it yet its ONE SIGTERM (stored negated once sent); `sig` == 9 SIGKILLs every
+# listed entry. Returns how many are still alive.
+fn _proc_tree_sweep(n, sig): i64 {
+    var st[8];
+    var live = 0;
+    var i = 0;
+    while (i < n) {
+        var e = load64(_proc_tree + i * 8);
+        var p = e;
+        if (p < 0) { p = 0 - p; }
+        if (p > 0) {
+            if (sig == 9) { sys_kill(p, 9); }
+            sys_waitpid(p, &st, 1);
+            if (sys_kill(p, 0) == 0 && _proc_zombie(p) == 0) {
+                live = live + 1;
+                if (sig == 15 && e > 0) { sys_kill(p, 15); store64(_proc_tree + i * 8, 0 - p); }
+            } else {
+                store64(_proc_tree + i * 8, 0);
+            }
+        }
+        i = i + 1;
+    }
+    return live;
+}
+
+# SIGTERM `pid`; once it has gone, ONE SIGTERM to each descendant it left (a second TERM kills
+# a shell mid-EXIT-trap — see lib/regression.cyr's twin); all within `_PROC_GRACE_MS`; then
+# SIGKILL the stragglers and reap `pid` into `stbuf`.
+fn _proc_kill_tree(pid, stbuf): i64 {
+    var n = _proc_tree_collect(pid);
+    sys_kill(pid, 15);
+    var got = 0;
+    var waited = 0;
+    var go = 1;
+    while (go == 1) {
+        if (got == 0) {
+            var w = sys_waitpid(pid, stbuf, 1);
+            if (w == pid) { got = 1; }
+            if (w < 0) { got = 2; }
+        }
+        if (got != 0) { if (_proc_tree_sweep(n, 15) == 0) { go = 0; } }
+        if (go == 1) {
+            if (waited >= _PROC_GRACE_MS) { go = 0; }
+            else { syscall(7, 0, 0, 10); waited = waited + 10; }
+        }
+    }
+    _proc_tree_sweep(n, 9);
+    if (got == 0) { sys_kill(pid, 9); sys_waitpid(pid, stbuf, 0); }
+    _proc_tree_sweep(n, 0);
+    return 0;
+}
+
 # Wait for `pid`, but not for ever. Returns 1 if the child was reaped normally (`stbuf` holds
-# its status), 0 if the deadline forced a SIGKILL, and -1 if waitpid failed before either —
+# its status), 0 if the deadline fired (the child's whole tree was then ended by
+# `_proc_kill_tree`: TERM, grace, KILL — 6.6.8), and -1 if waitpid failed before either —
 # then `stbuf` was NEVER WRITTEN and must not be decoded. That is not hypothetical: a caller
 # that inherited SIGCHLD = SIG_IGN (it survives execve) has its children auto-reaped by the
 # kernel, so waitpid blocks until they exit and then fails ECHILD; decoding the untouched
@@ -142,14 +334,16 @@ fn _proc_wait_deadline(pid, stbuf, timeout_ms): i64 {
     while (waited < timeout_ms) {
         var w = sys_waitpid(pid, stbuf, 1);
         if (w == pid) { return 1; }
-        if (w < 0) { sys_kill(pid, 9); sys_waitpid(pid, stbuf, 0); return 0 - 1; }
+        if (w < 0) { _proc_kill_tree(pid, stbuf); return 0 - 1; }
         syscall(7, 0, 0, slice);
         waited = waited + slice;
         if (waited >= 50) { slice = 10; }
         if (waited >= 2000) { slice = 50; }
     }
-    sys_kill(pid, 9);          # the deadline fired and WE killed it: 0 is the truth even
-    sys_waitpid(pid, stbuf, 0); # if an auto-reap leaves this reap nothing to collect
+    _proc_deadline_kills = _proc_deadline_kills + 1;
+    # The deadline fired and WE ended it (6.6.8: its whole tree, TERM -> grace -> KILL): 0 is
+    # the truth even if an auto-reap leaves nothing to collect.
+    _proc_kill_tree(pid, stbuf);
     return 0;
 }
 
@@ -170,8 +364,9 @@ fn _proc_poll_in(fd, timeout_ms): i64 {
 # break `cbt/deps.cyr`'s git and sigil's cryptsetup; a child that produces nothing and does
 # not exit is the hang this exists to stop. The total is bounded regardless because the loop
 # also stops at `buflen`. `timeout_ms <= 0` is the historical unbounded drain.
-# Set by `_proc_read_pipe`: 1 when it stopped because the idle deadline expired (or poll
-# failed), 0 when it reached EOF or filled the buffer. After a cut the child is abandoned
+# Set by `_proc_read_pipe`: 1 when it stopped because the idle deadline expired, 2 when poll
+# failed (6.6.8: EINTR is retried, and an error is no longer reported as the deadline), 0 when
+# it reached EOF or filled the buffer. After a cut the child is abandoned
 # mid-output — it is then killed at the wait deadline, or dies of SIGPIPE on its next write,
 # and either way the capture is incomplete. `exec_capture_status` reports that as the
 # deadline (-2), not as the SIGPIPE "crash" the reader itself caused. CHANGELOG [6.6.7]
@@ -183,9 +378,14 @@ fn _proc_read_pipe(fd, buf, buflen, timeout_ms): i64 {
     _proc_read_cut = 0;
     while (rgo == 1) {
         if (timeout_ms > 0) {
-            # <= 0 covers BOTH the timeout and a poll error (EINTR included): in either case
-            # we stop reading, and the caller's bounded wait deals with the child.
-            if (_proc_poll_in(fd, timeout_ms) <= 0) { rgo = 0; _proc_read_cut = 1; }
+            # 0 = the idle deadline expired: a CUT (reported as the deadline). A poll ERROR is
+            # not a deadline — 6.6.8: EINTR is retried (a signal handler in the embedder must
+            # not read as "the tool hung"), and any other error stops the read as a failure
+            # (`_proc_read_cut` = 2, reported as -1), not as a timeout it was not.
+            var pr = _proc_poll_in(fd, timeout_ms);
+            while (pr == 0 - 4) { pr = _proc_poll_in(fd, timeout_ms); }
+            if (pr == 0) { rgo = 0; _proc_read_cut = 1; }
+            if (pr < 0) { rgo = 0; _proc_read_cut = 2; }
         }
         if (rgo == 1) {
             var n = sys_read(fd, buf + total, buflen - total);
@@ -260,9 +460,11 @@ fn run_capture(cmd, arg1, arg2, buf, buflen): Result {
     }
     sys_close(write_fd);
     var total = _proc_read_pipe(read_fd, buf, buflen, proc_timeout_ms());
+    var cut = _proc_read_cut;
     sys_close(read_fd);
     var status_buf[4];
-    _proc_wait_deadline(pid, &status_buf, proc_timeout_ms());
+    var reaped = _proc_wait_deadline(pid, &status_buf, proc_timeout_ms());
+    if (cut == 1 && reaped == 1) { _proc_deadline_kills = _proc_deadline_kills + 1; }
     return Ok(total);
 }
 
@@ -445,8 +647,12 @@ fn exec_capture_status(args, buf, buflen, status_out): i64 {
     store32(&stbuf, 0 - 1);   # never a stale stack word, even if a path below forgets
     var reaped = _proc_wait_deadline(pid, &stbuf, proc_timeout_ms());
     # The reader gave up at the deadline: report THAT — unless waitpid never saw the child,
-    # which is "unknown" (-1), never a guessed -2.
-    if (cut == 1) { if (reaped == 1) { reaped = 0; } }
+    # which is "unknown" (-1), never a guessed -2. A poll error (cut 2) is a failure to read
+    # the child's output, reported as -1, never as the deadline. CHANGELOG [6.6.8]
+    if (cut == 1) {
+        if (reaped == 1) { reaped = 0; _proc_deadline_kills = _proc_deadline_kills + 1; }
+    }
+    if (cut == 2) { if (reaped == 1) { reaped = 0 - 1; } }
     _proc_store_status(status_out, reaped, load32(&stbuf));
     return total;
 }
@@ -587,9 +793,11 @@ fn exec_capture_str(args, buf, buflen): i64 {
     }
     sys_close(wfd);
     var total = _proc_read_pipe(rfd, buf, buflen, proc_timeout_ms());
+    var cut = _proc_read_cut;
     sys_close(rfd);
     var stbuf[4];
-    _proc_wait_deadline(pid, &stbuf, proc_timeout_ms());
+    var reaped = _proc_wait_deadline(pid, &stbuf, proc_timeout_ms());
+    if (cut == 1 && reaped == 1) { _proc_deadline_kills = _proc_deadline_kills + 1; }
     return total;
 }
 
