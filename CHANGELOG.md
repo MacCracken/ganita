@@ -50,6 +50,18 @@ every toolchain.
   (111 files, `diff -rq` clean against the 6.6.9 snapshot); `dist/` regenerated with
   `cyrius distlib --all` (`--check` current, `consumer-check.sh` clean).
 
+### Tests — every back-compat alias is exercised (CI coverage floor)
+
+- cyrius 6.6.8's `cyrius coverage` counts a REFERENCE, not a substring, and every `_compat` alias name
+  is a substring of the canonical it forwards to — so the old counter credited all 54 aliases while
+  this suite called five. Under the 6.6.9 pin the real figure was **60%** against CI's **94%** floor,
+  and CI went red. The floor was not lowered: a new group checks every alias against its `ganita_*`
+  twin on the same inputs (which also pins that each forwards to the right function), and a second
+  covers the five canonicals no row called (`ganita_mat_scale` / `_dot` / `_print`,
+  `ganita_f64_asin` / `_atan2`). Suite **589/0** (was 531). Coverage **98%** (139/141; the two
+  unreferenced are `main` entry points); the word-boundary count **88%**. Both CI floors were
+  RAISED to the measured values (94 -> 98, 58 -> 88). No `src/` or `dist/` change.
+
 ## [1.2.7] — 2026-09-27 — `pow` follows the C99 Annex F table
 
 Toolchain **6.6.4 → 6.6.7** (the vendored `lib/` is the full 6.6.7 snapshot). No

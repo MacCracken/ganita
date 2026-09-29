@@ -172,21 +172,22 @@ jobs:
       # A floor that ratchets, not a target. Raise it whenever real coverage
       # lands; never lower it to make a red build green.
       #
-      # ⚠ `cyrius coverage` credits a function whose name appears as a raw
-      # SUBSTRING anywhere in the scanned text, COMMENTS INCLUDED. Every
-      # _compat alias name is a substring of the canonical name it forwards to,
-      # and appending one comment line naming an uncalled function moved this
-      # figure from 80% to 82% at 1.2.2 (see docs/audit/2026-09-07-v1.2.3-audit.md).
-      # It is kept as a ratchet because it sees things a regex does not — but it
-      # is NOT the only gate, because it is a number a comment can move.
+      # Since cyrius 6.6.8 `cyrius coverage` counts REFERENCES — whole identifiers
+      # outside comments and strings — not substrings. Under the old counter every
+      # _compat alias was credited because its name is a substring of the canonical
+      # it forwards to (and one comment line naming an uncalled function moved the
+      # figure 80% -> 82% at 1.2.2; docs/audit/2026-09-07-v1.2.3-audit.md). The 6.6.9
+      # pin measured the truth at 60%; 1.2.8's alias rows made it 98%, so the floor
+      # was RAISED 94 -> 98, never lowered. The word-boundary script below stays as
+      # the independent second count.
       - name: Reference coverage floor (tool)
-        run: cyrius coverage --min 94
+        run: cyrius coverage --min 98
 
       # The same floor counted on word boundaries with comments stripped. This
       # is the number to plan against; the tool's is the number to ratchet.
       # Both must pass. Raise this whenever real coverage lands.
       - name: Reference coverage floor (word-boundary)
-        run: ./scripts/coverage-honest.sh 58
+        run: ./scripts/coverage-honest.sh 88
 
       # --- Distribution: ganita's actual product is dist/, not build/ ---------
 
