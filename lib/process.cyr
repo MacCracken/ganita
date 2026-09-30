@@ -136,15 +136,19 @@ fn proc_timeout_ms(): i64 {
 # prctl is not a Darwin/BSD syscall and is not routed on PE. The getppid re-check closes the
 # race where the parent died between the fork and the prctl: the death signal was then
 # delivered to nobody and will never fire, so the child exits itself.
-# macOS (6.6.10): when a deadline is in force the child also calls setsid(), so it leads its
-# own process group and `proc_kill_tree` can end that GROUP — macOS has no /proc to walk for
-# descendants. Only with a deadline: a session of its own detaches the child from the terminal
-# (no Ctrl-C, no /dev/tty), which an unbounded call — `git` prompting for credentials through
-# cbt/deps.cyr — must keep. CHANGELOG [6.6.10]
+# When a deadline is in force the child also calls setsid(), so it leads its own process group
+# and a deadline can end that GROUP: macOS (6.6.10) because it has no /proc to walk for
+# descendants; Linux (6.6.11) for the one case the /proc walk cannot reach — a child that exited
+# while a grandchild it started still holds the capture pipe (`_proc_end_cut_group`): by then the
+# child is reaped and its orphans reparented, so they are nobody's descendants. Only with a
+# deadline: a session of its own detaches the child from the terminal (no Ctrl-C, no /dev/tty),
+# which an unbounded call — `git` prompting for credentials through cbt/deps.cyr — must keep.
+# PR_SET_PDEATHSIG still ends a Linux child when its parent dies. CHANGELOG [6.6.10] [6.6.11]
 fn _proc_child_guard(ppid_before): i64 {
     #ifdef CYRIUS_TARGET_LINUX
     sys_prctl(1, 9, 0, 0, 0);
     if (syscall(SYS_GETPPID) != ppid_before) { sys_exit(1); }
+    if (_PROC_DEADLINE_MS > 0) { sys_setsid(); }
     #endif
     #ifdef CYRIUS_TARGET_MACOS
     if (_PROC_DEADLINE_MS > 0) { sys_setsid(); }
@@ -278,16 +282,17 @@ fn _proc_zombie(p): i64 {
     return 0;
 }
 
-# Walk the first `n` snapshot entries: reap each that is OUR zombie, blank each that is gone
-# (so a later SIGKILL cannot reach a recycled pid), and with `sig` == 15 give each live one
-# that has not had it yet its ONE SIGTERM (stored negated once sent); `sig` == 9 SIGKILLs every
-# listed entry. Returns how many are still alive.
-fn _proc_tree_sweep(n, sig): i64 {
+# Walk the first `n` entries of the snapshot at `snap`: reap each that is OUR zombie, blank each
+# that is gone (so a later SIGKILL cannot reach a recycled pid), and with `sig` == 15 give each
+# live one that has not had it yet its ONE SIGTERM (stored negated once sent); `sig` == 9 SIGKILLs
+# every listed entry. Returns how many are still alive. `snap` is `_proc_tree`, or a copy a
+# caller keeps for a kill that outlives the next snapshot (lib/async.cyr's kill task, 6.6.11).
+fn _proc_snap_sweep(snap, n, sig): i64 {
     var st[8];
     var live = 0;
     var i = 0;
     while (i < n) {
-        var e = load64(_proc_tree + i * 8);
+        var e = load64(snap + i * 8);
         var p = e;
         if (p < 0) { p = 0 - p; }
         if (p > 0) {
@@ -295,13 +300,19 @@ fn _proc_tree_sweep(n, sig): i64 {
             sys_waitpid(p, &st, 1);
             if (sys_kill(p, 0) == 0 && _proc_zombie(p) == 0) {
                 live = live + 1;
-                if (sig == 15 && e > 0) { sys_kill(p, 15); store64(_proc_tree + i * 8, 0 - p); }
+                if (sig == 15 && e > 0) { sys_kill(p, 15); store64(snap + i * 8, 0 - p); }
             } else {
-                store64(_proc_tree + i * 8, 0);
+                store64(snap + i * 8, 0);
             }
         }
         i = i + 1;
     }
+    return live;
+}
+
+# `_proc_snap_sweep` over the module's own snapshot, `_proc_tree`.
+fn _proc_tree_sweep(n, sig): i64 {
+    var live = _proc_snap_sweep(_proc_tree, n, sig);
     return live;
 }
 
@@ -338,47 +349,115 @@ fn proc_kill_tree(pid, stbuf): i64 {
 # exists, so while ours lives the probe cannot reach a stranger's group. This relies on
 # sys_kill passing Darwin's third `posix` argument as 0: with a stale register an all-zombie
 # group answered EPERM instead of ESRCH, and the wait below ran out its whole grace
-# (lib/syscalls_linux_common.cyr, CHANGELOG [6.6.10]).
+# (lib/syscalls_linux_common.cyr, CHANGELOG [6.6.10]). Compiled on Linux too: a child that
+# called setsid() under a deadline leads a group there as well (`_proc_end_cut_group`).
 fn _proc_kill_group(pid, stbuf): i64 {
+    var g = _proc_kill_run(pid, stbuf, 1);
+    return g;
+}
+
+# ── A kill in three steps (6.6.11) ──────
+# `_proc_kill_begin` sends the TERM, `_proc_kill_step` is ONE non-blocking look (called every
+# 10 ms until it answers 1 or `_PROC_GRACE_MS` has passed) and `_proc_kill_finish` KILLs what is
+# left and reaps. `_proc_kill_run` is the blocking loop over them behind `proc_kill_tree`; the
+# async reactors drive the same three from a task, so their other tasks keep running during the
+# grace instead of stalling behind a 10 ms sleep loop (lib/async.cyr, lib/async_macos.cyr).
+# A kill state is 40 bytes: { pid@0, tgt@8, got@16, n@24, snap@32 }.
+#   tgt   what the TERM and the KILL go to: `pid`, or `-pid` when `grp` asked for its process
+#         group and one exists.
+#   got   0 until `pid` is reaped; 1 reaped into the caller's status buffer; 2 waitpid failed.
+#   n, snap   the /proc descendant snapshot (Linux, `grp` 0): `n` entries at `snap` — which is
+#         `_proc_tree`; a caller whose kill outlives the next snapshot copies it and repoints.
+var _PROC_KILL_STATE = 40;
+
+# Begin ending `pid`: with `grp` 1 target its process group when it leads one, else snapshot its
+# descendants; then TERM the target. Fills the kill state `ks`. Returns 0.
+fn _proc_kill_begin(ks, pid, grp): i64 {
+    store64(ks, pid);
+    store64(ks + 16, 0);
+    store64(ks + 24, 0);
+    store64(ks + 32, 0);
     var tgt = pid;
-    if (sys_kill(0 - pid, 0) == 0) { tgt = 0 - pid; }
+    if (grp == 1) {
+        if (sys_kill(0 - pid, 0) == 0) { tgt = 0 - pid; }
+    } else {
+        store64(ks + 24, _proc_tree_collect(pid));
+        store64(ks + 32, _proc_tree);
+    }
+    store64(ks + 8, tgt);
     sys_kill(tgt, 15);
-    var got = 0;
-    var waited = 0;
+    return 0;
+}
+
+# One non-blocking look at a kill in progress: reap `pid` if it has gone, and once it has, give
+# each descendant it left its ONE TERM (a second TERM kills a shell mid-EXIT-trap). Returns 1 when
+# nothing is left to wait for — `pid` reaped and its group, or every snapshot entry, gone — else 0.
+fn _proc_kill_step(ks, stbuf): i64 {
+    var pid = load64(ks);
+    if (load64(ks + 16) == 0) {
+        var w = sys_waitpid(pid, stbuf, 1);
+        if (w == pid) { store64(ks + 16, 1); }
+        if (w < 0) { store64(ks + 16, 2); }
+    }
+    if (load64(ks + 16) == 0) { return 0; }
+    var tgt = load64(ks + 8);
+    if (tgt != pid) {
+        if (sys_kill(tgt, 0) != 0) { return 1; }
+        return 0;
+    }
+    if (_proc_snap_sweep(load64(ks + 32), load64(ks + 24), 15) == 0) { return 1; }
+    return 0;
+}
+
+# Finish a kill: KILL every snapshot entry and the group still listed, and if `pid` itself has not
+# been reaped, KILL and reap it into `stbuf`. Returns 0. The caller must not waitpid `pid` again.
+fn _proc_kill_finish(ks, stbuf): i64 {
+    var pid = load64(ks);
+    var tgt = load64(ks + 8);
+    var snap = load64(ks + 32);
+    var n = load64(ks + 24);
+    _proc_snap_sweep(snap, n, 9);
+    if (tgt != pid) { sys_kill(tgt, 9); }
+    if (load64(ks + 16) == 0) { sys_kill(pid, 9); sys_waitpid(pid, stbuf, 0); }
+    _proc_snap_sweep(snap, n, 0);
+    return 0;
+}
+
+# The rest of a begun kill, blocking: look every 10 ms until nothing is left or `_PROC_GRACE_MS`
+# has passed (`waited` of it already has), then finish. Returns 0.
+fn _proc_kill_wait(ks, stbuf, waited): i64 {
     var go = 1;
     while (go == 1) {
-        if (got == 0) {
-            var w = sys_waitpid(pid, stbuf, 1);
-            if (w == pid) { got = 1; }
-            if (w < 0) { got = 2; }
-        }
-        if (got != 0) {
-            if (tgt == pid) { go = 0; }
-            else { if (sys_kill(tgt, 0) != 0) { go = 0; } }
-        }
-        if (go == 1) {
-            if (waited >= _PROC_GRACE_MS) { go = 0; }
-            else { syscall(7, 0, 0, 10); waited = waited + 10; }
-        }
+        if (_proc_kill_step(ks, stbuf) == 1) { go = 0; }
+        elif (waited >= _PROC_GRACE_MS) { go = 0; }
+        else { syscall(7, 0, 0, 10); waited = waited + 10; }
     }
-    if (tgt != pid) { sys_kill(tgt, 9); }
-    if (got == 0) { sys_kill(pid, 9); sys_waitpid(pid, stbuf, 0); }
+    _proc_kill_finish(ks, stbuf);
+    return 0;
+}
+
+# The blocking kill: begin, then `_proc_kill_wait`. `grp` 1 ends `pid`'s process group (macOS's
+# `proc_kill_tree`, and `_proc_end_cut_group`), 0 its /proc tree.
+fn _proc_kill_run(pid, stbuf, grp): i64 {
+    var ks[40];
+    _proc_kill_begin(&ks, pid, grp);
+    _proc_kill_wait(&ks, stbuf, 0);
     return 0;
 }
 
 # A capture the deadline cut short (`_proc_read_cut` == 1) whose child had ALREADY exited on its
 # own: the drain was held open by something the child left running (a `cmd & echo` grandchild on
-# the pipe), and the verb reports the deadline. On macOS end what is left of the child's process
-# group — the child called setsid() because a deadline was set, and POSIX does not reuse a pid
-# while a group of that id exists, so the probe cannot reach a stranger's group (the same shape
-# as cbt's `_run_end_leftovers`). Linux has no group here and no adoption window in a LIBRARY
-# verb (that changes who reaps the caller's orphans), so the leftover is only cut off from the
-# pipe there. Returns 0. CHANGELOG [6.6.10]
+# the pipe), and the verb reports the deadline. End what is left of the child's process group —
+# the child called setsid() because a deadline was set, and POSIX does not reuse a pid while a
+# group of that id exists, so the probe cannot reach a stranger's group (the same shape as cbt's
+# `_run_end_leftovers`). Every POSIX host: `_proc_kill_group` directly, never `proc_kill_tree`,
+# whose Linux arm walks /proc from a pid that is already reaped. Returns 0.
+# ⛔ 6.6.11 — this was macOS-only: Linux had no group here, so the verb returned -2 with the
+# grandchild still running at PPID 1 (measured: `sleep 9 & echo hi` under a 300 ms deadline).
+# CHANGELOG [6.6.10] [6.6.11]
 fn _proc_end_cut_group(pid): i64 {
-    #ifdef CYRIUS_TARGET_MACOS
     var st[8];
-    if (sys_kill(0 - pid, 0) == 0) { proc_kill_tree(pid, &st); }
-    #endif
+    if (sys_kill(0 - pid, 0) == 0) { _proc_kill_group(pid, &st); }
     return 0;
 }
 
@@ -387,28 +466,8 @@ fn _proc_end_cut_group(pid): i64 {
 # SIGKILL the stragglers and reap `pid` into `stbuf`. The /proc walk behind `proc_kill_tree`
 # (off Linux the snapshot is empty and `pid` alone is signalled).
 fn _proc_kill_tree(pid, stbuf): i64 {
-    var n = _proc_tree_collect(pid);
-
-    sys_kill(pid, 15);
-    var got = 0;
-    var waited = 0;
-    var go = 1;
-    while (go == 1) {
-        if (got == 0) {
-            var w = sys_waitpid(pid, stbuf, 1);
-            if (w == pid) { got = 1; }
-            if (w < 0) { got = 2; }
-        }
-        if (got != 0) { if (_proc_tree_sweep(n, 15) == 0) { go = 0; } }
-        if (go == 1) {
-            if (waited >= _PROC_GRACE_MS) { go = 0; }
-            else { syscall(7, 0, 0, 10); waited = waited + 10; }
-        }
-    }
-    _proc_tree_sweep(n, 9);
-    if (got == 0) { sys_kill(pid, 9); sys_waitpid(pid, stbuf, 0); }
-    _proc_tree_sweep(n, 0);
-    return 0;
+    var t = _proc_kill_run(pid, stbuf, 0);
+    return t;
 }
 
 # TERM the first `n` snapshot entries (each once), give them `_PROC_GRACE_MS` to go, KILL

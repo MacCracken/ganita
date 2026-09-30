@@ -23,24 +23,16 @@
 # WIN32_FIND_DATAW field offsets (pack=4): dwFileAttributes@0, cFileName@44
 # (WCHAR[260]); total sizeof = 592. FILE_ATTRIBUTE_DIRECTORY = 0x10.
 
-# Widen a UTF-8 (ASCII) path to UTF-16LE in dst, translating '/' → '\' so
-# callers' POSIX-style paths (e.g. "tests/tcyr") enumerate. Writes a trailing
-# NUL WCHAR; returns the WCHAR count (excluding the NUL). dst needs (len+1)*2
-# bytes. ASCII-only zero-extend (the toolchain walks ASCII paths) — non-ASCII
-# path components won't round-trip, matching the EOPEN_PE/ECREATEDIR_PE limit.
-fn _fs_widen(dst, src): i64 {
-    var i = 0;
-    var c = load8(src + i);
-    while (c != 0) {
-        if (c == 47) { c = 92; }            # '/' → '\'
-        store8(dst + i * 2, c);
-        store8(dst + i * 2 + 1, 0);
-        i = i + 1;
-        c = load8(src + i);
-    }
-    store8(dst + i * 2, 0);                  # trailing NUL WCHAR
-    store8(dst + i * 2 + 1, 0);
-    return i;
+# Widen EXACTLY `n` bytes of the UTF-8 path at `src` (a Str's data + length — a Str need not be
+# NUL-terminated: str_sub shares its parent's bytes) to UTF-16LE in `dst`, '/' → '\', plus a NUL
+# WCHAR. dst needs (n+1)*2 bytes — UTF-8 never takes fewer bytes than UTF-16 units. Returns the
+# unit count, or -1 for an embedded NUL or invalid UTF-8, which the callers answer as "no such
+# path" rather than widen something else. It is the peer's `_win_widen_n` (the one decoder).
+# ⛔ 6.6.11 — this read to a NUL and ignored the Str's length, so `is_dir(str_sub("dirA",0,3))`
+# answered for "dirA", and it zero-extended each byte (Latin-1), so a non-ASCII name the
+# emitter could now open could still not be listed or stat'ed. CHANGELOG [6.6.11]
+fn _fs_widen(dst, src, n): i64 {
+    return _win_widen_n(dst, src, n, n + 1);
 }
 
 # Convert ONE UTF-16LE NUL-terminated wide string at `w` into UTF-8 in `dst`
@@ -122,12 +114,13 @@ fn _fs_narrow(w, dst, cap): i64 {
 # a refused allocation wrote the pattern to address 0 — and never given back: the default
 # allocator has no free, and dir_walk lists every directory it visits). CHANGELOG [6.6.10]
 fn _dir_list_into_vec(path: Str, entries): i64 {
-    # UTF-16LE search pattern "<path>\*". _fs_widen writes (len+1) WCHARs; the pattern adds
-    # two more, so a path past 509 bytes cannot fit — refused rather than overrun.
-    var pd = str_data(path);
-    if (strlen(pd) > 509) { return 0 - 1; }
+    # UTF-16LE search pattern "<path>\*". _fs_widen writes at most (len+1) WCHARs; the pattern
+    # adds two more, so a path past 509 bytes cannot fit — refused rather than overrun.
+    var pn = str_len(path);
+    if (pn > 509) { return 0 - 1; }
     var wpat[1040];
-    var n = _fs_widen(&wpat, pd);
+    var n = _fs_widen(&wpat, str_data(path), pn);   # 6.6.11: bounded by the Str, decoded
+    if (n < 0) { return 0 - 1; }
     store8(&wpat + n * 2, 92);          store8(&wpat + n * 2 + 1, 0);        # '\'
     store8(&wpat + (n + 1) * 2, 42);    store8(&wpat + (n + 1) * 2 + 1, 0);  # '*'
     store8(&wpat + (n + 2) * 2, 0);     store8(&wpat + (n + 2) * 2 + 1, 0);  # NUL
@@ -163,10 +156,10 @@ fn _dir_list_into_vec(path: Str, entries): i64 {
 # answer for a directory whose ACL denies LISTING, so such a directory is still a directory
 # here (the walkers then fail to list it, by name). Stack buffer, as above. CHANGELOG [6.6.10]
 fn is_dir(path: Str): i64 {
-    var pd = str_data(path);
-    if (strlen(pd) > 511) { return 0; }
+    var pn = str_len(path);
+    if (pn > 511) { return 0; }
     var wpath[1040];
-    _fs_widen(&wpath, pd);
+    if (_fs_widen(&wpath, str_data(path), pn) < 0) { return 0; }   # 6.6.11: bounded, decoded
     var attrs = syscall(61465, &wpath);         # GetFileAttributesW
     if (attrs == 4294967295) { return 0; }      # INVALID_FILE_ATTRIBUTES
     if ((attrs & 16) != 0) { return 1; }        # FILE_ATTRIBUTE_DIRECTORY

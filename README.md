@@ -13,13 +13,14 @@ Written in [Cyrius](https://github.com/MacCracken/cyrius).
 
 ## Status
 
-**1.2.9** — `ganita_f32_sin` / `ganita_f32_cos` are correct for every finite f32 (were NaN at and above 2^63). See
+**1.2.10** — toolchain 6.6.11; CI's `cyrius coverage` floor is 100 % (139/139). See
 [`CHANGELOG.md`](CHANGELOG.md) for the full history and
 [`docs/development/state.md`](docs/development/state.md) for the live snapshot.
 Recent releases in brief:
 
 | | |
 |---|---|
+| **1.2.10** | toolchain 6.6.11; `cyrius coverage --min 100` (6.6.11 no longer counts the uncallable `main`) |
 | **1.2.9** | f32 `sin` / `cos` correct past 2^63 (the NaN guard dropped — stdlib's `f64_sin` reduces every finite argument since cyrius 6.6.9); toolchain 6.6.10 |
 | **1.2.8** | `pow` within 1 ulp everywhere — an fdlibm `e_pow` core replaces `exp(y·ln x)` (909 ulp) and the squaring path (772 ulp); toolchain 6.6.9 |
 | **1.2.7** | `pow` answers the C99 Annex F special values (was NaN for every infinite base/exponent off the integral path, and for `pow(1, NaN)`); toolchain 6.6.7 |

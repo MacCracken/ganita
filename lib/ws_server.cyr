@@ -1,12 +1,13 @@
 # lib/ws_server.cyr — server-side WebSocket (RFC 6455)
 #
 # Companion to lib/ws.cyr (client-side).
-# Requires (NOT self-sufficient yet — the PENDING tier of
-# tests/gates/toolchain/stdlib_modules_self_sufficient.sh): alloc.cyr, string.cyr, fmt.cyr,
-# str.cyr, syscalls.cyr, sha1.cyr, net.cyr, tagged.cyr, plus base64_encode from lib/bayan.cyr
-# (base64.cyr was folded into bayan) and sandhi_server_find_header from lib/sandhi.cyr
-# (http_server.cyr was folded into sandhi). Both are distlib bundles that strip their own
-# includes, so this file cannot compile alone until they are raw-includable.
+# Includes its own first-party definers (6.6.11): syscalls.cyr, alloc.cyr, string.cyr, str.cyr,
+# net.cyr and sha1.cyr. NOT self-sufficient yet — the PENDING tier of
+# tests/gates/toolchain/stdlib_modules_self_sufficient.sh, which holds that the residual is
+# fold names ONLY: base64_encode from lib/bayan.cyr (base64.cyr was folded into bayan) and
+# sandhi_server_find_header from lib/sandhi.cyr (http_server.cyr was folded into sandhi). Both
+# are distlib bundles that strip their own includes, so this file cannot compile alone until
+# they are raw-includable.
 #
 # Design: integrates with sandhi's HTTP server (formerly lib/http_server.cyr) — an HTTP
 # handler detects a WS upgrade request, calls ws_server_handshake(cfd, buf, n) to upgrade in
@@ -15,6 +16,11 @@
 #
 # Shipped post-4.5.0. v5.6.13: SHA-1 extracted to lib/sha1.cyr.
 
+include "lib/syscalls.cyr"
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/str.cyr"
+include "lib/net.cyr"
 include "lib/sha1.cyr"
 
 # ================================================================
@@ -137,10 +143,12 @@ fn ws_server_handshake(cfd, req_buf, req_len): i64 {
 
 # Read EXACTLY n bytes into buf. Returns 0, or -1 on EOF / a read error (EINTR is retried).
 # A TCP read returns what has arrived, so even the 2-byte header can come back short.
+# ⛔ Through lib/net.cyr's _net_os_recv, never sys_read: on Windows sys_read is ReadFile, which
+# returns 0 (a false EOF) on an overlapped Winsock socket with data waiting. CHANGELOG [6.6.11]
 fn _wss_recv_exact(fd, buf, n): i64 {
     var got = 0;
     while (got < n) {
-        var r = sys_read(fd, buf + got, n - got);
+        var r = _net_os_recv(fd, buf + got, n - got);
         if (r == 0 - 4) { continue; }
         if (r <= 0) { return 0 - 1; }
         got = got + r;

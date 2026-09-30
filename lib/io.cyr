@@ -246,18 +246,14 @@ fn _xdir_exists(path): i64 {
     # loses its idempotence on Windows: CreateDirectoryW fails on an existing directory
     # and nothing else can tell "already there" from "could not create".
     # ⚠ The 0xF019 reroute takes an ALREADY-WIDE path, unlike the mkdir/unlink reroutes
-    # which widen inline — hence the widen loop here. ASCII-only, matching `_fs_widen`.
-    # A STACK buffer (v6.6.8): it was alloc(1024) stored through unchecked, so a refused
-    # allocation wrote the wide path to address 0. 511 UTF-16 units + NUL fit exactly.
+    # which widen in the emitter — hence the widen here, through the Windows peer's one
+    # UTF-8 decoder. ⛔ 6.6.11: this was a byte-per-unit copy that STOPPED at 510 units, so a
+    # longer path was answered for its own prefix and a non-ASCII one as Latin-1; a path that
+    # cannot be widened whole is now "not a directory". A STACK buffer (v6.6.8): it was
+    # alloc(1024) stored through unchecked, so a refused allocation wrote to address 0.
     var wbuf[1024];
     var wp = &wbuf;
-    var wi = 0;
-    while (load8(path + wi) != 0) {
-        if (wi >= 510) { break; }
-        store16(wp + wi * 2, load8(path + wi));
-        wi = wi + 1;
-    }
-    store16(wp + wi * 2, 0);
+    if (_win_widen(wp, path, 512) < 0) { return 0; }
     var attrs = syscall(61465, wp);             # GetFileAttributesW
     if (attrs == 4294967295) { return 0; }      # INVALID_FILE_ATTRIBUTES
     if ((attrs & 16) != 0) { return 1; }        # FILE_ATTRIBUTE_DIRECTORY

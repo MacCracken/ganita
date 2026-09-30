@@ -515,7 +515,14 @@ fn _bench_per_op_ps(net, k): i64 {
 #
 # ⚠ `min_k` is the smallest op count PER CLOCK PAIR: a window of p pairs carries up to p
 # clock errors, so it clears the bar only if k / p ops do. CHANGELOG [6.6.9].
+#
+# ⛔ A window of k <= 0 ops measured NO op, so it books NOTHING — not its time, not its
+# clock pair, not an extreme. `bench_batch_stop(b, 0)` / `bench_run_batch*(…, 0, …)` used to
+# book it as eligible with min_k 0, and the first min/max read divided by that 0: SIGFPE on
+# x86, and on aarch64 (sdiv by 0 is 0) a row that "resolved" having measured nothing. A
+# negative batch made min_k negative and resolved falsely the same way. CHANGELOG [6.6.11]
 fn _bench_record(b, raw, k, pairs, elig): i64 {
+    if (k <= 0) { return 0; }
     var fl = bench_clock_overhead_ns();
     store64(b + 16, load64(b + 16) + raw);
     store64(b + 24, load64(b + 24) + k);
@@ -637,6 +644,8 @@ fn bench_min_resolved(b): i64 {
     if (load64(b + 56) <= 0) { return 0; }
     if (load64(b + 56) != load64(b + 48)) { return 0; }
     var mk = load64(b + 64);
+    # Never divide by a min_k that is not a count of ops (see `_bench_record`). CHANGELOG [6.6.11]
+    if (mk <= 0) { return 0; }
     var bar = _BENCH_RESOLVE * _bench_err_ns() * 1000;
     var need = (bar + mk - 1) / mk;
     if (bench_avg_ps(b) >= need) { return 1; }

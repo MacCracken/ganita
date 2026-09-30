@@ -1,8 +1,9 @@
 # ws.cyr — WebSocket protocol (RFC 6455)
 # Usage: include "lib/ws.cyr"
-# Requires (NOT self-sufficient yet — the PENDING tier of
-# tests/gates/toolchain/stdlib_modules_self_sufficient.sh): net.cyr, string.cyr, alloc.cyr,
-# syscalls.cyr, and base64_encode from lib/bayan.cyr (base64.cyr was folded into bayan). bayan
+# Includes its own first-party definers (6.6.11): syscalls.cyr, alloc.cyr, string.cyr, net.cyr.
+# NOT self-sufficient yet — the PENDING tier of
+# tests/gates/toolchain/stdlib_modules_self_sufficient.sh, which holds that the residual is
+# fold names ONLY: base64_encode from lib/bayan.cyr (base64.cyr was folded into bayan). bayan
 # is a distlib bundle that strips its own includes, so including it here does not make this
 # file compile alone; that waits on raw-includable fold bundles (roadmap, "Fold bundles that
 # are raw-includable").
@@ -15,6 +16,11 @@
 #   ws_send_text(ws, "hello");
 #   var msg = ws_recv(ws);
 #   ws_close(ws);
+
+include "lib/syscalls.cyr"
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/net.cyr"
 
 # WebSocket opcodes
 enum WsOpcode {
@@ -121,7 +127,7 @@ fn ws_connect(sock, path, host): i64 {
 
     # Read response (simplified — check for 101)
     var resp[512];
-    var n = sys_read(sock, &resp, 511);
+    var n = _net_os_recv(sock, &resp, 511);        # not sys_read: see _ws_recv_exact
     # 6.6.10: fewer than 12 bytes cannot hold "HTTP/1.1 101" — the status check below would read
     # stale stack bytes past the ones received. CHANGELOG [6.6.10]
     if (n < 12) { store64(ws + 8, WS_CLOSED); return ws; }
@@ -220,11 +226,15 @@ var WS_RECV_MAX_PAYLOAD = 16777216;
 
 # Read EXACTLY n bytes into buf. Returns 0, or -1 on EOF / a read error (EINTR is retried).
 # A TCP read returns what has arrived, so any frame part — even the 2-byte header — may come
-# back short; a single sys_read is never "the bytes".
+# back short; a single read is never "the bytes".
+# ⛔ Socket reads go through lib/net.cyr's _net_os_recv, never sys_read: on Windows sys_read is
+# ReadFile, and ReadFile with no OVERLAPPED on an overlapped Winsock socket (what tcp_socket makes
+# there) returns 0 while data is waiting — a false EOF at the first read. Off Windows it IS
+# sys_read. CHANGELOG [6.6.11]
 fn _ws_recv_exact(fd, buf, n): i64 {
     var got = 0;
     while (got < n) {
-        var r = sys_read(fd, buf + got, n - got);
+        var r = _net_os_recv(fd, buf + got, n - got);
         if (r == 0 - 4) { continue; }
         if (r <= 0) { return 0 - 1; }
         got = got + r;

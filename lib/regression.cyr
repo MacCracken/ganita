@@ -311,10 +311,19 @@ fn regression_file_contains_substr(path, substr): i64 {
 # prctl is not a Darwin/BSD syscall and is not routed on PE. The getppid re-check closes
 # the race where the parent died between the fork and the prctl, in which case the death
 # signal has already been delivered to nobody and will never fire.
+# macOS (6.6.11): the child calls setsid() so it leads its own process group, and a deadline's
+# `_regression_kill_tree` can end that GROUP — macOS has no /proc to walk for descendants, so
+# it signalled the child alone and a `sh -c 'x &'` grandchild outlived the deadline. No
+# condition, unlike lib/process.cyr's twin: every verb here runs its child under a deadline, and
+# a deadline means no controlling terminal (lib/process.cyr's rule), so ssh/scp run from here on
+# macOS cannot prompt for a host key or passphrase. CHANGELOG [6.6.11]
 fn _regression_child_guard(ppid_before): i64 {
     #ifdef CYRIUS_TARGET_LINUX
     sys_prctl(1, 9, 0, 0, 0);
     if (syscall(SYS_GETPPID) != ppid_before) { sys_exit(1); }
+    #endif
+    #ifdef CYRIUS_TARGET_MACOS
+    sys_setsid();
     #endif
     return 0;
 }
@@ -582,9 +591,18 @@ fn _regression_tree_sweep(n, term): i64 {
 # The deadline's kill: SIGTERM `pid`; once it has gone, one SIGTERM to each descendant it left
 # (from the snapshot taken first); all within the grace period, so EXIT traps run; then
 # SIGKILL the stragglers and reap `pid` into `stbuf`.
+# macOS (6.6.11): there is no /proc snapshot, so the target is `pid`'s PROCESS GROUP when it
+# leads one (`_regression_child_guard` makes it) — the group gets one TERM, the grace, then one
+# KILL: lib/process.cyr's `_proc_kill_group` shape. It signalled `pid` alone before. `kill(-pid,
+# 0)` answers 0 only while a group of that id has a live member, and POSIX does not reuse a pid
+# while its group exists, so the probe cannot reach a stranger's group. CHANGELOG [6.6.11]
 fn _regression_kill_tree(pid, stbuf): i64 {
     var n = _regression_tree_collect(pid);
-    sys_kill(pid, 15);
+    var tgt = pid;
+    #ifdef CYRIUS_TARGET_MACOS
+    if (sys_kill(0 - pid, 0) == 0) { tgt = 0 - pid; }
+    #endif
+    sys_kill(tgt, 15);
     var got = 0;
     var waited = 0;
     var go = 1;
@@ -594,13 +612,17 @@ fn _regression_kill_tree(pid, stbuf): i64 {
             if (w == pid) { got = 1; }
             if (w < 0) { got = 2; }
         }
-        if (got != 0) { if (_regression_tree_sweep(n, 1) == 0) { go = 0; } }
+        if (got != 0) {
+            if (tgt != pid) { if (sys_kill(tgt, 0) != 0) { go = 0; } }
+            elif (_regression_tree_sweep(n, 1) == 0) { go = 0; }
+        }
         if (go == 1) {
             if (waited >= _REGRESSION_GRACE_MS) { go = 0; }
             else { syscall(7, 0, 0, 10); waited = waited + 10; }
         }
     }
     _regression_tree_kill_all(n);
+    if (tgt != pid) { sys_kill(tgt, 9); }
     if (got == 0) { sys_kill(pid, 9); sys_waitpid(pid, stbuf, 0); }
     _regression_tree_sweep(n, 0);
     return 0;

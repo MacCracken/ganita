@@ -545,8 +545,8 @@ enum Statfs {
 }
 
 # access(path, mode) — 0xF019 (61465) → kernel32!GetFileAttributesW, live since v6.1.18.
-# ⚠ THE REROUTE TAKES AN ALREADY-WIDE (UTF-16) PATH, which is the one non-obvious part; the
-# widen loop below is the same shape lib/io.cyr uses for its own CreateFileW calls.
+# ⚠ THE REROUTE TAKES AN ALREADY-WIDE (UTF-16) PATH, which is the one non-obvious part — it is
+# decoded by `_win_widen`, which refuses (-1 here) what it cannot widen whole (6.6.11).
 # INVALID_FILE_ATTRIBUTES is 0xFFFFFFFF → the path does not exist (or is unreachable).
 # Returns 0 on success and -1 otherwise, the POSIX contract callers expect.
 # NOTE: existence only. W_OK is deliberately NOT modelled from FILE_ATTRIBUTE_READONLY —
@@ -555,15 +555,7 @@ enum Statfs {
 # permission should attempt the open and handle the failure.
 fn sys_access(path, mode): i64 {
     var wp[520];
-    var i = 0;
-    while (i < 259) {
-        var c = load8(path + i);
-        store8(&wp + i * 2, c);
-        store8(&wp + i * 2 + 1, 0);
-        if (c == 0) { i = 259; } else { i = i + 1; }
-    }
-    store8(&wp + 518, 0);
-    store8(&wp + 519, 0);
+    if (_win_widen(&wp, path, 260) < 0) { return 0 - 1; }   # 6.6.11: refused, not cut at 259
     var attrs = syscall(61465, &wp);
     if (attrs == 4294967295) { return 0 - 1; }
     return 0;
@@ -615,20 +607,80 @@ fn sys_truncate(path, length): i64 {
     return r;
 }
 
-# Widen a UTF-8 (ASCII) path into `dst` as UTF-16LE with '/' → '\', at most `cap` - 1 units
-# plus a NUL. Returns the unit count. The peer's own copy: it includes nothing, so it cannot
-# borrow lib/fs_win.cyr's `_fs_widen`, and a stack buffer needs no allocator. CHANGELOG [6.6.9]
-fn _win_widen(dst, src, cap): i64 {
+# Decode EXACTLY `n` bytes of UTF-8 at `src` into UTF-16LE at `dst` ('/' → '\'), at most
+# `cap` - 1 units plus a NUL; a code point past U+FFFF becomes a surrogate pair. Returns the unit
+# count, or -1 — and then `dst` must not be used — for an embedded NUL (a NUL inside the bytes
+# would silently cut the path), invalid UTF-8 (a stray continuation byte, a truncated or overlong
+# sequence, an encoded surrogate, anything past U+10FFFF) or no room. REFUSE, NEVER TRUNCATE: the
+# byte-per-unit loops this replaced zero-extended UTF-8 as Latin-1 and cut at their cap, so a
+# non-ASCII name was answered as some other name and a long one as its own prefix. It is the ONE
+# stdlib decoder: `_win_widen` below, lib/fs_win.cyr's `_fs_widen`, lib/fs.cyr's `is_symlink`
+# and lib/io.cyr's `_xdir_exists` all call it, so what the narrow-path reroutes open
+# (MultiByteToWideChar, in the emitter) the wide-path ones can also stat and list.
+# CHANGELOG [6.6.11]
+fn _win_widen_n(dst, src, n, cap): i64 {
     var i = 0;
-    while (i < cap - 1) {
+    var o = 0;
+    while (i < n) {
         var c = load8(src + i);
-        if (c == 0) { break; }
-        if (c == 47) { c = 92; }
-        store16(dst + i * 2, c);
-        i = i + 1;
+        var cp = c;
+        var k = 0;
+        if (c == 0) { return 0 - 1; }
+        if (c >= 0x80) {
+            if (c < 0xC2) { return 0 - 1; }             # continuation byte / overlong 2-byte lead
+            if (c >= 0xF5) { return 0 - 1; }            # past U+10FFFF
+            k = 1;
+            cp = c & 0x1F;
+            if (c >= 0xE0) { k = 2; cp = c & 0x0F; }
+            if (c >= 0xF0) { k = 3; cp = c & 0x07; }
+            if (i + k >= n) { return 0 - 1; }           # truncated sequence
+            var j = 1;
+            while (j <= k) {
+                var cc = load8(src + i + j);
+                if ((cc & 0xC0) != 0x80) { return 0 - 1; }
+                cp = (cp << 6) | (cc & 0x3F);
+                j = j + 1;
+            }
+            if (k == 2) {
+                if (cp < 0x800) { return 0 - 1; }       # overlong
+                if ((cp & 0xF800) == 0xD800) { return 0 - 1; }   # an encoded surrogate
+            }
+            if (k == 3) {
+                if (cp < 0x10000) { return 0 - 1; }     # overlong
+                if (cp > 0x10FFFF) { return 0 - 1; }
+            }
+        }
+        if (cp == 47) { cp = 92; }                      # '/' → '\'
+        if (cp >= 0x10000) {
+            if (o + 2 >= cap) { return 0 - 1; }
+            var v = cp - 0x10000;
+            store16(dst + o * 2, 0xD800 | (v >> 10));
+            store16(dst + o * 2 + 2, 0xDC00 | (v & 0x3FF));
+            o = o + 2;
+        } else {
+            if (o + 1 >= cap) { return 0 - 1; }
+            store16(dst + o * 2, cp);
+            o = o + 1;
+        }
+        i = i + 1 + k;
     }
-    store16(dst + i * 2, 0);
-    return i;
+    store16(dst + o * 2, 0);
+    return o;
+}
+
+# Widen a NUL-terminated UTF-8 path into `dst` (`cap` units including the NUL) via
+# `_win_widen_n`. Returns the unit count, or -1 when the path does not fit or is not valid
+# UTF-8 — it never cuts a path to fit (it did until 6.6.11: `sys_symlink` then created its link
+# at the path's first 518 units). This peer includes nothing, which is why the one decoder lives
+# here for the other modules to call; the stack buffers its callers pass need no allocator.
+# CHANGELOG [6.6.9], [6.6.11]
+fn _win_widen(dst, src, cap): i64 {
+    var n = 0;
+    while (load8(src + n) != 0) {
+        n = n + 1;
+        if (n >= cap * 3) { return 0 - 1; }             # more bytes than `cap` units can hold
+    }
+    return _win_widen_n(dst, src, n, cap);
 }
 
 # symlink(target, linkpath) — REAL since 6.6.9: CreateSymbolicLinkW (reroute 0xF03E). Windows
@@ -644,8 +696,9 @@ fn sys_symlink(target, linkpath): i64 {
     var wl[1040];
     var wt[1040];
     var wr[2080];
-    _win_widen(&wl, linkpath, 519);
+    if (_win_widen(&wl, linkpath, 519) < 0) { return 0 - 1; }   # 6.6.11: refused, never cut
     var tn = _win_widen(&wt, target, 519);
+    if (tn < 0) { return 0 - 1; }
     # Resolve the target as the link will: absolute ('\...', 'X:...') as-is, else against
     # the link's directory (the part of linkpath up to its last separator).
     var abs = 0;
@@ -751,10 +804,13 @@ fn fd_restore_flags(fd, saved): i64 { return 0 - 38; }
 # TOCTOU-lstat paths since 2.3.12). Without them a PE build that merely REACHES such a
 # path is refused: `refusing to emit binary with N reachable undefined function(s)`.
 # Same contract as the block above: each declines with -38/-ENOSYS, so the caller's
-# `if (r < 0)` fires; none emulates. ⚠ The socket four are NOT a missing reroute: the
-# ws2_32 band (0xF022…) returns a SOCKET handle that must be closed with closesocket and
-# reports errors through WSAGetLastError, so a BSD-shaped fd peer is an fd↔SOCKET
-# namespace design, not a renumber (the sys_socketpair note above). CHANGELOG [6.6.7]
+# `if (r < 0)` fires; none emulates. ⚠ The socket four still decline ON PURPOSE. Since
+# 6.6.11 lib/net.cyr IS the Windows socket surface (tcp_socket … sock_close over ws2_32, a
+# SOCKET as the fd, Winsock option constants, closesocket). These raw wrappers are the
+# Linux-shaped ABI: their callers pass Linux option numbers (SOL_SOCKET = 1 is not Winsock's
+# 0xFFFF) and close with sys_close, which is CloseHandle here and does not close a SOCKET — so
+# routing them would turn an honest -38 into wrong options and leaked sockets. Use lib/net.cyr.
+# CHANGELOG [6.6.7], [6.6.11]
 # Device control. Declines: Windows has no ioctl (DeviceIoControl takes a HANDLE and
 # Windows control codes, not Linux device requests).
 fn sys_ioctl(fd, request, argp): i64 { return 0 - 38; }
@@ -817,7 +873,8 @@ fn sys_getsockname(fd, addr, addrlen): i64 {
 # listen (0xF033 → ws2_32!listen): same normalization as getsockname — 0, or -WSAGetLastError.
 # 6.6.10: the reroute existed since v6.4.44 but no `sys_listen` did, so a portable caller of
 # the POSIX name failed to COMPILE for PE (tests/tcyr/platform/socket_syscalls.tcyr).
-# `fd` is a ws2_32 SOCKET (lib/net.cyr's tcp_socket on PE). CHANGELOG [6.6.10]
+# `fd` is a ws2_32 SOCKET (lib/net.cyr's tcp_socket on PE, real since 6.6.11 — until then it
+# returned -38 there and this comment described a socket nothing could create). CHANGELOG [6.6.10]
 fn sys_listen(fd, backlog): i64 {
     var r = syscall(0xF033, fd, backlog);
     if (r == 0) { return 0; }

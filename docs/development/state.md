@@ -2,10 +2,16 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-09-29 (1.2.9 — f32 `sin` / `cos` correct past 2^63,
-> toolchain 6.6.10).
+> Last refreshed: 2026-09-30 (1.2.10 — toolchain 6.6.11, the tool coverage floor
+> at 100).
 
 ## Version
+
+**1.2.10** — **toolchain 6.6.10 → 6.6.11 and `cyrius coverage --min 100`.** CI only:
+cyrius 6.6.11's `cyrius coverage` no longer counts an entry point `main`, which nothing
+can call, so the figure is 139/139 (was 139/141 against the two `main`s) and the floor
+rose 98 → 100 in the same commit as the pin. `lib/` re-vendored (**111** files). No
+source or public signature changed. **597 assertions**.
 
 **1.2.9** — **f32 `sin` / `cos` are correct past 2^63.** The 1.2.x guard returned NaN
 for |x| ≥ 2^63, written against the old stdlib `f64_sin` that returned its argument
@@ -142,9 +148,9 @@ initial carve out of cyrius stdlib (2026-06-10, cyrius v6.1.26).
 
 ## Toolchain
 
-- **Cyrius pin**: `6.6.10` (`cyrius.cyml [package].cyrius`, since 1.2.9).
-  `cyrius version` reports `manifest-pin: 6.6.10` with no drift line —
-  `cyrius lib sync --full` re-copied all 111 files from the 6.6.10 snapshot.
+- **Cyrius pin**: `6.6.11` (`cyrius.cyml [package].cyrius`, since 1.2.10).
+  `cyrius version` reports `manifest-pin: 6.6.11` with no drift line —
+  `cyrius lib sync --full` re-copied all 111 files from the 6.6.11 snapshot.
 - **`lib/` matches the pin exactly**: 111 files, 0 differ. Verify by comparing
   the trees against `~/.cyrius/versions/<pin>/lib`, not by trusting
   `cyrius lib sync --full`'s exit code.
@@ -296,6 +302,11 @@ Two figures are now tracked, and CI gates on **both**:
 | `cyrius coverage` (substring) | 109/135 (80 %) | 131/139 (94 %) | **133/141 (94 %)** | `--min 94` |
 | `scripts/coverage-honest.sh` (word boundary, comments stripped) | 72/135 (**53 %**) | 87/153 (56 %) | **92/158 (58 %)** | `58` |
 
+Since then the tool changed twice, and the gate followed it up, never down: cyrius
+6.6.8 counts whole-identifier references outside comments and strings (98 % at 1.2.8),
+and 6.6.11 excludes the entry point `main`. At the 6.6.11 pin (1.2.10) the tool reports
+**139/139 (100 %)** and CI gates `--min 100`; the word-boundary gate is `88`.
+
 The honest count is the one to plan against. The tool's is kept as a ratchet
 because it sees things a regex does not — but it is not the only gate, because it
 is a number a comment can move.
@@ -347,8 +358,8 @@ sweep. Three properties worth remembering when editing it:
 
 Gates (20 steps as of 1.2.3): pin-drift · version consistency · `lib/` vs
 snapshot · format (src, tests **and examples**) · lint · vet · build with 0
-warnings · smoke exits 42 · test · fuzz · bench · `coverage --min 94` ·
-**`coverage-honest.sh 58`** (ratcheted from 56 at 1.2.6) · `distlib --all --check` ·
+warnings · smoke exits 42 · test · fuzz · bench · `coverage --min 100` (since 1.2.10) ·
+**`coverage-honest.sh 88`** (ratcheted from 56 at 1.2.6) · `distlib --all --check` ·
 regeneration leaves no tree diff · consumer-check · **examples build and run**.
 
 Two of those are new at 1.2.3 and both exist because a gate was measuring the

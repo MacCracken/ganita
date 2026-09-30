@@ -1,6 +1,9 @@
 # log.cyr — structured logging wrapper over sakshi
 # Usage: include "lib/log.cyr"
-# Requires: sakshi.cyr, string.cyr, fmt.cyr
+# Includes its own first-party definer (6.6.11): string.cyr (strlen). The caller still supplies
+# the sakshi_* fns from lib/sakshi.cyr — a distlib fold that strips its own includes, so it is
+# not raw-includable here (the PENDING tier of tests/gates/toolchain/
+# stdlib_modules_self_sufficient.sh, which holds that sakshi_* is ALL that stays undefined).
 #
 # Provides simple log_debug/info/warn/error/fatal API with
 # level filtering. Delegates to sakshi for output routing
@@ -10,6 +13,8 @@
 #   log_info("server started");
 #   log_warn("connection timeout");
 #   log_error("disk full");
+
+include "lib/string.cyr"
 
 # Log levels — severity-ascending (TRACE=0 .. FATAL=5)
 enum LogLevel {

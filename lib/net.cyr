@@ -10,7 +10,9 @@
 # numbers; the Mach-O backends translate them to Darwin BSD (ESYSXLAT /
 # EMACHO_SYSXLAT) and the BSD option/flag constants + sockaddr layout are
 # platform-branched (#ifdef CYRIUS_TARGET_MACOS). Verified on arm64 macOS (ecb)
-# v6.0.59 — see 2026-06-04-macos-net-socket-syscalls-unported.md.
+# v6.0.59 — see 2026-06-04-macos-net-socket-syscalls-unported.md. On Windows (PE) every verb
+# goes through ws2_32 instead — see "The per-OS socket primitives" below (6.6.11); a socket
+# there is a Winsock SOCKET and must be closed with sock_close, never sys_close.
 # Usage: include "lib/net.cyr"
 # Includes its own definers (6.6.9): syscalls.cyr, alloc.cyr, string.cyr, result.cyr, and io.cyr
 # for the resolver.
@@ -48,10 +50,15 @@ var SYS_SHUTDOWN = 48;
 # sys/socket.h) 30. Per-target so v6 sockets/sockaddrs are correct on Mach-O
 # (the backend SYSXLAT translates syscall NUMBERS, not this address-family
 # constant). See docs/development/issues/2026-06-15-cyrius-net-v6-darwin.md.
+# 6.6.11: Windows (ws2def.h) has its own AF_INET6, 23. CHANGELOG [6.6.11]
 #ifdef CYRIUS_TARGET_MACOS
 enum SockDomain { AF_INET = 2; AF_INET6 = 30; }
 #else
+#ifdef CYRIUS_TARGET_WIN
+enum SockDomain { AF_INET = 2; AF_INET6 = 23; }
+#else
 enum SockDomain { AF_INET = 2; AF_INET6 = 10; }
+#endif
 #endif
 enum SockType { SOCK_STREAM = 1; SOCK_DGRAM = 2; }
 #ifdef CYRIUS_TARGET_MACOS
@@ -77,6 +84,35 @@ enum IpOpt {
     IP_DROP_MEMBERSHIP = 13;
 }
 var _NET_EINPROGRESS = 36;
+var _NET_SO_REUSE = 0x0004;          # sock_reuse's option: SO_REUSEADDR
+#else
+#ifdef CYRIUS_TARGET_WIN
+# 6.6.11: Winsock (winsock2.h / ws2ipdef.h). The option values are the BSD ones, and the
+# IPv4 multicast numbers are Darwin's (9-13), not Linux's. Windows has NO SO_REUSEPORT: its
+# SO_REUSEADDR IS the port-sharing option (a second socket may bind a port that is in use), so
+# SO_REUSEPORT names it here — sock_reuseport's callers ask for exactly that sharing.
+enum SockOpt {
+    SOL_SOCKET = 0xFFFF;
+    SO_REUSEADDR = 0x0004;
+    SO_RCVTIMEO = 0x1006;    # a DWORD of milliseconds on Windows, not a timeval
+    SO_SNDTIMEO = 0x1005;
+    SO_ERROR = 0x1007;
+    SO_REUSEPORT = 0x0004;   # = SO_REUSEADDR (see above)
+}
+enum IpOpt {
+    IPPROTO_IP = 0;
+    IP_MULTICAST_IF = 9;
+    IP_MULTICAST_TTL = 10;
+    IP_MULTICAST_LOOP = 11;
+    IP_ADD_MEMBERSHIP = 12;
+    IP_DROP_MEMBERSHIP = 13;
+}
+var _NET_EINPROGRESS = 10035;        # WSAEWOULDBLOCK: a non-blocking connect is under way
+# ⛔ sock_reuse's option on Windows is SO_EXCLUSIVEADDRUSE (~SO_REUSEADDR), NOT SO_REUSEADDR.
+# Windows' SO_REUSEADDR lets ANOTHER socket bind a port this server is using and take its
+# traffic; Linux's only lets a restarted server rebind past TIME_WAIT. EXCLUSIVEADDRUSE is the
+# option that keeps the port this process's alone. CHANGELOG [6.6.11]
+var _NET_SO_REUSE = 0xFFFFFFFB;
 #else
 enum SockOpt {
     SOL_SOCKET = 1;
@@ -96,6 +132,8 @@ enum IpOpt {
     IP_DROP_MEMBERSHIP = 36;
 }
 var _NET_EINPROGRESS = 115;
+var _NET_SO_REUSE = 2;               # sock_reuse's option: SO_REUSEADDR
+#endif
 #endif
 
 # sockaddr_in: { family(2), port(2), addr(4), zero(8) } = 16 bytes
@@ -201,6 +239,223 @@ fn _net_eagain() : Result {
     return Err(_NET_EAGAIN);
 }
 
+# ── The per-OS socket primitives (6.6.11) ──
+#
+# ⛔ WHY: every verb in this file issued the Linux socket numbers directly, and on PE none of
+# them is a syscall: each returned -38 (-ENOSYS), so tcp_socket/udp_socket failed and http_*
+# could not work on Windows at all (sandhi's v4 path rides the same verbs). Each verb's OS call
+# now lives in ONE primitive below, with a Windows arm on ws2_32 and the unchanged syscall
+# elsewhere, so the public verbs keep one body per target instead of growing a third arm each.
+#
+# The contract every primitive keeps on every target: the value, or -errno. On Windows the SOCKET
+# handle IS the fd; a failure is SOCKET_ERROR / INVALID_SOCKET, which becomes -WSAGetLastError
+# (read straight after the failing call — it is per-thread and the next Winsock call resets it).
+# Two Winsock codes are folded onto the POSIX ones portable callers already test: WSAEWOULDBLOCK
+# (a non-blocking accept/send/recv with nothing to do) and, for send/recv only, WSAETIMEDOUT (an
+# expired SO_RCVTIMEO / SO_SNDTIMEO) both become -EAGAIN, as Linux reports them. CHANGELOG [6.6.11]
+#ifdef CYRIUS_TARGET_WIN
+# Winsock must be started once per process before any socket or getaddrinfo call. WSAStartup is
+# reference-counted, so two threads racing the first call cost one extra count, not a fault.
+var _net_wsa_up = 0;
+fn _net_wsa_init(): i64 {
+    if (_net_wsa_up == 1) { return 0; }
+    var wsadata[512];                              # WSADATA is 408 bytes on Win64
+    var r = syscall(0xF01E, 0x0202, &wsadata) & 0xFFFFFFFF;    # WSAStartup(2.2) returns its error
+    if (r != 0) { return 0 - r; }
+    _net_wsa_up = 1;
+    return 0;
+}
+
+# The calling thread's last Winsock error, negated. Never 0: a failure must not read as success.
+fn _net_wsa_err(): i64 {
+    var e = syscall(0xF024) & 0xFFFFFFFF;          # WSAGetLastError
+    if (e == 0) { return 0 - 1; }
+    return 0 - e;
+}
+
+# An `int` result from the reroutes that return eax unextended (bind, connect, listen,
+# setsockopt, getsockopt, closesocket, getaddrinfo): 0, or -WSAGetLastError.
+fn _net_wsa_rc(r): i64 {
+    if ((r & 0xFFFFFFFF) == 0) { return 0; }
+    return _net_wsa_err();
+}
+
+# A failed send/recv's error, with a would-block or an expired timeout reported as -EAGAIN.
+fn _net_wsa_io_err(): i64 {
+    var e = _net_wsa_err();
+    if (e == 0 - 10035) { return 0 - _NET_EAGAIN; }    # WSAEWOULDBLOCK
+    if (e == 0 - 10060) { return 0 - _NET_EAGAIN; }    # WSAETIMEDOUT (SO_RCVTIMEO / SO_SNDTIMEO)
+    return e;
+}
+
+# ioctlsocket(FIONBIO): 1 = non-blocking, 0 = blocking. 0 or -WSAGetLastError.
+fn _net_wsa_nbio(fd, on): i64 {
+    var v[8];
+    store64(&v, on);
+    if (syscall(0xF049, fd, 0x8004667E, &v) != 0) { return _net_wsa_err(); }   # FIONBIO
+    return 0;
+}
+#endif
+
+# Send up to `len` bytes on socket `fd`: the count, or -errno.
+fn _net_os_send(fd, buf, len): i64 {
+    #ifdef CYRIUS_TARGET_WIN
+    if (len > 0x7FFFFFFF) { len = 0x7FFFFFFF; }    # send() takes an int length; a short write is legal
+    var n = syscall(0xF047, fd, buf, len, 0);
+    if (n < 0) { return _net_wsa_io_err(); }
+    return n;
+    #endif
+    #ifndef CYRIUS_TARGET_WIN
+    return sys_write(fd, buf, len);                # agnos: the peer routes a tagged fd to #48
+    #endif
+}
+
+# Receive up to `len` bytes from socket `fd`: the count (0 = the peer closed), or -errno.
+fn _net_os_recv(fd, buf, len): i64 {
+    #ifdef CYRIUS_TARGET_WIN
+    if (len > 0x7FFFFFFF) { len = 0x7FFFFFFF; }
+    var n = syscall(0xF048, fd, buf, len, 0);
+    if (n < 0) { return _net_wsa_io_err(); }
+    return n;
+    #endif
+    #ifndef CYRIUS_TARGET_WIN
+    return sys_read(fd, buf, len);                 # agnos: the peer routes a tagged fd to #49
+    #endif
+}
+
+# Close socket `fd`: 0 or -errno. On Windows a SOCKET must be closed with closesocket —
+# CloseHandle (sys_close) on one is documented as undefined and skips Winsock's teardown.
+fn _net_os_close(fd): i64 {
+    #ifdef CYRIUS_TARGET_WIN
+    return _net_wsa_rc(syscall(0xF023, fd));
+    #endif
+    #ifndef CYRIUS_TARGET_WIN
+    return sys_close(fd);                          # agnos: the peer routes a tagged fd to #50
+    #endif
+}
+
+#ifndef CYRIUS_TARGET_AGNOS
+# A new AF_INET socket of `type` (SOCK_STREAM / SOCK_DGRAM): the fd, or -errno.
+# On Windows: WSA_FLAG_OVERLAPPED (0x01) — the attribute socket() itself gives — plus
+# WSA_FLAG_NO_HANDLE_INHERIT (0x80), so a spawned child never inherits it. ⚠ NOT a
+# non-overlapped socket: measured on cass and under wine, a blocking recv on one IGNORES
+# SO_RCVTIMEO and hangs forever, which would make sock_set_recv_timeout (the slowloris bound)
+# a silent no-op. send/recv/accept on an overlapped socket still block as on POSIX.
+fn _net_os_socket(type): i64 {
+    #ifdef CYRIUS_TARGET_WIN
+    var up = _net_wsa_init();
+    if (up < 0) { return up; }
+    var s = syscall(0xF022, AF_INET, type, 0, 0, 0, 0x81);    # WSASocketW
+    if (s == 0 - 1) { return _net_wsa_err(); }                # INVALID_SOCKET
+    return s;
+    #endif
+    #ifndef CYRIUS_TARGET_WIN
+    return syscall(NSYS_SOCKET, AF_INET, type, 0);
+    #endif
+}
+
+# bind(fd, sa, salen): 0 or -errno.
+fn _net_os_bind(fd, sa, salen): i64 {
+    #ifdef CYRIUS_TARGET_WIN
+    return _net_wsa_rc(syscall(0xF025, fd, sa, salen));
+    #endif
+    #ifndef CYRIUS_TARGET_WIN
+    return syscall(NSYS_BIND, fd, sa, salen);
+    #endif
+}
+
+# connect(fd, sa, salen), blocking: 0 or -errno.
+fn _net_os_connect(fd, sa, salen): i64 {
+    #ifdef CYRIUS_TARGET_WIN
+    return _net_wsa_rc(syscall(0xF028, fd, sa, salen));
+    #endif
+    #ifndef CYRIUS_TARGET_WIN
+    return syscall(NSYS_CONNECT, fd, sa, salen);
+    #endif
+}
+
+# listen(fd, backlog): 0 or -errno.
+fn _net_os_listen(fd, backlog): i64 {
+    #ifdef CYRIUS_TARGET_WIN
+    return _net_wsa_rc(syscall(0xF033, fd, backlog));
+    #endif
+    #ifndef CYRIUS_TARGET_WIN
+    return syscall(NSYS_LISTEN, fd, backlog);
+    #endif
+}
+
+# accept(fd, NULL, NULL): the connection's fd, or -errno (-EAGAIN when a non-blocking listener
+# has nothing pending, on every target).
+fn _net_os_accept(fd): i64 {
+    #ifdef CYRIUS_TARGET_WIN
+    var c = syscall(0xF045, fd, 0, 0);
+    if (c == 0 - 1) {                                          # INVALID_SOCKET
+        var e = _net_wsa_err();
+        if (e == 0 - 10035) { return 0 - _NET_EAGAIN; }        # WSAEWOULDBLOCK
+        return e;
+    }
+    return c;
+    #endif
+    #ifndef CYRIUS_TARGET_WIN
+    return syscall(SYS_ACCEPT, fd, 0, 0);
+    #endif
+}
+
+# setsockopt(fd, level, name, val, vallen): 0 or -errno. `level` / `name` are this target's
+# values (the SockOpt / IpOpt enums above).
+fn _net_os_setopt(fd, level, name, val, vallen): i64 {
+    #ifdef CYRIUS_TARGET_WIN
+    return _net_wsa_rc(syscall(0xF032, fd, level, name, val, vallen));
+    #endif
+    #ifndef CYRIUS_TARGET_WIN
+    return syscall(NSYS_SETSOCKOPT, fd, level, name, val, vallen);
+    #endif
+}
+
+# shutdown(fd, how) — 0 = read, 1 = write, 2 = both on every target (SD_RECEIVE / SD_SEND /
+# SD_BOTH on Windows): 0 or -errno.
+fn _net_os_shutdown(fd, how): i64 {
+    #ifdef CYRIUS_TARGET_WIN
+    if (syscall(0xF046, fd, how) != 0) { return _net_wsa_err(); }
+    return 0;
+    #endif
+    #ifndef CYRIUS_TARGET_WIN
+    return syscall(SYS_SHUTDOWN, fd, how);
+    #endif
+}
+
+# Set SO_RCVTIMEO / SO_SNDTIMEO (`opt`) to secs.usecs: 0 or -errno.
+fn _net_set_timeo(fd, opt, secs, usecs): i64 {
+    #ifdef CYRIUS_TARGET_WIN
+    # Windows takes a DWORD of MILLISECONDS, not a timeval. 0 still means "never time out", so a
+    # sub-millisecond remainder rounds UP: 500 us must not become 0 = block forever.
+    if (secs < 0 || usecs < 0) { return 0 - 22; }              # EINVAL, as Linux says for a bad timeval
+    var ms = secs * 1000 + (usecs + 999) / 1000;
+    if (ms > 0x7FFFFFFF) { ms = 0x7FFFFFFF; }
+    var dw[8];
+    store64(&dw, ms);
+    return _net_os_setopt(fd, SOL_SOCKET, opt, &dw, 4);
+    #endif
+    #ifndef CYRIUS_TARGET_WIN
+    # Linux struct timeval is {tv_sec, tv_usec} — both i64 on 64-bit Linux (16 bytes total).
+    # On the stack: setsockopt copies the timeval in (an unchecked, leaked alloc(16) per call
+    # until 6.6.10). CHANGELOG [6.6.10]
+    var tvb[16];
+    var tv = &tvb;
+    memset(tv, 0, 16);
+    store64(tv, secs);
+    #ifdef CYRIUS_TARGET_MACOS
+    # Darwin struct timeval is {tv_sec: i64, tv_usec: i32} — tv_usec is 32-bit
+    # (a 64-bit write would spill into the next field / past the struct).
+    store32(tv + 8, usecs);
+    #else
+    store64(tv + 8, usecs);
+    #endif
+    return _net_os_setopt(fd, SOL_SOCKET, opt, tv, 16);
+    #endif
+}
+#endif
+
 # Create a TCP socket. Returns Result(fd). On AGNOS the "fd" is a tagged
 # placeholder handle (a reserved conn slot); the real conn_id is assigned by
 # sock_connect (#47 does socket()+connect() in one).
@@ -211,7 +466,7 @@ fn tcp_socket() : Result {
     return Ok(afd);
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    var fd = syscall(NSYS_SOCKET, AF_INET, SOCK_STREAM, 0);
+    var fd = _net_os_socket(SOCK_STREAM);
     if (fd < 0) { return Err(0 - fd); }
     return Ok(fd);
     #endif
@@ -227,7 +482,7 @@ fn udp_socket() : Result {
     return Err(1);   # use sys_udp_bind/send/recv/unbind (#51-#54) on agnos
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    var fd = syscall(NSYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+    var fd = _net_os_socket(SOCK_DGRAM);
     if (fd < 0) { return Err(0 - fd); }
     return Ok(fd);
     #endif
@@ -246,9 +501,11 @@ fn sock_reuse(fd): i64 {
     #ifndef CYRIUS_TARGET_AGNOS
     # The option value lives on the stack: setsockopt copies it in, so there is no allocation to
     # refuse (it was an unchecked alloc(4), leaked per call, until 6.6.10). CHANGELOG [6.6.10]
+    # _NET_SO_REUSE is SO_REUSEADDR on POSIX and SO_EXCLUSIVEADDRUSE on Windows (see its
+    # definition: Windows' SO_REUSEADDR would let another socket take this port). CHANGELOG [6.6.11]
     var val[8];
     store32(&val, 1);
-    return syscall(NSYS_SETSOCKOPT, fd, SOL_SOCKET, SO_REUSEADDR, &val, 4);
+    return _net_os_setopt(fd, SOL_SOCKET, _NET_SO_REUSE, &val, 4);
     #endif
 }
 
@@ -268,23 +525,8 @@ fn sock_set_recv_timeout(fd, secs, usecs): i64 {
     return _agnos_sock_set_tmo(&_agnos_sock_rcvto_us, fd, secs * 1000000 + usecs);
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    # Linux struct timeval is {tv_sec, tv_usec} — both i64 on 64-bit
-    # Linux (16 bytes total). Kernel reads 16 bytes; padding doesn't
-    # matter because both fields are 64-bit.
-    # On the stack: setsockopt copies the timeval in (an unchecked, leaked alloc(16) per call
-    # until 6.6.10). CHANGELOG [6.6.10]
-    var tvb[16];
-    var tv = &tvb;
-    memset(tv, 0, 16);
-    store64(tv, secs);
-    #ifdef CYRIUS_TARGET_MACOS
-    # Darwin struct timeval is {tv_sec: i64, tv_usec: i32} — tv_usec is 32-bit
-    # (a 64-bit write would spill into the next field / past the struct).
-    store32(tv + 8, usecs);
-    #else
-    store64(tv + 8, usecs);
-    #endif
-    return syscall(NSYS_SETSOCKOPT, fd, SOL_SOCKET, SO_RCVTIMEO, tv, 16);
+    # A timeval on POSIX, a DWORD of milliseconds on Windows — _net_set_timeo owns the layouts.
+    return _net_set_timeo(fd, SO_RCVTIMEO, secs, usecs);
     #endif
 }
 
@@ -305,16 +547,7 @@ fn sock_set_send_timeout(fd, secs, usecs): i64 {
     return _agnos_sock_set_tmo(&_agnos_sock_sndto_us, fd, secs * 1000000 + usecs);
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    var tvb[16];                                 # on the stack, as above. CHANGELOG [6.6.10]
-    var tv = &tvb;
-    memset(tv, 0, 16);
-    store64(tv, secs);
-    #ifdef CYRIUS_TARGET_MACOS
-    store32(tv + 8, usecs);
-    #else
-    store64(tv + 8, usecs);
-    #endif
-    return syscall(NSYS_SETSOCKOPT, fd, SOL_SOCKET, SO_SNDTIMEO, tv, 16);
+    return _net_set_timeo(fd, SO_SNDTIMEO, secs, usecs);
     #endif
 }
 
@@ -341,7 +574,7 @@ fn sock_bind(fd, addr, port) : Result {
     #ifndef CYRIUS_TARGET_AGNOS
     var sa = sockaddr_in(addr, port);
     if (sa == 0) { return Err(12); }             # ENOMEM: the address was never built
-    var r = syscall(NSYS_BIND, fd, sa, 16);
+    var r = _net_os_bind(fd, sa, 16);
     if (r < 0) { return Err(0 - r); }
     return Ok(0);
     #endif
@@ -360,7 +593,7 @@ fn sock_listen(fd, backlog) : Result {
     return Ok(0);
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    var r = syscall(NSYS_LISTEN, fd, backlog);
+    var r = _net_os_listen(fd, backlog);
     if (r < 0) { return Err(0 - r); }
     return Ok(0);
     #endif
@@ -397,7 +630,7 @@ fn sock_accept(fd) : Result {
     # was written but NEVER read (sock_accept returns only Ok(cfd)), so allocating
     # it was 20 B/call of pure bump-heap leak. accept(2) accepts NULL/NULL. A future
     # caller needing the peer addr should add sock_accept_from(fd, out) instead.
-    var cfd = syscall(SYS_ACCEPT, fd, 0, 0);
+    var cfd = _net_os_accept(fd);
     if (cfd < 0) {
         # v6.4.61 (Fix B): the would-block (-EAGAIN) return is the poll-loop's steady
         # state — hand back the shared singleton instead of boxing a fresh Result
@@ -425,7 +658,7 @@ fn sock_connect(fd, addr, port) : Result {
     #ifndef CYRIUS_TARGET_AGNOS
     var sa = sockaddr_in(addr, port);
     if (sa == 0) { return Err(12); }             # ENOMEM: the address was never built
-    var r = syscall(NSYS_CONNECT, fd, sa, 16);
+    var r = _net_os_connect(fd, sa, 16);
     if (r < 0) { return Err(0 - r); }
     return Ok(0);
     #endif
@@ -433,7 +666,7 @@ fn sock_connect(fd, addr, port) : Result {
 
 # Send data on socket. Returns Result(bytes_sent).
 fn sock_send(fd, buf, len) : Result {
-    var n = sys_write(fd, buf, len);
+    var n = _net_os_send(fd, buf, len);
     if (n < 0) { return Err(0 - n); }
     return Ok(n);
 }
@@ -449,7 +682,7 @@ fn sock_send(fd, buf, len) : Result {
 fn sock_send_all(fd, buf, len): i64 {
     var off = 0;
     while (off < len) {
-        var n = sys_write(fd, buf + off, len - off);
+        var n = _net_os_send(fd, buf + off, len - off);
         if (n == 0 - 4) { continue; }               # EINTR: nothing was written; retry
         if (n < 0) { return n; }
         if (n == 0) { return 0 - 5; }               # EIO: a stream write never returns 0 for len > 0
@@ -460,7 +693,7 @@ fn sock_send_all(fd, buf, len): i64 {
 
 # Receive data from socket. Returns Result(bytes_read).
 fn sock_recv(fd, buf, len) : Result {
-    var n = sys_read(fd, buf, len);
+    var n = _net_os_recv(fd, buf, len);
     if (n < 0) { return Err(0 - n); }
     return Ok(n);
 }
@@ -483,7 +716,7 @@ fn sock_recv(fd, buf, len) : Result {
 # that happens inside the callee.
 #
 # ⚠ ONLY send/recv HAVE PEERS, and the reason is a drift hazard, not scope. These two are three
-# lines of straight `sys_write`/`sys_read` with no per-target branches. The other seven
+# lines over the `_net_os_send`/`_net_os_recv` primitives with no per-target branches of their own. The other seven
 # `: Result` fns in this file (`tcp_socket`, `udp_socket`, `sock_bind`, `sock_listen`,
 # `sock_accept`, `sock_connect`, `_net_eagain`) each carry `#ifdef CYRIUS_TARGET_AGNOS`
 # branches with genuinely different semantics per target — AGNOS merges bind+listen, its accept
@@ -500,21 +733,22 @@ fn sock_recv(fd, buf, len) : Result {
 # declarations and 516 construction sites. See lib/result.cyr's `ok_via` header.
 # Send on a socket, boxing the Result through the caller's allocator. Returns Ok(n)/Err(errno).
 fn sock_send_a(a, fd, buf, len): i64 {
-    var n = sys_write(fd, buf, len);
+    var n = _net_os_send(fd, buf, len);
     if (n < 0) { return err_via(a, 0 - n); }
     return ok_via(a, n);
 }
 
 # Receive from a socket, boxing the Result through the caller's allocator. Ok(n)/Err(errno).
 fn sock_recv_a(a, fd, buf, len): i64 {
-    var n = sys_read(fd, buf, len);
+    var n = _net_os_recv(fd, buf, len);
     if (n < 0) { return err_via(a, 0 - n); }
     return ok_via(a, n);
 }
 
-# Close socket
+# Close a socket from this file: 0 or -errno. ⚠ Close sockets with THIS, never sys_close: on
+# Windows a SOCKET needs closesocket (CHANGELOG [6.6.11]).
 fn sock_close(fd): i64 {
-    return sys_close(fd);
+    return _net_os_close(fd);
 }
 
 # Shutdown socket (0=read, 1=write, 2=both)
@@ -526,7 +760,7 @@ fn sock_shutdown(fd, how): i64 {
     return 0;
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    return syscall(SYS_SHUTDOWN, fd, how);
+    return _net_os_shutdown(fd, how);
     #endif
 }
 
@@ -550,7 +784,7 @@ fn sock_reuseport(fd): i64 {
     #ifndef CYRIUS_TARGET_AGNOS
     var optval[4];
     store32(&optval, 1);
-    return syscall(NSYS_SETSOCKOPT, fd, SOL_SOCKET, SO_REUSEPORT, &optval, 4);
+    return _net_os_setopt(fd, SOL_SOCKET, SO_REUSEPORT, &optval, 4);
     #endif
 }
 
@@ -565,7 +799,7 @@ fn net_join_multicast(fd, group, iface): i64 {
     var mreq[8];
     store32(&mreq, group);
     store32(&mreq + 4, iface);
-    return syscall(NSYS_SETSOCKOPT, fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, 8);
+    return _net_os_setopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, 8);
     #endif
 }
 
@@ -578,7 +812,7 @@ fn net_drop_multicast(fd, group, iface): i64 {
     var mreq[8];
     store32(&mreq, group);
     store32(&mreq + 4, iface);
-    return syscall(NSYS_SETSOCKOPT, fd, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq, 8);
+    return _net_os_setopt(fd, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq, 8);
     #endif
 }
 
@@ -591,7 +825,7 @@ fn net_set_multicast_ttl(fd, ttl): i64 {
     #ifndef CYRIUS_TARGET_AGNOS
     var optval[4];
     store32(&optval, ttl);
-    return syscall(NSYS_SETSOCKOPT, fd, IPPROTO_IP, IP_MULTICAST_TTL, &optval, 4);
+    return _net_os_setopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &optval, 4);
     #endif
 }
 
@@ -603,7 +837,7 @@ fn net_set_multicast_loop(fd, on): i64 {
     #ifndef CYRIUS_TARGET_AGNOS
     var optval[4];
     store32(&optval, on);
-    return syscall(NSYS_SETSOCKOPT, fd, IPPROTO_IP, IP_MULTICAST_LOOP, &optval, 4);
+    return _net_os_setopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &optval, 4);
     #endif
 }
 
@@ -616,7 +850,7 @@ fn net_set_multicast_if(fd, iface): i64 {
     #ifndef CYRIUS_TARGET_AGNOS
     var optval[4];
     store32(&optval, iface);
-    return syscall(NSYS_SETSOCKOPT, fd, IPPROTO_IP, IP_MULTICAST_IF, &optval, 4);
+    return _net_os_setopt(fd, IPPROTO_IP, IP_MULTICAST_IF, &optval, 4);
     #endif
 }
 
@@ -724,7 +958,12 @@ fn net_connect_sa_nb(fd, sa, salen, timeout_ms): i64 {
     # tagged adapter); callers use net_connect_nb for v4. Fail closed here.
     return _NET_CONN_NB_ERR;
     #endif
+    #ifdef CYRIUS_TARGET_WIN
+    # Windows has no fcntl and no poll(2): ioctlsocket(FIONBIO) + WSAPoll. CHANGELOG [6.6.11]
+    return _net_win_connect_nb(fd, sa, salen, timeout_ms);
+    #endif
     #ifndef CYRIUS_TARGET_AGNOS
+    #ifndef CYRIUS_TARGET_WIN
     # v6.6.8: a failed F_SETFL is now an error too — it used to be ignored, which ran the
     # "bounded" connect in BLOCKING mode. CHANGELOG [6.6.8]
     var saved_flags = fd_set_nonblocking(fd);               # F_GETFL + F_SETFL O_NONBLOCK
@@ -753,7 +992,44 @@ fn net_connect_sa_nb(fd, sa, salen, timeout_ms): i64 {
     fd_restore_flags(fd, saved_flags);                      # F_SETFL <saved> — restore blocking
     return result;
     #endif
+    #endif
 }
+
+#ifdef CYRIUS_TARGET_WIN
+# net_connect_sa_nb on Windows: FIONBIO on, connect, WSAPoll for writability, SO_ERROR, FIONBIO
+# off on every exit path (the socket is always left BLOCKING — Windows cannot read FIONBIO back,
+# so there is no prior state to restore; see sock_set_nonblocking). Same sentinels.
+# ⚠ WSAPoll before Windows 10 2004 does not report a REFUSED non-blocking connect: it waits out
+# the timeout, so on those builds a refusal reads as _NET_CONN_NB_TIMEOUT. CHANGELOG [6.6.11]
+fn _net_win_connect_nb(fd, sa, salen, timeout_ms): i64 {
+    if (_net_wsa_nbio(fd, 1) != 0) { return _NET_CONN_NB_ERR; }
+    var result = _NET_CONN_NB_ERR;
+    var cr = _net_wsa_rc(syscall(0xF028, fd, sa, salen));  # connect
+    if (cr == 0) {
+        result = _NET_CONN_NB_OK;
+    } elif (cr == 0 - _NET_EINPROGRESS) {                   # WSAEWOULDBLOCK: under way
+        var pfd[16];                                        # WSAPOLLFD { SOCKET, short, short }
+        store64(&pfd, fd);
+        store16(&pfd + 8, 0x10);                            # POLLWRNORM (Windows' POLLOUT)
+        store16(&pfd + 10, 0);
+        store32(&pfd + 12, 0);
+        var pr = syscall(0xF04A, &pfd, 1, timeout_ms);      # WSAPoll
+        if (pr > 0) {
+            var sb[8];
+            var slen[8];
+            store64(&sb, 1);                                # not 0: an unwritten value is no success
+            store64(&slen, 4);
+            if (_net_wsa_rc(syscall(0xF026, fd, SOL_SOCKET, SO_ERROR, &sb, &slen)) == 0) {
+                if (load32(&sb) == 0) { result = _NET_CONN_NB_OK; }
+            }
+        } elif (pr == 0) {
+            result = _NET_CONN_NB_TIMEOUT;
+        }
+    }
+    _net_wsa_nbio(fd, 0);                                   # back to blocking
+    return result;
+}
+#endif
 
 # v6.2.10: IPv6 non-blocking connect — `addr16` is a ptr to the 16-byte v6
 # address (network byte order), `port` host-order. Builds a Darwin/Linux-correct
@@ -793,8 +1069,15 @@ fn sock_set_nonblocking(fd): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return 0;
     #endif
+    #ifdef CYRIUS_TARGET_WIN
+    # ioctlsocket(FIONBIO, 1). Windows cannot read a socket's blocking mode back, so the "saved"
+    # value is always 0 (blocking) and sock_clear_nonblocking restores blocking. CHANGELOG [6.6.11]
+    return _net_wsa_nbio(fd, 1);
+    #endif
     #ifndef CYRIUS_TARGET_AGNOS
+    #ifndef CYRIUS_TARGET_WIN
     return fd_set_nonblocking(fd);
+    #endif
     #endif
 }
 
@@ -803,8 +1086,13 @@ fn sock_clear_nonblocking(fd, saved): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return 0;
     #endif
+    #ifdef CYRIUS_TARGET_WIN
+    return _net_wsa_nbio(fd, 0);                            # ioctlsocket(FIONBIO, 0)
+    #endif
     #ifndef CYRIUS_TARGET_AGNOS
+    #ifndef CYRIUS_TARGET_WIN
     return fd_restore_flags(fd, saved);
+    #endif
     #endif
 }
 
@@ -977,20 +1265,24 @@ fn _net_conf_scan(path, want): i64 {
 }
 
 # A 16-bit DNS transaction id from the kernel CSPRNG — a guessable id is what lets an off-path
-# attacker forge the answer (the Kaminsky class). /dev/urandom if getrandom fails; -1 when
-# neither yields 2 bytes, and the caller fails the lookup.
+# attacker forge the answer (the Kaminsky class). /dev/urandom if getrandom fails (POSIX only);
+# -1 when neither yields 2 bytes, and the caller fails the lookup.
 # ⛔ NEVER add a weak fallback (clock, stack address, pid): a predictable TXID is worse than a
 # failed lookup, which is exactly what CVE-19 closed. CHANGELOG [6.6.9]
 fn _net_dns_id(): i64 {
     var b[8];
     store64(&b, 0);
     if (sys_getrandom(&b, 2, 0) == 2) { return load16(&b); }
+    #ifndef CYRIUS_TARGET_WIN
+    # ⛔ Not on Windows: sys_getrandom there is ProcessPrng, and "/dev/urandom" is a DRIVE-RELATIVE
+    # path (C:\dev\urandom) that any local user can create and fill with fixed bytes. CHANGELOG [6.6.11]
     var fd = file_open("/dev/urandom", 0, 0);
     if (fd >= 0) {
         var n = file_read(fd, &b, 2);
         file_close(fd);
         if (n == 2) { return load16(&b); }
     }
+    #endif
     return 0 - 1;
 }
 
@@ -1129,19 +1421,75 @@ fn net_dns_query_ipv4(host, ns, port): i64 {
 # takes, or -1. In order: a dotted-quad literal; `localhost` and any `*.localhost` name, which
 # are always 127.0.0.1 (RFC 6761); the IPv4 entries of /etc/hosts; one DNS A query to the first
 # IPv4 `nameserver` in /etc/resolv.conf — 127.0.0.1 when it names none, as glibc does. agnos
-# has no BSD UDP socket, so there only the first three steps can succeed.
+# has no BSD UDP socket, so there only the first three steps can succeed. On Windows the last
+# two steps are the system resolver instead (see _net_resolve_win).
 fn net_resolve_ipv4(host): i64 {
     if (host == 0) { return 0 - 1; }
     if (load8(host) == 0) { return 0 - 1; }
     var lit = net_parse_ipv4(host);
     if (lit != 0 - 1) { return lit; }
     if (_net_is_localhost(host) == 1) { return INADDR_LOOPBACK(); }
+    #ifdef CYRIUS_TARGET_WIN
+    var w = _net_resolve_win(host);
+    return w;
+    #endif
+    #ifndef CYRIUS_TARGET_WIN
     var h = _net_conf_scan("/etc/hosts", host);
     if (h != 0 - 1) { return h; }
     var ns = _net_conf_scan("/etc/resolv.conf", 0);
     if (ns == 0 - 1) { ns = INADDR_LOOPBACK(); }
     return net_dns_query_ipv4(host, ns, 53);
+    #endif
 }
+
+#ifdef CYRIUS_TARGET_WIN
+# net_resolve_ipv4's Windows steps: getaddrinfo, the SYSTEM resolver — the real hosts file
+# (%SystemRoot%\System32\drivers\etc\hosts) and the adapters' DNS servers. Returns the first
+# IPv4 address, or -1.
+# ⛔ CVE-grade: NEVER open /etc/hosts or /etc/resolv.conf here, and never fall back to
+# 127.0.0.1:53. On Windows a rooted path is DRIVE-RELATIVE — "/etc/hosts" is C:\etc\hosts — and
+# any authenticated user may create folders at the root of the system drive, so the POSIX steps
+# let an unprivileged local user redirect every other user's lookups; and port 53 is not
+# privileged there, so the fallback nameserver is whoever binds it first. CHANGELOG [6.6.11]
+# Refused before any lookup: a name with a byte that is not printable ASCII (getaddrinfo reads
+# an ANSI code-page string, and IDNs need punycode first), and a name Windows would parse as an
+# ADDRESS although net_parse_ipv4 refused it ("010.0.0.1", "127.1", "0x7f000001") — the
+# strict-literal rule must not be undone one layer down. Measured: wine's getaddrinfo (glibc)
+# reads all three as addresses; Windows' own refused them on cass, so there this is defence.
+fn _net_resolve_win(host): i64 {
+    var n = strlen(host);
+    if (n == 0 || n > 254) { return 0 - 1; }
+    var i = 0;
+    while (i < n) {
+        var c = load8(host + i);
+        if (c <= 32 || c >= 127) { return 0 - 1; }
+        i = i + 1;
+    }
+    if (_net_wsa_init() != 0) { return 0 - 1; }
+    var hints[48];                                  # ADDRINFOA
+    memset(&hints, 0, 48);
+    store32(&hints, 4);                             # ai_flags = AI_NUMERICHOST
+    store32(&hints + 4, AF_INET);                   # ai_family
+    var res[8];
+    store64(&res, 0);
+    if (_net_wsa_rc(syscall(0xF02B, host, 0, &hints, &res)) == 0) {
+        syscall(0xF02C, load64(&res));              # freeaddrinfo
+        return 0 - 1;                               # a numeric form the strict parser refused
+    }
+    store32(&hints, 0);
+    store64(&res, 0);
+    if (_net_wsa_rc(syscall(0xF02B, host, 0, &hints, &res)) != 0) { return 0 - 1; }
+    var addr = 0 - 1;
+    var ai = load64(&res);
+    while (ai != 0 && addr == 0 - 1) {
+        # ADDRINFOA on Win64: ai_family @4, ai_addr @32, ai_next @40; sin_addr is at +4.
+        if (load32(ai + 4) == AF_INET && load64(ai + 32) != 0) { addr = load32(load64(ai + 32) + 4); }
+        ai = load64(ai + 40);
+    }
+    syscall(0xF02C, load64(&res));                  # freeaddrinfo
+    return addr;
+}
+#endif
 
 # === Simple TCP server pattern ===
 # fn handle_client(cfd) { ... }

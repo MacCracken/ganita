@@ -92,7 +92,12 @@ Deliberately not in ganita, so that nobody adds them by accident:
 
 ---
 
-## Moving the cyrius pin (done at 1.2.7: 6.6.4 → 6.6.7; at 1.2.8: → 6.6.9; at 1.2.9: → 6.6.10)
+## Moving the cyrius pin (done at 1.2.7: 6.6.4 → 6.6.7; at 1.2.8: → 6.6.9; at 1.2.9: → 6.6.10; at 1.2.10: → 6.6.11)
+
+**1.2.10 moved it to `cyrius = "6.6.11"`** by the same sequence (`lib/` re-vendored to the
+111-file 6.6.11 snapshot, `dist/` regenerated), and raised `cyrius coverage --min` 98 → 100
+in the same commit: the 6.6.11 tool excludes the entry point `main`, and older pins still
+count it (139/141), so the floor and the pin move together.
 
 **1.2.9 moved it to `cyrius = "6.6.10"`** by the same sequence (`lib/` re-vendored to the
 111-file 6.6.10 snapshot, `dist/` regenerated).

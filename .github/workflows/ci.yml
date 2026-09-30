@@ -169,19 +169,20 @@ jobs:
       - name: Bench harness compiles and runs
         run: cyrius bench
 
-      # A floor that ratchets, not a target. Raise it whenever real coverage
-      # lands; never lower it to make a red build green.
+      # 100 %: every public fn is referenced from the tests. Never lower it to
+      # make a red build green; a new uncalled fn fails here until a test calls it.
       #
       # Since cyrius 6.6.8 `cyrius coverage` counts REFERENCES — whole identifiers
       # outside comments and strings — not substrings. Under the old counter every
       # _compat alias was credited because its name is a substring of the canonical
-      # it forwards to (and one comment line naming an uncalled function moved the
-      # figure 80% -> 82% at 1.2.2; docs/audit/2026-09-07-v1.2.3-audit.md). The 6.6.9
-      # pin measured the truth at 60%; 1.2.8's alias rows made it 98%, so the floor
-      # was RAISED 94 -> 98, never lowered. The word-boundary script below stays as
-      # the independent second count.
+      # it forwards to (docs/audit/2026-09-07-v1.2.3-audit.md). The floor stood at 98
+      # only because the <= 6.6.10 tool also counted the two `main` entry points
+      # (src/main.cyr, src/test.cyr), which nothing can call: 139/141. cyrius 6.6.11
+      # excludes an entry point, and at that pin every fn is covered, 139/139 — so the
+      # floor is 100, and it rose in the same commit as the pin (1.2.10). The
+      # word-boundary script below stays as the independent second count.
       - name: Reference coverage floor (tool)
-        run: cyrius coverage --min 98
+        run: cyrius coverage --min 100
 
       # The same floor counted on word boundaries with comments stripped. This
       # is the number to plan against; the tool's is the number to ratchet.

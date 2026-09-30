@@ -4,6 +4,31 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.10] — 2026-09-30 — toolchain 6.6.11; the tool coverage floor is 100
+
+CI only. Toolchain **6.6.10 → 6.6.11** (the vendored `lib/` is the full 6.6.11 snapshot).
+No source or public signature changed; **597 assertions**, unchanged.
+
+### Changed — `cyrius coverage --min 98` → `--min 100`
+
+The floor sat at 98 because the ≤ 6.6.10 tool counted the two entry points —
+`src/main.cyr` and `src/test.cyr` `main` — which nothing can call: 139/141. cyrius 6.6.11
+excludes an entry point from the count, and at that pin ganita is 139/139 (100 %). The rise
+lands in the same commit as the pin move, because the wrapper runs the manifest-pinned CLI:
+with this `ci.yml` and the pin left at 6.6.10 the step fails (`coverage gate FAILED: 98% <
+--min 100%`, the two `main`s listed as unreferenced). The comment above the step is
+rewritten to say so. The word-boundary floor (`scripts/coverage-honest.sh 88`) is a separate
+count and is unchanged.
+
+### Changed
+
+- **Toolchain pin 6.6.10 → 6.6.11.** `lib/` re-vendored with `cyrius lib sync --full`
+  (111 files, `diff -rq` clean against the 6.6.11 snapshot; 21 files changed, including the
+  `lib/ganita.cyr` fold of 1.2.9); `cyrius.lock` re-locked; `dist/` regenerated with
+  `cyrius distlib --all` (version header only; the `.deps` sidecar is unchanged).
+- README, `docs/development/state.md` and `docs/development/roadmap.md` name the 6.6.11 pin
+  and the 100 % floor.
+
 ## [1.2.9] — 2026-09-29 — f32 `sin` / `cos` are correct past 2^63
 
 Toolchain **6.6.9 → 6.6.10** (the vendored `lib/` is the full 6.6.10 snapshot). No

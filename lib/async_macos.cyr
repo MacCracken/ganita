@@ -189,12 +189,12 @@ fn _async_kev_wake(rt, ident, bit): i64 {
 # One reactor step (mirror of async.cyr _async_step). Runs every TASK_READY task, capturing its
 # return into the result slot (@40); a task that parks stays TASK_WAITING. If nothing ran and
 # tasks are parked, block in kevent() once and wake whoever fired: fd readiness, a timer (the
-# async_with_timeout sentinel, an interval tick) or a child's exit. Returns the count of tasks
-# still live (0 = idle).
+# async_with_timeout sentinel, an interval tick) or a child's exit; if a coroutine was kept
+# READY, poll without blocking instead. Returns the count of tasks still live (0 = idle).
 fn _async_step(rt): i64 {
-    var kq = load64(rt);
     var active = 0;
     var ran = 0;
+    var kept = 0;
     var t = load64(rt + 8);
     while (t != 0) {
         if (load64(t + 16) == TASK_READY) {
@@ -202,29 +202,48 @@ fn _async_step(rt): i64 {
             var r = fncall1(load64(t), load64(t + 8));
             ran = 1;
             if (load64(t + 16) == TASK_READY) {
-                store64(t + 40, r);
-                store64(t + 16, TASK_DONE);
+                # A coroutine suspended at an await that did not park stays READY (6.6.11 —
+                # it was finished with the 0 its suspend returned). lib/async.cyr explains.
+                var keep = 0;
+                #ifdef CYRIUS_ASYNC_FUTURES
+                keep = _async_coro_pending(t);
+                #endif
+                if (keep == 1) { kept = 1; }
+                else {
+                    store64(t + 40, r);
+                    store64(t + 16, TASK_DONE);
+                }
             }
         }
         if (load64(t + 16) != TASK_DONE) { active = active + 1; }
         t = load64(t + 24);
     }
     if (active > 0) {
-        if (ran == 0) {
-            # Every live task is parked. Block in kevent() and wake whoever fired. kqueue
-            # reports ONE event per (ident, filter), so the directions of one fd, a timer and a
-            # pid arrive as distinct events.
-            var evb[256];                   # 8 events x 32 B
-            var nr = sys_kevent(kq, 0, 0, &evb, 8, 0);
-            var ei = 0;
-            while (ei < nr) {
-                var eo = ei * KEV_SIZE;
-                _async_kev_wake(rt, load64(&evb + eo), _async_kev_bit(load16(&evb + eo + 8)));
-                ei = ei + 1;
-            }
-        }
+        if (ran == 0) { _async_kev_poll(rt, 0 - 1); }
+        elif (kept == 1) { _async_kev_poll(rt, 0); }   # so parked tasks are not starved
     }
     return active;
+}
+
+# Collect up to 8 events from the runtime's kqueue — blocking until one arrives when `block` is
+# -1, returning at once when it is 0 — and wake whoever fired. kqueue reports ONE event per
+# (ident, filter), so the directions of one fd, a timer and a pid arrive as distinct events.
+# Returns the number of events taken.
+fn _async_kev_poll(rt, block): i64 {
+    var evb[256];                   # 8 events x 32 B
+    var ts[16];
+    store64(&ts, 0);
+    store64(&ts + 8, 0);
+    var tsp = &ts;
+    if (block < 0) { tsp = 0; }
+    var nr = sys_kevent(load64(rt), 0, 0, &evb, 8, tsp);
+    var ei = 0;
+    while (ei < nr) {
+        var eo = ei * KEV_SIZE;
+        _async_kev_wake(rt, load64(&evb + eo), _async_kev_bit(load16(&evb + eo + 8)));
+        ei = ei + 1;
+    }
+    return nr;
 }
 
 # Drive the reactor until either watched handle is DONE, or — both 0 — until idle.
@@ -236,10 +255,12 @@ fn _async_pump(rt, until_a, until_b): i64 {
     }
 }
 
-# Run all spawned tasks to completion. The kqueue stays open (the epoll backend's async_run closes
-# its epfd).
+# Run all spawned tasks to completion, then close the runtime's kqueue: single-use, like the epoll
+# backend (6.6.11 — it was left open, one fd leaked per runtime, and this comment said so instead).
+# CHANGELOG [6.6.11]
 fn async_run(rt): i64 {
     _async_pump(rt, 0, 0);
+    sys_close(load64(rt));
     return 0;
 }
 
@@ -288,9 +309,11 @@ fn async_select(rt, handles, n): i64 {
 # reactor never re-runs it, and take its registrations out of the kqueue. A read/write filter is
 # deleted only when no OTHER parked task still waits on it (kqueue keys by (ident, filter), so
 # deleting it would silently drop that waiter too); a timer the task armed is always deleted.
-# ⚠ Leaving them armed is not harmless: a level-triggered fd registration nobody waits on makes
-# every later kevent() return at once, so the reactor spins instead of sleeping. No-op on a DONE
-# task.
+# A process task's child is ended too (6.6.11 — it was left running and unreaped): TERMed now,
+# the rest of the kill left to a task on `rt`, whose handle is returned for the caller to pump
+# to DONE (async_with_timeout does); otherwise 0.
+# ⚠ Leaving them armed is not harmless: an fd registration nobody waits on would be delivered to
+# nobody (a one-shot one once; a timer on every period). No-op on a DONE task.
 fn _async_retire(rt, t): i64 {
     if (t == 0) { return 0; }
     if (load64(t + 16) == TASK_DONE) { return 0; }
@@ -313,7 +336,13 @@ fn _async_retire(rt, t): i64 {
         if ((bits & _KEV_PROC) != 0) { _async_kev_change(kq, ident, _KEVF_PROC, _EV_DELETE, 0, 0); }
     }
     if (own >= 0) { _async_kev_change(kq, own, _KEVF_TIMER, _EV_DELETE, 0, 0); }
-    return 0;
+    var kt = 0;
+    # Guarded for the same reason as async_run_process's kill below: a whole-lib PE build
+    # compiles this file without process.cyr's POSIX block.
+    #ifndef CYRIUS_TARGET_WIN
+    if (load64(t) == &_async_process_task) { kt = _async_process_end(rt, load64(t + 8)); }
+    #endif
+    return kt;
 }
 
 # Deadline sentinel for async_with_timeout: parks on the one-shot EVFILT_TIMER its caller armed
@@ -330,7 +359,9 @@ fn _async_timeout_sentinel(ctx): i64 {
 # Await `handle` (an async_spawn / async_spawn_future return) with a deadline of `ms`
 # milliseconds. Returns 1 if the task completed in time (its result is then in the handle's
 # result slot, or via task_join), 0 if the deadline fired first (the still-pending task is
-# retired: it will not run again and its kqueue registrations are removed), or -1 if the deadline
+# retired: it will not run again and its kqueue registrations are removed; an
+# async_spawn_process handle's child is ended and reaped before this returns, 6.6.11 — the
+# child alone, or its process group when it leads one), or -1 if the deadline
 # could not be armed (the handle is then left as it was). Races the task against a one-shot
 # EVFILT_TIMER sentinel on the reactor — the kqueue analogue of the epoll backend's timerfd
 # sentinel; does NOT close the runtime. `ms <= 0` is a deadline that has already passed: the
@@ -359,8 +390,11 @@ fn async_with_timeout(rt, handle, ms): i64 {
     # snapshot the winner BEFORE retiring (retire marks the loser DONE)
     var completed = 0;
     if (load64(handle + 16) == TASK_DONE) { completed = 1; }
-    _async_retire(rt, handle);
+    var kt = _async_retire(rt, handle);
     _async_retire(rt, sentinel);
+    # A process loser's child is being ended by a kill task: drive it to done, so the child is
+    # reaped when this returns, while the runtime's other tasks keep running (6.6.11).
+    if (kt != 0) { _async_pump(rt, kt, 0); }
     return completed;
 }
 
@@ -430,7 +464,8 @@ fn _async_reap_code(pid): i64 {
 # Async subprocess task: on first run fork + exec the child and park on EVFILT_PROC/NOTE_EXIT
 # for its pid (the kqueue twin of the epoll backend's pidfd); on wake reap it and return the exit
 # code. ctx = { step, path, argv, envp, pid, group, rt }. With `group` set the child becomes its
-# own session and process-group leader first, so a deadline can signal its whole tree.
+# own session and process-group leader first, so a deadline can signal its whole tree. step 0 =
+# not forked, 1 = forked and parked, 2 = retired and handed to a kill task (6.6.11).
 fn _async_process_task(ctx): i64 {
     if (load64(ctx) == 0) {
         var pid = sys_fork();
@@ -480,12 +515,68 @@ fn async_spawn_process(rt, path, argv, envp): i64 {
     return _async_spawn_process_in(rt, path, argv, envp, 0);
 }
 
+# ── The deadline's kill as a reactor task (6.6.11) ──────
+# ⛔ async_run_process called the BLOCKING proc_kill_tree after its deadline — TERM, then a
+# 10 ms sleep-poll for up to `_PROC_GRACE_MS` (5 s) during which no task ran; and a plain
+# async_with_timeout on a process handle ended nothing. Now the retire TERMs the child's group
+# (`_proc_kill_begin`, the child alone when it leads none) and a task on the same reactor
+# finishes the kill: it parks on a periodic 10 ms EVFILT_TIMER (ident = its ctx, owned so a
+# retire deletes it) and takes one non-blocking look (`_proc_kill_step`) per tick until nothing
+# is left or the grace has run out, then KILLs and reaps (`_proc_kill_finish`). lib/async.cyr
+# carries the epoll twin. ctx (72 B) = { kill state @0 (40 B, lib/process.cyr), status @40,
+# started ms @48, rt @56, spare @64 }.
+#ifndef CYRIUS_TARGET_WIN
+fn _async_kill_task(ctx): i64 {
+    var rt = load64(ctx + 56);
+    if (_proc_kill_step(ctx, ctx + 40) == 0) {
+        if (clock_now_ms() - load64(ctx + 48) < _PROC_GRACE_MS) {
+            _async_kev_park(rt, ctx, _KEV_TIMER);
+            return 0;
+        }
+    }
+    _proc_kill_finish(ctx, ctx + 40);
+    _async_kev_change(load64(rt), ctx, _KEVF_TIMER, _EV_DELETE, 0, 0);
+    var cur = load64(rt + 40);
+    if (cur != 0) { store64(cur + 48, 0 - 1); }    # the timer is gone: nothing for a retire
+    return 0;
+}
+
+# End the child of a retired process task (ctx `pctx`): TERM it — its group when it leads one —
+# and return a kill task on `rt` that finishes the job, or 0 when there is nothing to end or the
+# kill was completed here because no task could be made (then it BLOCKS for the grace: correct,
+# only not concurrent).
+fn _async_process_end(rt, pctx): i64 {
+    if (load64(pctx) != 1) { return 0; }          # never forked, or already handed over
+    var pid = load64(pctx + 32);
+    if (pid <= 0) { return 0; }
+    store64(pctx, 2);
+    var ctx = alloc_via(load64(rt + 32), 72);
+    if (ctx == 0) {
+        var sb[8];
+        proc_kill_tree(pid, &sb);
+        return 0;
+    }
+    store64(ctx + 48, clock_now_ms());
+    store64(ctx + 56, rt);
+    _proc_kill_begin(ctx, pid, 1);
+    var kt = 0;
+    if (_async_kev_change(load64(rt), ctx, _KEVF_TIMER, _EV_ADD, 0, 10) >= 0) {
+        kt = async_spawn(rt, &_async_kill_task, ctx);
+        if (kt == 0) { _async_kev_change(load64(rt), ctx, _KEVF_TIMER, _EV_DELETE, 0, 0); }
+        else { store64(kt + 48, ctx); }             # a retire of the kill task deletes the timer
+    }
+    if (kt == 0) { _proc_kill_wait(ctx, ctx + 40, 0); }   # no task: finish it here, blocking
+    return kt;
+}
+#endif
+
 # Spawn `path` and wait for it, with an optional deadline (ms <= 0 = no deadline). Returns the
 # child's exit code, -2 if the deadline fired first, or -1 if it could not be started or the
 # deadline could not be armed. With a deadline the child runs as its own process-group leader,
-# and on expiry `proc_kill_tree` ends its whole tree (TERM, grace, KILL) and REAPS it — so it is
-# not waited for again here. Does NOT close the runtime. v6.4.36 (P2); on macOS since 6.6.10
-# (before, it returned -1 and spawned nothing). CHANGELOG [6.6.10]
+# and on expiry async_with_timeout's retire ends its whole GROUP (TERM, grace, KILL) and reaps it
+# while the runtime's other tasks keep running. Does NOT close the runtime. v6.4.36 (P2); on
+# macOS since 6.6.10 (before, it returned -1 and spawned nothing). 6.6.11: the kill is a reactor
+# task driven from the retire, no longer a blocking proc_kill_tree here. CHANGELOG [6.6.11]
 fn async_run_process(rt, path, argv, envp, ms): i64 {
     if (ms <= 0) {
         var h0 = async_spawn_process(rt, path, argv, envp);
@@ -496,18 +587,13 @@ fn async_run_process(rt, path, argv, envp, ms): i64 {
     if (h == 0) { return 0 - 1; }
     var w = async_with_timeout(rt, h, ms);
     if (w == 1) { return load64(h + 40); }
-    _async_retire(rt, h);                           # w == -1 leaves it unretired
-    var pid = load64(load64(h + 8) + 32);
-    if (pid > 0) {
-        var st[8];
-        # Guarded although this peer only ever serves macOS: a whole-lib concatenation (e.g.
-        # tests/gates/codegen/dce_pe_macho_layout_declines_compaction.sh) compiles every
-        # lib/*_macos.cyr for PE too, where process.cyr's POSIX block — and this fn — is absent.
-        #ifndef CYRIUS_TARGET_WIN
-        proc_kill_tree(pid, &st);                   # TERM the tree, grace, KILL, reap pid
-        #endif
+    if (w < 0) {
+        # No deadline could be armed, so nothing was run: retire the handle so a later pump
+        # does not start a child nobody is waiting for.
+        var kt = _async_retire(rt, h);
+        if (kt != 0) { _async_pump(rt, kt, 0); }
+        return 0 - 1;
     }
-    if (w < 0) { return 0 - 1; }
     return 0 - 2;
 }
 
@@ -593,14 +679,21 @@ fn async_await_readable(fd): i64 {
 # ⭐ kqueue needs NO union mask and NO modify-on-conflict: it keys by (ident, filter), so read and
 # write are independent registrations and repeated EV_ADD of the same pair is an idempotent
 # update, not an error (the -EEXIST the epoll backend fixed at v6.5.26 cannot happen).
+# ⛔ 6.6.11 — EV_ONESHOT. A plain EV_ADD is level-triggered and PERSISTENT, and the wake path never
+# removed it, so after a normal wake on an fd that stayed readable every later kevent() returned
+# that event at once, woke nobody, and the reactor SPUN instead of sleeping. The epoll twin
+# deletes or modifies its registration after each wake. A wake already wakes EVERY waiter on
+# (ident, filter), so one delivery is all a registration is for; a later park re-adds it.
+# CHANGELOG [6.6.11]
 fn _async_kev_register(rt, fd, events): i64 {
     var cur = load64(rt + 40);
     if (cur == 0) { return 0 - 1; }
     var kq = load64(rt);
     var rc = 0;
-    if ((events & _KEV_READ) != 0) { rc = _async_kev_change(kq, fd, _KEVF_READ, _EV_ADD, 0, 0); }
+    var fl = _EV_ADD | _EV_ONESHOT;
+    if ((events & _KEV_READ) != 0) { rc = _async_kev_change(kq, fd, _KEVF_READ, fl, 0, 0); }
     if (rc >= 0) {
-        if ((events & _KEV_WRITE) != 0) { rc = _async_kev_change(kq, fd, _KEVF_WRITE, _EV_ADD, 0, 0); }
+        if ((events & _KEV_WRITE) != 0) { rc = _async_kev_change(kq, fd, _KEVF_WRITE, fl, 0, 0); }
     }
     if (rc < 0) { return 0 - 1; }   # not parked: a caller that sees -1 can fall back to blocking I/O
     return _async_kev_park(rt, fd, events);

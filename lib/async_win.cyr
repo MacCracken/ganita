@@ -147,11 +147,13 @@ fn async_spawn(rt, fp, arg): i64 {
 }
 
 # One reactor step. Run every TASK_READY task; if none ran and tasks are parked, drain
-# ONE IOCP completion and wake the owning task. Returns the count of tasks not yet DONE.
+# ONE IOCP completion and wake the owning task (without blocking when a coroutine was kept
+# READY). Returns the count of tasks not yet DONE.
 fn _async_step(rt): i64 {
     var iocp = load64(rt);
     var active = 0;
     var ran = 0;
+    var kept = 0;
     var t = load64(rt + 8);
     while (t != 0) {
         if (load64(t + 16) == TASK_READY) {
@@ -159,8 +161,17 @@ fn _async_step(rt): i64 {
             var r = fncall1(load64(t), load64(t + 8));
             ran = 1;
             if (load64(t + 16) == TASK_READY) {
-                store64(t + 40, r);
-                store64(t + 16, TASK_DONE);
+                # A coroutine suspended at an await that did not park stays READY (6.6.11 —
+                # it was finished with the 0 its suspend returned). lib/async.cyr explains.
+                var keep = 0;
+                #ifdef CYRIUS_ASYNC_FUTURES
+                keep = _async_coro_pending(t);
+                #endif
+                if (keep == 1) { kept = 1; }
+                else {
+                    store64(t + 40, r);
+                    store64(t + 16, TASK_DONE);
+                }
             }
         }
         if (load64(t + 16) != TASK_DONE) {
@@ -169,11 +180,15 @@ fn _async_step(rt): i64 {
         t = load64(t + 24);
     }
     if (active > 0) {
-        if (ran == 0) {
+        # Nothing ran: block for a completion. A coroutine kept READY: take one that is already
+        # queued without blocking, so parked tasks are not starved while it runs (6.6.11).
+        var wait_ms = 0 - 1;
+        if (ran == 1) { wait_ms = 0; }
+        if (ran == 0 || kept == 1) {
             var bytes[8]; store64(&bytes, 0);
             var key[8]; store64(&key, 0);
             var ovl[8]; store64(&ovl, 0);
-            syscall(0xF020, iocp, &bytes, &key, &ovl, 0 - 1);   # GetQueuedCompletionStatus (block)
+            syscall(0xF020, iocp, &bytes, &key, &ovl, wait_ms);   # GetQueuedCompletionStatus
             var lpov = load64(&ovl);
             if (lpov != 0) {
                 # lpov = ctx (OVERLAPPED @ ctx+0). Recover the task; wake it UNLESS it was

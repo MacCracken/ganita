@@ -10,7 +10,9 @@
 # `arch/x86/include/uapi/asm/stat.h` values.
 #
 # Cyrius re-implementation of agnosys syscall bindings.
-# Constants use enums to avoid gvar_toks overflow (4096 slot limit).
+# Constants are enums so they fold to compile-time literals: no data slot and no load, and a
+# syscall number spelled with one is a LITERAL to the compiler's per-target syscall routing (a
+# `var` number is not — parse_expr.cyr's non-literal-number warning). CHANGELOG [6.6.11]
 
 # ================================================================
 # Syscall numbers (x86_64)
