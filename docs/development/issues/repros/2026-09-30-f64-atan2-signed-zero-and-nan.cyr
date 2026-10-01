@@ -1,0 +1,87 @@
+# ganita_f64_atan2 ignores the sign of a zero y and of a zero x, and answers a NaN y
+# at x = +-0 with -pi/2.
+#
+# Self-proving: the exit code is the number of rows of the C99 Annex F (F.10.1.4)
+# atan2 table below that come back wrong -- 0 when every row is right. Each row is
+# printed with the bits it got and the bits C99 specifies.
+#
+# Filed with docs/development/issues/2026-09-30-f64-atan2-signed-zero-and-nan.md.
+# Found by hisab (3.2.2, the cyrius 6.6.6 -> 6.6.12 bump): from cyrius 6.6.8 on,
+# `f64_neg(+0)` is an IEEE sign flip and yields -0, so `cx_conj(-1 + 0i)` carries a
+# -0 imaginary part into atan2 -- and gets +pi back where carg(conj z) = -carg(z)
+# says -pi.
+#
+# Build and run from the ganita repo root:
+#   cyrius build docs/development/issues/repros/2026-09-30-f64-atan2-signed-zero-and-nan.cyr /tmp/atan2z
+#   /tmp/atan2z; echo "exit=$?"      # -> 5 on ganita 1.2.10 (4 signed-zero rows + 1 NaN row)
+#
+# Zeros are written as bit patterns (0x8000000000000000 is -0.0) so the program means
+# the same thing on every toolchain, including those whose f64_neg(+0) is +0.
+#
+# Includes src/ directly rather than lib/ganita.cyr so it exercises the working
+# source. math_advanced has no matrix/linalg dependency.
+
+include "lib/syscalls.cyr"
+include "lib/string.cyr"
+include "lib/alloc.cyr"
+include "lib/fmt.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/math.cyr"
+
+include "src/math_advanced.cyr"
+
+var _PZ = 0;
+var _NZ = 0x8000000000000000;
+var _ONE = 0x3FF0000000000000;
+var _NONE = 0xBFF0000000000000;
+var _PI = 0x400921FB54442D18;
+var _NPI = 0xC00921FB54442D18;
+var _HPI = 0x3FF921FB54442D18;
+var _NHPI = 0xBFF921FB54442D18;
+var _NAN = 0x7FF8000000000000;
+
+var _bad = 0;
+
+fn _is_nan(v) {
+    if (((v >> 52) & 0x7FF) != 0x7FF) { return 0; }
+    if ((v & 0x000FFFFFFFFFFFFF) == 0) { return 0; }
+    return 1;
+}
+
+# want_nan = 1: any NaN is right. Otherwise the BITS must match -- the point of
+# every zero row is its sign, which f64_eq cannot see.
+fn row(label, y, x, want, want_nan) {
+    var got = ganita_f64_atan2(y, x);
+    var ok = 0;
+    if (want_nan == 1) { ok = _is_nan(got); } else { if (got == want) { ok = 1; } }
+    if (ok == 0) { _bad = _bad + 1; print("  WRONG ", 8); } else { print("  ok    ", 8); }
+    print(label, strlen(label));
+    print("  got ", 6); fmt_int(got);
+    print("  want ", 7);
+    if (want_nan == 1) { print("NaN", 3); } else { fmt_int(want); }
+    println("");
+    return 0;
+}
+
+fn main() {
+    println("C99 F.10.1.4 atan2 -- signed zeros");
+    row("atan2(+0, +0) = +0     ", _PZ, _PZ, _PZ, 0);
+    row("atan2(-0, +0) = -0     ", _NZ, _PZ, _NZ, 0);
+    row("atan2(+0, -0) = +pi    ", _PZ, _NZ, _PI, 0);
+    row("atan2(-0, -0) = -pi    ", _NZ, _NZ, _NPI, 0);
+    row("atan2(+0, -1) = +pi    ", _PZ, _NONE, _PI, 0);
+    row("atan2(-0, -1) = -pi    ", _NZ, _NONE, _NPI, 0);
+    row("atan2(+0, +1) = +0     ", _PZ, _ONE, _PZ, 0);
+    row("atan2(-0, +1) = -0     ", _NZ, _ONE, _NZ, 0);
+    row("atan2(+1, -0) = +pi/2  ", _ONE, _NZ, _HPI, 0);
+    row("atan2(-1, +0) = -pi/2  ", _NONE, _PZ, _NHPI, 0);
+    println("NaN in, NaN out");
+    row("atan2(NaN, +0) = NaN   ", _NAN, _PZ, 0, 1);
+    row("atan2(+1, NaN) = NaN   ", _ONE, _NAN, 0, 1);
+    print("rows wrong: ", 12); fmt_int(_bad); println("");
+    return _bad;
+}
+
+var r = main();
+sys_exit_group(r);

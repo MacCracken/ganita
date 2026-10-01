@@ -1,0 +1,115 @@
+# ganita_f64_atan2 answers NaN when both arguments are infinite. C99 Annex F
+# (F.10.1.4) gives +-pi/4 and +-3pi/4 there.
+#
+# Self-proving: the exit code is the number of rows of the table below that come
+# back wrong -- 0 when every row is right. Each row is printed with the bits it got
+# and the bits C99 specifies.
+#
+# Filed with docs/development/issues/2026-09-30-f64-atan2-infinite-arguments.md,
+# the companion of 2026-09-30-f64-atan2-signed-zero-and-nan.md. That filing and its
+# repro own the signed-zero and NaN rows; this one owns the +-inf rows and does
+# not repeat them. Found by abaco 2.4.9's project audit (atan2 in its expression
+# evaluator).
+#
+# Build and run from the ganita repo root:
+#   cyrius build docs/development/issues/repros/2026-09-30-f64-atan2-infinite-arguments.cyr /tmp/atan2inf
+#   /tmp/atan2inf; echo "exit=$?"      # -> 4 on ganita 1.2.10: the four (+-inf, +-inf) rows
+#
+# The twelve other infinite rows and the four finite controls pass today. They are
+# here so a fix for the four cannot break them unseen: the (+-inf, x) rows go
+# through the x = 0 branch and the y / x quotient that both fixes touch.
+#
+# Every input and every expected value is a bit pattern, so the program means the
+# same thing on every toolchain. pi/4 and 3pi/4 are the doubles nearest the exact
+# values (0x3FE921FB54442D18, 0x4002D97C7F3321D2), checked at 300 bits with mpmath.
+#
+# Includes src/ directly rather than lib/ganita.cyr so it exercises the working
+# source. math_advanced has no matrix/linalg dependency.
+
+include "lib/syscalls.cyr"
+include "lib/string.cyr"
+include "lib/alloc.cyr"
+include "lib/fmt.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/math.cyr"
+
+include "src/math_advanced.cyr"
+
+var _PZ = 0;
+var _NZ = 0x8000000000000000;
+var _ONE = 0x3FF0000000000000;
+var _NONE = 0xBFF0000000000000;
+var _MAX = 0x7FEFFFFFFFFFFFFF;         # DBL_MAX
+var _NTINY = 0x8000000000000001;       # -(smallest subnormal), -4.9e-324
+var _PINF = 0x7FF0000000000000;
+var _NINF = 0xFFF0000000000000;
+var _PI = 0x400921FB54442D18;
+var _NPI = 0xC00921FB54442D18;
+var _HPI = 0x3FF921FB54442D18;
+var _NHPI = 0xBFF921FB54442D18;
+var _QPI = 0x3FE921FB54442D18;         # pi/4
+var _NQPI = 0xBFE921FB54442D18;
+var _TQPI = 0x4002D97C7F3321D2;        # 3pi/4
+var _NTQPI = 0xC002D97C7F3321D2;
+
+var _bad = 0;
+
+# 16 upper-case hex digits, so a sign bit and a NaN read at a glance.
+fn _hex16(v) {
+    var buf[16];
+    var i = 15;
+    while (i >= 0) {
+        var nib = v & 0xF;
+        if (nib < 10) { store8(&buf + i, 48 + nib); } else { store8(&buf + i, 55 + nib); }
+        v = v >> 4;
+        i = i - 1;
+    }
+    print("0x", 2);
+    print(&buf, 16);
+    return 0;
+}
+
+# The BITS must match: f64_eq cannot see the sign of the +-0 rows, and NaN is
+# never equal to the expected value, which is the failure this repro is about.
+fn row(label, y, x, want) {
+    var got = ganita_f64_atan2(y, x);
+    if (got != want) { _bad = _bad + 1; print("  WRONG ", 8); } else { print("  ok    ", 8); }
+    print(label, strlen(label));
+    print("  got ", 6); _hex16(got);
+    print("  want ", 7); _hex16(want);
+    println("");
+    return 0;
+}
+
+fn main() {
+    println("C99 F.10.1.4 atan2 -- both arguments infinite");
+    row("atan2(+inf, +inf) = +pi/4   ", _PINF, _PINF, _QPI);
+    row("atan2(-inf, +inf) = -pi/4   ", _NINF, _PINF, _NQPI);
+    row("atan2(+inf, -inf) = +3pi/4  ", _PINF, _NINF, _TQPI);
+    row("atan2(-inf, -inf) = -3pi/4  ", _NINF, _NINF, _NTQPI);
+    println("y infinite, x finite");
+    row("atan2(+inf, +1)   = +pi/2   ", _PINF, _ONE, _HPI);
+    row("atan2(-inf, +1)   = -pi/2   ", _NINF, _ONE, _NHPI);
+    row("atan2(+inf, -1)   = +pi/2   ", _PINF, _NONE, _HPI);
+    row("atan2(-inf, -1)   = -pi/2   ", _NINF, _NONE, _NHPI);
+    row("atan2(+inf, -0)   = +pi/2   ", _PINF, _NZ, _HPI);
+    row("atan2(-inf, +0)   = -pi/2   ", _NINF, _PZ, _NHPI);
+    println("y finite and non-zero, x infinite");
+    row("atan2(+1, +inf)   = +0      ", _ONE, _PINF, _PZ);
+    row("atan2(-1, +inf)   = -0      ", _NONE, _PINF, _NZ);
+    row("atan2(+1, -inf)   = +pi     ", _ONE, _NINF, _PI);
+    row("atan2(-1, -inf)   = -pi     ", _NONE, _NINF, _NPI);
+    row("atan2(+MAX, -inf) = +pi     ", _MAX, _NINF, _PI);
+    row("atan2(-tiny, +inf) = -0     ", _NTINY, _PINF, _NZ);
+    println("finite controls (same quadrants as the first four rows)");
+    row("atan2(+1, +1)     = +pi/4   ", _ONE, _ONE, _QPI);
+    row("atan2(-1, +1)     = -pi/4   ", _NONE, _ONE, _NQPI);
+    row("atan2(+1, -1)     = +3pi/4  ", _ONE, _NONE, _TQPI);
+    row("atan2(-1, -1)     = -3pi/4  ", _NONE, _NONE, _NTQPI);
+    print("rows wrong: ", 12); fmt_int(_bad); println("");
+    return _bad;
+}
+
+var r = main();
+sys_exit_group(r);

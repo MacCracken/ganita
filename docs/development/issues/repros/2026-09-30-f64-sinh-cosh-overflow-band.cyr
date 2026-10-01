@@ -1,0 +1,52 @@
+# ganita_f64_sinh / ganita_f64_cosh are up to ~500 ulp off for 709 < |x| <= ~710.4759,
+# the band where exp(|x|) overflows but sinh/cosh do not. That branch returns
+# exp(|x| - ln2), and rounding |x| - ln2 (an argument near 709) costs up to ~500 ulp
+# once exp amplifies it.
+#
+# Self-proving: the exit code is the number of rows more than 2 ulp from the correctly
+# rounded value (mpmath, 300 bits). The last two rows (|x| = 708, below the branch)
+# are controls.
+#
+#   cyrius build docs/development/issues/repros/2026-09-30-f64-sinh-cosh-overflow-band.cyr /tmp/shband
+#   /tmp/shband; echo "exit=$?"      # -> 8 on ganita 1.2.10
+
+include "lib/syscalls.cyr"
+include "lib/string.cyr"
+include "lib/alloc.cyr"
+include "lib/fmt.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/math.cyr"
+
+include "src/math_advanced.cyr"
+
+fn out(s) { syscall(1, 1, s, strlen(s)); return 0; }
+
+fn row(label, got, want) {
+    var d = got - want;
+    if (d < 0) { d = 0 - d; }
+    if (d > 2) { out("  WRONG "); } else { out("  ok    "); }
+    out(label); out("  got "); fmt_hex0x(got); out("  want "); fmt_hex0x(want);
+    out("  off "); fmt_int(d); out(" ulp\n");
+    if (d > 2) { return 1; }
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    var r = 0;
+    r = r + row("sinh(709.5)", ganita_f64_sinh(0x40862C0000000000), 0x7FD81E9B4B52D0C9);
+    r = r + row("sinh(710.0)", ganita_f64_sinh(0x4086300000000000), 0x7FE3E21A464507F9);
+    r = r + row("sinh(710.4755135003535)", ganita_f64_sinh(0x408633CDDA05A699), 0x7FEFFD294EF597D8);
+    r = r + row("sinh(-710.4755135003535)", ganita_f64_sinh(0xC08633CDDA05A699), 0xFFEFFD294EF597D8);
+    r = r + row("cosh(709.5)", ganita_f64_cosh(0x40862C0000000000), 0x7FD81E9B4B52D0C9);
+    r = r + row("cosh(710.0)", ganita_f64_cosh(0x4086300000000000), 0x7FE3E21A464507F9);
+    r = r + row("cosh(710.4755135003535)", ganita_f64_cosh(0x408633CDDA05A699), 0x7FEFFD294EF597D8);
+    r = r + row("cosh(-710.4755135003535)", ganita_f64_cosh(0xC08633CDDA05A699), 0x7FEFFD294EF597D8);
+    r = r + row("sinh(708.0)", ganita_f64_sinh(0x4086200000000000), 0x7FB586F6BF260CF1);
+    r = r + row("cosh(708.0)", ganita_f64_cosh(0x4086200000000000), 0x7FB586F6BF260CF1);
+    out("rows wrong: "); fmt_int(r); out("\n");
+    return r;
+}
+var rc = main();
+syscall(SYS_EXIT, rc);
