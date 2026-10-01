@@ -1,0 +1,53 @@
+# Neither ganita nor stdlib math has a tangent, so every consumer writes
+# f64_sin(x) / f64_cos(x): two results within 1 ulp each and a rounded division,
+# up to 2 ulp from the correctly rounded tan(x).
+#
+# Self-proving: the exit code is the number of rows MORE than 1 ulp from the
+# correctly rounded tan (Python Fraction/Decimal, 120 digits, pi by Machin). An
+# fdlibm k_tan is within 1 ulp everywhere, so the repro exits 0 once
+# `candidate_tan` is swapped to the new function. The last two rows are controls.
+#
+#   cyrius build docs/development/issues/repros/2026-09-30-f64-tan-missing.cyr /tmp/tanm
+#   /tmp/tanm; echo "exit=$?"      # -> 6 on ganita 1.2.10 (sin/cos division)
+
+include "lib/syscalls.cyr"
+include "lib/string.cyr"
+include "lib/alloc.cyr"
+include "lib/fmt.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/math.cyr"
+
+include "src/math_advanced.cyr"
+
+# Swap to the new tangent once it exists.
+fn candidate_tan(x): i64 { return f64_div(f64_sin(x), f64_cos(x)); }
+
+fn out(s) { syscall(1, 1, s, strlen(s)); return 0; }
+
+fn row(label, got, want) {
+    var d = got - want;
+    if (d < 0) { d = 0 - d; }
+    if (d > 1) { out("  WRONG "); } else { out("  ok    "); }
+    out(label); out("  got "); fmt_hex0x(got); out("  want "); fmt_hex0x(want);
+    out("  off "); fmt_int(d); out(" ulp\n");
+    if (d > 1) { return 1; }
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    var r = 0;
+    r = r + row("tan(0.770994674674816)", candidate_tan(0x3FE8ABFD0623CAB4), 0x3FEF1759205E500C);
+    r = r + row("tan(-0.6867992795081325)", candidate_tan(0xBFE5FA427B8CEBDD), 0xBFEA3D30361F2EFF);
+    r = r + row("tan(1.0097733806423936)", candidate_tan(0x3FF0280821E3AFE2), 0x3FF9766548EDEC10);
+    r = r + row("tan(-40.07147885594231)", candidate_tan(0xC0440926381A5059), 0x3FEEFB395BD7179D);
+    r = r + row("tan(-58.10337168140758)", candidate_tan(0xC04D0D3B48837D32), 0xC04F115FAB4615F4);
+    r = r + row("tan(44.764364370283715)", candidate_tan(0x404661D6B1124C50), 0x3FEFC99B5776134D);
+    r = r + row("tan(0.5)", candidate_tan(0x3FE0000000000000), 0x3FE17B4F5BF3474A);
+    r = r + row("tan(3.0)", candidate_tan(0x4008000000000000), 0xBFC23EF71254B86F);
+    out("rows wrong: "); fmt_int(r); out("\n");
+    return r;
+}
+var rc = main();
+syscall(SYS_EXIT, rc);
