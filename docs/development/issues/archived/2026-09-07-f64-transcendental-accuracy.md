@@ -39,6 +39,30 @@
 >
 > Also closed: `acos`, `acosh` and `atanh` now return NaN outside their domains
 > instead of whatever the formula produced.
+>
+> ⚠ **Addendum (ganita 1.2.11, 2026-10-01): "all four groups closed" was not true.**
+> Four parts of this filing stayed open after 1.2.4. Consumers found them on
+> 2026-09-30, and 1.2.11 closed them:
+>
+> - **§1.** Item 3's series fixed only |x| < 2^-26 (1e-8 for asinh). That is where
+>   `x` alone becomes the correctly rounded answer, not where the direct forms
+>   become accurate. Just above it they still lost about eps/|x|, up to 4e7 ulp for
+>   sinh and 1.3e8 for asinh. Closed by fdlibm `expm1` / `log1p` forms, filed as
+>   [`2026-09-30-f64-hyperbolic-and-asin-cancellation-band`](2026-09-30-f64-hyperbolic-and-asin-cancellation-band.md).
+> - **§2.** Item 4's `exp(|x| - ln 2)` removed the `+inf`, but rounding `|x| - ln 2`
+>   near 709 left the band up to ~495 ulp off. Closed by `_gn_exp_half`, filed as
+>   [`2026-09-30-f64-sinh-cosh-overflow-band`](2026-09-30-f64-sinh-cosh-overflow-band.md).
+> - **§3.** `acosh` near 1 ("~9 digits") was never addressed: `acosh(1 + 2^-52)` was
+>   2.5e7 ulp off through 1.2.10. Closed in the same cancellation-band filing,
+>   by log1p(t + √(2t + t²)), t = x − 1.
+> - **§4.** `atan2(inf, inf) = NaN` and the inverted branch cut at −0 were never
+>   closed. `ganita_f64_atan2` was byte-identical from 1.0.0 to 1.2.10. Closed by
+>   [`2026-09-30-f64-atan2-signed-zero-and-nan`](2026-09-30-f64-atan2-signed-zero-and-nan.md)
+>   and [`2026-09-30-f64-atan2-infinite-arguments`](2026-09-30-f64-atan2-infinite-arguments.md),
+>   together with a row this filing did not have: `atan2(NaN, ±0)` returned −π/2.
+>
+> Not in this filing, but fixed alongside it: `asin` near ±1 (up to 1,024 ulp)
+> now forms 1 − x² as (1 − |x|)(1 + |x|).
 
 
 **Filed by**: ganita's 1.2.3 P(-1) sweep (math-advanced lens)

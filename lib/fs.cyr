@@ -292,7 +292,8 @@ fn dir_list_checked(path: Str, entries): i64 {
 # filing asked for (2026-07-26-agora-fs-dir-list-per-call-alloc §"Proposed fix").
 #
 #   path        directory to list
-#   scratch     caller buffer for the raw getdents batch (>= 1024; 4096 recommended)
+#   scratch     caller buffer for the raw getdents batch (>= 1024; 4096 recommended; on
+#               Windows it holds one WIN32_FIND_DATAW)
 #   scratch_len size of `scratch`
 #   names       caller buffer receiving NUL-terminated entry names, packed
 #   names_cap   size of `names`
@@ -309,6 +310,13 @@ fn dir_list_checked(path: Str, entries): i64 {
 # `dir_list`.
 fn dir_list_into(path: Str, scratch, scratch_len, names, names_cap, offs, max_entries): i64 {
     if (scratch_len < 1024) { return 0 - 2; }
+    #ifdef CYRIUS_TARGET_WIN
+    # 6.6.12: FindFirstFileW/FindNextFileW into the caller's buffers (lib/fs_win.cyr) — there
+    # was no Windows arm, so the open + getdents64 body below answered -1 for every directory.
+    var wr = _dir_list_into_win(path, scratch, names, names_cap, offs, max_entries);
+    return wr;
+    #endif
+    #ifndef CYRIUS_TARGET_WIN
     var count = 0;
     var npos = 0;
     #ifdef CYRIUS_TARGET_AGNOS
@@ -395,6 +403,7 @@ fn dir_list_into(path: Str, scratch, scratch_len, names, names_cap, offs, max_en
     sys_close(fd2);
     return count;
     #endif
+    #endif
 }
 
 # List directory entries with full paths
@@ -465,7 +474,7 @@ fn is_dir(path: Str): i64 {
 # inflating it, which is the silent-green shape this release keeps finding.
 #
 # A depth cap rather than a visited-inode set: it needs no allocation, and it bounds
-# every cause (symlink loop, bind mount, Windows directory junction — `fs_win.cyr:146`
+# every cause (symlink loop, bind mount, Windows directory junction — `fs_win.cyr`'s `is_dir`
 # treats a reparse point as a directory), not just the one we reproduced. O_NOFOLLOW was
 # rejected because it would refuse LEGITIMATE symlinked directories, which real projects
 # use. 64 is far past any real tree (`tests/tcyr/crossos/x.tcyr` is depth 3).
@@ -505,20 +514,19 @@ var DIR_WALK_MAX_DEPTH = 64;
 # agnos ABI errors for months — this is the same class, caught the same way.
 fn is_symlink(path: Str): i64 {
     #ifdef CYRIUS_TARGET_WIN
-    # Widened bounded by str_len (a Str need not be NUL-terminated) and DECODED (6.6.11 — it
-    # was an inline byte-per-unit copy). Both buffers are on the STACK — dir_walk calls this for
-    # every entry, and a bump-allocated pair per call leaked ~600 B + 2x the path each time. A
-    # path past 519 bytes, or one that is not valid UTF-8, answers 0: GetFileAttributesW fails
-    # past MAX_PATH anyway (this image is not long-path-aware on the wide-path reroutes).
-    var pn = str_len(path);
-    if (pn > 519) { return 0; }
-    var wp[1040];
-    if (_fs_widen(&wp, str_data(path), pn) < 0) { return 0; }
-    var attrs = syscall(61465, &wp);                # GetFileAttributesW (no final-link follow)
+    # Exactly the Str's bytes (a Str need not be NUL-terminated), as a NARROW UTF-8 path the
+    # emitter decodes and, past 247 units, `\\?\`-prefixes (6.6.12 — it was widened here with
+    # no prefix and refused past 519 bytes, so a link on a long path answered 0). Both buffers
+    # are on the STACK — dir_walk calls this for every entry, and a bump-allocated pair per call
+    # leaked ~600 B + 2x the path each time. A path that is not valid UTF-8 answers 0.
+    var zb[32776];
+    var p = _fs_zpath(path, 0, &zb, 32776);
+    if (p == 0) { return 0; }
+    var attrs = syscall(61465, p);                  # GetFileAttributesW (no final-link follow)
     if (attrs == 4294967295) { return 0; }          # INVALID_FILE_ATTRIBUTES
     if ((attrs & 1024) == 0) { return 0; }          # not FILE_ATTRIBUTE_REPARSE_POINT
     var fd[592];                                    # WIN32_FIND_DATAW
-    var h = syscall(61462, &wp, &fd);               # FindFirstFileW on the name itself
+    var h = syscall(61462, p, &fd);                 # FindFirstFileW on the name itself
     if (h == 0 - 1) { return 0; }
     syscall(61464, h);                              # FindClose
     if ((load32(&fd + 36) & 0x20000000) != 0) { return 1; }   # dwReserved0 = tag; name surrogate

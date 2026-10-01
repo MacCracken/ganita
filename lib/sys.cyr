@@ -120,8 +120,10 @@ fn _uts_field(a, b, dst, scratch, cap): i64 {
 # with 4 bytes of tail pad — byte layout measured identically on ecb and ach).
 # clock_gettime is deliberately NOT used here: Darwin has no clock_gettime syscall, and
 # syscall(228)'s two Mach-O reroutes RETURN nanoseconds rather than filling a timespec
-# (arm64 binds _clock_gettime_nsec_np and never touches the buffer; x86 composes it from
-# this same gettimeofday — EMACHO_CLOCK_X86, routed since v6.5.16). This note said 228 was
+# (arm64 binds _clock_gettime_nsec_np and never touches the buffer; x86 issues this same
+# gettimeofday — EMACHO_CLOCK_X86, routed since v6.5.16 — and returns the timeval composed
+# to ns for clock id 0, or for any other id the mach time the kernel copies out through the
+# third argument, which is ns at Intel's 1:1 timebase; 6.6.12). This note said 228 was
 # "unrouted on x86-macOS" until 6.6.10; gettimeofday is still the one source that fills a
 # struct timeval identically on both Macs.
 #
@@ -143,6 +145,8 @@ fn _uts_field(a, b, dst, scratch, cap): i64 {
 # ⚠ The compiler's own x86 reroute of syscall(228) (EMACHO_CLOCK_X86) made exactly this
 # mistake from v6.5.16 to 6.6.9 — it set rdi and rsi and never zeroed rdx — so every
 # clock_now_* on Intel-Mac wrote mach time through a stale rdx. CVE-51, CHANGELOG [6.6.10].
+# Since 6.6.12 it points rdx at its own 8-byte stack slot and returns that mach time for
+# every clock id but 0 (the monotonic read); this wrapper wants only the timeval, so NULL.
 fn _macos_gettimeofday(tv): i64 {
     #ifdef CYRIUS_TARGET_MACOS
     return syscall(SYS_GETTIMEOFDAY, tv, 0, 0);

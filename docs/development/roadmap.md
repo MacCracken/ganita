@@ -20,10 +20,13 @@ The point at which `ganita_*` becomes load-bearing and cannot change.
 - [x] CHANGELOG complete from 1.0.0 onward
 - [x] Benchmark baseline captured (`scripts/bench-history.sh` → `bench-history.csv`)
 - [ ] **Test coverage adequate for the surface area** — `cyrius coverage` reports
-      94 %, but it counts substrings; counted on word boundaries the repo is at 58 %
-      (1.2.6), and `_compat.cyr` at 6/54 is most of the gap. The floor is a floor,
-      not the target.
-- [ ] **`_compat.cyr` removed** — 53 deprecated aliases still ship, and they are
+      100 % (142/142 at 1.2.11; it counts references since cyrius 6.6.8), and every
+      public fn and every `_compat` alias is now called by name. Counted on word
+      boundaries with private helpers included the repo is at 89 % (152/170). The
+      floor is a floor, not the target: what is still dark is private helpers
+      (`_f64_is_*`, the pow core's pieces) reached only through their callers.
+- [ ] **`_compat.cyr` removed** — 55 aliases still ship (53 legacy names plus
+      `f64_cbrt` and `f64_tan`, which arrived with their functions), and they are
       exported into cyrius's stdlib namespace by the fold. Needs the consumers to
       re-pin first.
 - [ ] **The fuzz harness does something** — `tests/ganita.fcyr` is a `cyrius init`
@@ -60,11 +63,13 @@ filings in `docs/development/issues/` closed. See
 
 _Gate: nothing external._
 
-Close the two real coverage gaps rather than the reported percentage.
-`math_advanced.cyr` at 4/13 is the largest untested public surface in the repo,
-and it is exactly the module whose defects have historically been *silent* —
-`f64_pow` returned NaN for every non-positive base for four releases. Also
-replace `tests/ganita.fcyr` with a harness that drives the real input surface:
+Close the real coverage gaps rather than the reported percentage. When this
+milestone was written `math_advanced.cyr` was 4/13, the largest untested public
+surface in the repo, and exactly the module whose defects have historically been
+*silent* — `f64_pow` returned NaN for every non-positive base for four releases.
+Releases 1.2.4–1.2.11 have since covered all 15 of its public functions by name,
+with accuracy sweeps against an mpmath oracle behind the rows. What remains here
+is the fuzz harness: replace `tests/ganita.fcyr` with one that drives the real input surface:
 ganita takes no external input, so the thing to fuzz is the argument space —
 dimensions, indices, and bit patterns.
 
@@ -92,7 +97,15 @@ Deliberately not in ganita, so that nobody adds them by accident:
 
 ---
 
-## Moving the cyrius pin (done at 1.2.7: 6.6.4 → 6.6.7; at 1.2.8: → 6.6.9; at 1.2.9: → 6.6.10; at 1.2.10: → 6.6.11)
+## Moving the cyrius pin (done at 1.2.7: 6.6.4 → 6.6.7; at 1.2.8: → 6.6.9; at 1.2.9: → 6.6.10; at 1.2.10: → 6.6.11; at 1.2.11: → 6.6.12)
+
+**1.2.11 moved it to `cyrius = "6.6.12"`** by the same sequence, before any `src/`
+change: the pin, `cyrius lib sync --full` (111 files, 22 changed, `lib/math.cyr` not
+among them), `cyrius deps` to re-lock, and the full gate green on 1.2.10's own source.
+Verified against the published release tarball in an isolated `CYRIUS_HOME`. From
+1.2.11 ganita's tangent calls stdlib math's private `_f64_rem_pio2`, so a future pin
+bump that renames it fails to compile: see
+[ADR 0003](../adr/0003-tan-uses-stdlib-rem-pio2.md).
 
 **1.2.10 moved it to `cyrius = "6.6.11"`** by the same sequence (`lib/` re-vendored to the
 111-file 6.6.11 snapshot, `dist/` regenerated), and raised `cyrius coverage --min` 98 → 100

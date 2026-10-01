@@ -98,40 +98,66 @@ fn log_error(msg): i64 { return _log_emit(LOG_ERROR, msg); }
 # Log at FATAL level (does NOT exit — caller decides)
 fn log_fatal(msg): i64 { return _log_emit(LOG_FATAL, msg); }
 
-# Log with key=value context
+# Append NUL-terminated `s` at buf + off, never writing at or past `lim`. Returns the new
+# offset. The one copy both structured loggers below go through: `lim` is what keeps a
+# caller-controlled string inside their 512-byte stack scratch. CHANGELOG [6.6.12]
+fn _log_cat(buf, off, s, lim): i64 {
+    var i = 0;
+    while (off < lim) {
+        var c = load8(s + i);
+        if (c == 0) { return off; }
+        store8(buf + off, c);
+        off = off + 1;
+        i = i + 1;
+    }
+    return off;
+}
+
+# Mark a truncated line: overwrite the last three bytes before `off` with "...".
+fn _log_mark_trunc(buf, off): i64 {
+    if (off < 3) { return 0; }
+    store8(buf + off - 3, 46);
+    store8(buf + off - 2, 46);
+    store8(buf + off - 1, 46);
+    return 0;
+}
+
+# The line limit: a 512-byte scratch holds at most 511 bytes plus the NUL.
+var _LOG_LINE_MAX = 511;
+
+# Log with key=value context: "msg key=val". A line longer than 511 bytes is cut at 511
+# and ends "..." — the sink never sees more than 511 bytes.
+#
+# ⛔ CVE-56 (6.6.12): the three copies had no bound, so a logged caller-controlled value
+# (a request header, a path) longer than the 512-byte stack scratch overwrote this fn's
+# own locals and its return address — a 4 KB value killed the process with SIGSEGV
+# before the sink was reached. Same class as CVE-50. CHANGELOG [6.6.12]
 fn log_info_kv(msg, key, val): i64 {
     if (LOG_INFO < _log_level) { return 0; }
-    # Build "msg key=val" in scratch buffer
     var buf[512];
-    var off = 0;
-    var ml = strlen(msg);
-    var kl = strlen(key);
-    var vl = strlen(val);
-    var i = 0;
-    while (i < ml) { store8(&buf + off, load8(msg + i)); off = off + 1; i = i + 1; }
-    store8(&buf + off, 32); off = off + 1;
-    i = 0;
-    while (i < kl) { store8(&buf + off, load8(key + i)); off = off + 1; i = i + 1; }
-    store8(&buf + off, 61); off = off + 1;
-    i = 0;
-    while (i < vl) { store8(&buf + off, load8(val + i)); off = off + 1; i = i + 1; }
+    var lim = _LOG_LINE_MAX;
+    var off = _log_cat(&buf, 0, msg, lim);
+    off = _log_cat(&buf, off, " ", lim);
+    off = _log_cat(&buf, off, key, lim);
+    off = _log_cat(&buf, off, "=", lim);
+    off = _log_cat(&buf, off, val, lim);
+    if (strlen(msg) + strlen(key) + strlen(val) + 2 > lim) { _log_mark_trunc(&buf, off); }
     store8(&buf + off, 0);
     sakshi_info(&buf, off);
     return 0;
 }
 
-# Log with integer value
+# Log with integer value: "msg key=<decimal>". The value is never truncated: msg and key
+# share 511 - 22 bytes (22 = '=' + '-' + 19 digits, with one to spare) and end "..." when
+# they do not fit. CVE-56, CHANGELOG [6.6.12]
 fn log_info_int(msg, key, val): i64 {
     if (LOG_INFO < _log_level) { return 0; }
     var buf[512];
-    var off = 0;
-    var ml = strlen(msg);
-    var kl = strlen(key);
-    var i = 0;
-    while (i < ml) { store8(&buf + off, load8(msg + i)); off = off + 1; i = i + 1; }
-    store8(&buf + off, 32); off = off + 1;
-    i = 0;
-    while (i < kl) { store8(&buf + off, load8(key + i)); off = off + 1; i = i + 1; }
+    var lim = _LOG_LINE_MAX - 22;
+    var off = _log_cat(&buf, 0, msg, lim);
+    off = _log_cat(&buf, off, " ", lim);
+    off = _log_cat(&buf, off, key, lim);
+    if (strlen(msg) + strlen(key) + 1 > lim) { _log_mark_trunc(&buf, off); }
     store8(&buf + off, 61); off = off + 1;
     # Format integer into buffer
     if (val == 0) { store8(&buf + off, 48); off = off + 1; }

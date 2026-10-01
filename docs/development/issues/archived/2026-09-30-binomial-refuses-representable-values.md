@@ -1,6 +1,30 @@
 # `ganita_binomial` returns −1 for C(n, k) that fit in i64: every one above `i64_MAX / min(k, n−k)`
 
-**Status:** 🟡 **OPEN** — found by abaco 2.4.8; abaco works around it from 2.4.9; not repaired.
+> ✅ **RESOLVED in ganita 1.2.11** (2026-10-01). `ganita_binomial` returns −1 **exactly**
+> when C(n, k) > i64_MAX, as its contract always said. The proposed fix shipped as written.
+>
+> - **How.** While `C(n, i)·(n − i)` fits, it multiplies first, the same arithmetic as
+>   1.2.10, so C(61, 30) costs what it did. Otherwise it divides through
+>   g = gcd(C(n, i), i + 1) first (private `_gn_gcd`), so the only product it forms is
+>   C(n, i + 1) itself, and it refuses only if that does not fit. The source comment
+>   carries the four-step exactness argument. The CWE-834 bound still holds: for
+>   k′ ≥ 34 it refuses by the 34th iteration.
+> - **The repro exits 0** (was 9) on x86_64 and on aarch64 (qemu). It stays in
+>   `repros/` as the regression witness.
+> - **Checked against Python's exact `math.comb`** on 30,040 cases (every n ≤ 200 with
+>   k from −2 to n + 2, plus 8,931 cases at each k's fit boundary and random large n).
+>   0 mismatches on either architecture; 1.2.10 misses 3,848 of them, every one a
+>   refusal. In a step-by-step model over 220,100 inputs, every intermediate is
+>   ≤ i64_MAX, every gcd-branch division is exact, and no input takes more than 33
+>   iterations.
+> - **Suite.** The 1.2.3 row that pinned the refusal now asserts C(62, 30) exactly. A new
+>   group (37 assertions) holds the 8 rows of the table below, the controls, mirrors,
+>   the k = 2/3/4 boundaries, direct `_gn_gcd` rows, and an in-suite Pascal sweep of
+>   every n ≤ 70 (0 of 2,556 cells wrong; 113 under the 1.2.10 body). Mutation-checked.
+> - **Cost** (`tests/ganita.bcyr`): C(61, 30) ~128 ns, unchanged. C(66, 33) ~230 ns,
+>   where 1.2.10 took 99 ns to refuse it.
+
+**Status:** ✅ **RESOLVED in ganita 1.2.11** — found by abaco 2.4.8; abaco works around it from 2.4.9.
 **Placement:** unpinned.
 **Discovered:** 2026-09-30, abaco 2.4.8. Its evaluator began reporting ganita's −1 as a math
 error, so `binomial(62, 31)` became an error even though the value fits. abaco 2.4.9 stopped

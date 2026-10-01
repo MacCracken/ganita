@@ -154,6 +154,7 @@
 #
 # Explicit batching is still available and still slightly cheaper:
 #   var b = bench_new("my_op");
+#   if (b == 0) { return 1; }         # the allocation was refused
 #   bench_batch_start(b);
 #   var i = 0;
 #   while (i < 10000) { my_op(); i = i + 1; }
@@ -253,12 +254,12 @@ fn now_ns(): i64 {
     # ⚠ x86-macho takes this SAME arm, and it is not unrouted. This line read "(x86-macho
     # 228 unrouted → HELD.)" until the 6.6.5 review; v6.5.16 gave ach `EMACHO_CLOCK_X86`
     # (src/backend/x86/emit.cyr), which composes ns from BSD `gettimeofday` and returns
-    # them in rax — the same contract. Two consequences for a bench on ach and neither is
-    # a bug here: it is the REALTIME clock (it can step under NTP; Darwin exposes no
-    # monotonic clock through the x86 syscall table), and gettimeofday's resolution is a
-    # MICROSECOND, so `bench_clock_tick_ns()` measures 1,000 there against a ~570 ns read.
-    # The resolution rule already sizes for floor PLUS tick, which is what makes that host
-    # measurable at all.
+    # them in rax — the same contract. Since 6.6.12 that emitter honours the id: for this
+    # id-4 read it returns the mach_absolute_time gettimeofday copies out through its third
+    # argument (ns at Intel's 1:1 timebase, monotonic), not the timeval. Until 6.6.12 it
+    # was the REALTIME clock at MICROSECOND resolution on ach (it could step under NTP, and
+    # `bench_clock_tick_ns()` measured 1,000 there against a ~570 ns read); the resolution
+    # rule sizes for floor PLUS tick either way.
     #
     # ⚠ id **4** (CLOCK_MONOTONIC_RAW → mach_continuous_time), not 6. Darwin's
     # CLOCK_MONOTONIC (6) is `gettimeofday - boottime` in Apple's Libc
@@ -472,6 +473,11 @@ var BENCH_SIZE = 72;
 
 # Create a new benchmark with the given name. Returns 0 when the allocation is refused
 # (it stored through the unchecked pointer before 6.6.10). CHANGELOG [6.6.10]
+#
+# ⚠ Every public fn below takes that 0 without dereferencing it (6.6.12): the timers and
+# runners do nothing and return 0, the readers return 0, and `bench_report` prints
+# "(bench_new refused)". Through 6.6.11 only the constructor knew about the refusal, so
+# `bench_iterations(bench_new(..))` under a refused alloc was a SIGSEGV. CHANGELOG [6.6.12]
 fn bench_new(name): i64 {
     var b = alloc(BENCH_SIZE);
     if (b == 0) { return 0; }
@@ -488,7 +494,10 @@ fn bench_new(name): i64 {
 }
 
 # Return the name string of a benchmark
-fn bench_name(b): i64 { return load64(b); }
+fn bench_name(b): i64 {
+    if (b == 0) { return 0; }
+    return load64(b);
+}
 
 # Per-op picoseconds of `net` ns over k ops, clamped at 0. The same rounding
 # `bench_avg_ps` applies to the row total, so a window and the row agree exactly.
@@ -522,6 +531,7 @@ fn _bench_per_op_ps(net, k): i64 {
 # x86, and on aarch64 (sdiv by 0 is 0) a row that "resolved" having measured nothing. A
 # negative batch made min_k negative and resolved falsely the same way. CHANGELOG [6.6.11]
 fn _bench_record(b, raw, k, pairs, elig): i64 {
+    if (b == 0) { return 0; }
     if (k <= 0) { return 0; }
     var fl = bench_clock_overhead_ns();
     store64(b + 16, load64(b + 16) + raw);
@@ -540,6 +550,7 @@ fn _bench_record(b, raw, k, pairs, elig): i64 {
 
 # Record the start timestamp for a benchmark iteration
 fn bench_start(b): i64 {
+    if (b == 0) { return 0; }
     store64(b + 8, now_ns());
     return 0;
 }
@@ -551,6 +562,7 @@ fn bench_start(b): i64 {
 # correct answer to "how much of this window did I measure". It no longer makes the
 # benchmark's `min` 0: since v6.6.5 a window this short cannot claim an extreme at all.
 fn bench_stop(b): i64 {
+    if (b == 0) { return 0; }
     var end = now_ns();
     var raw = end - load64(b + 8);
     _bench_record(b, raw, 1, 1, 1);
@@ -558,7 +570,10 @@ fn bench_stop(b): i64 {
 }
 
 # Return the number of completed iterations
-fn bench_iterations(b): i64 { return load64(b + 24); }
+fn bench_iterations(b): i64 {
+    if (b == 0) { return 0; }
+    return load64(b + 24);
+}
 
 # The number of TIMED WINDOWS this row consumed — one clock PAIR each, so the row cost
 # exactly `2 × bench_windows(b)` clock reads however many iterations it covered. It is
@@ -568,13 +583,17 @@ fn bench_iterations(b): i64 { return load64(b + 24); }
 # measured duration against `n × bench_clock_overhead_ns()` was host-speed dependent and
 # shipped RED on ecb — its bar reduces to "the op must cost under half a clock read",
 # which is unsatisfiable where the clock read is 5 ns. CHANGELOG [6.6.5].
-fn bench_windows(b): i64 { return load64(b + 48); }
+fn bench_windows(b): i64 {
+    if (b == 0) { return 0; }
+    return load64(b + 48);
+}
 
 # Total elapsed nanoseconds across all iterations, net of one clock read per WINDOW.
 # Netted here rather than per window: a per-window clamp at 0 biases this upward (88 to
 # 3,584 of 20,000 windows clamped on the box that filed it), and netting at read time is
 # what lets `bench_clock_recheck` correct rows already accumulated.
 fn bench_total_ns(b): i64 {
+    if (b == 0) { return 0; }
     var t = load64(b + 16) - load64(b + 48) * bench_clock_overhead_ns();
     if (t < 0) { return 0; }
     return t;
@@ -589,6 +608,7 @@ fn _bench_round(ps): i64 {
 # Average time per iteration in PICOSECONDS. `elapsed / iters` in whole ns quantizes a
 # 4 ns row by 25 %.
 fn bench_avg_ps(b): i64 {
+    if (b == 0) { return 0; }
     var n = load64(b + 24);
     if (n == 0) { return 0; }
     var t = bench_total_ns(b);
@@ -596,7 +616,10 @@ fn bench_avg_ps(b): i64 {
 }
 
 # Average time per iteration in nanoseconds (rounded half up since v6.6.5).
-fn bench_avg_ns(b): i64 { return _bench_round(bench_avg_ps(b)); }
+fn bench_avg_ns(b): i64 {
+    if (b == 0) { return 0; }
+    return _bench_round(bench_avg_ps(b));
+}
 
 # 1 when this row's windows did not, in total, outlast the clock reads that bracketed
 # them — `raw_total <= windows × floor`. `bench_total_ns` then clamps at 0 and the mean,
@@ -613,6 +636,7 @@ fn bench_avg_ns(b): i64 { return _bench_round(bench_avg_ps(b)); }
 # the clock move) is the discriminator. Found at the 6.6.5 review; the row still reports
 # the mean with `bench_min_resolved(b) == 0`, which is the honest answer for a dead clock.
 fn bench_sub_floor(b): i64 {
+    if (b == 0) { return 0; }
     if (load64(b + 24) == 0) { return 0; }
     var fl = bench_clock_overhead_ns();
     if (bench_clock_tick_ns() < 0) { return 0; }
@@ -626,7 +650,10 @@ fn bench_sub_floor(b): i64 {
 # any growth chunks before it). min and max range over exactly these windows, and the row
 # can resolve only when this equals `bench_windows(b)`: then every op is in one of them.
 # CHANGELOG [6.6.9].
-fn bench_windows_eligible(b): i64 { return load64(b + 56); }
+fn bench_windows_eligible(b): i64 {
+    if (b == 0) { return 0; }
+    return load64(b + 56);
+}
 
 # 1 when this row's per-op min and max mean something: EVERY op of it lies in an eligible
 # window, and the smallest of those windows per clock pair, at the row's MEAN per-op cost,
@@ -641,6 +668,7 @@ fn bench_windows_eligible(b): i64 { return load64(b + 56); }
 # mean that no extreme covers is what let a `bench_run` pilot put the mean under the min
 # (review of the first cut, 2026-09-28). CHANGELOG [6.6.9].
 fn bench_min_resolved(b): i64 {
+    if (b == 0) { return 0; }
     if (load64(b + 56) <= 0) { return 0; }
     if (load64(b + 56) != load64(b + 48)) { return 0; }
     var mk = load64(b + 64);
@@ -654,6 +682,7 @@ fn bench_min_resolved(b): i64 {
 
 # Minimum single-op time in picoseconds over the eligible windows, when the row resolves.
 fn bench_min_ps(b): i64 {
+    if (b == 0) { return 0; }
     if (bench_min_resolved(b) == 1) { return load64(b + 32); }
     return bench_avg_ps(b);
 }
@@ -661,14 +690,21 @@ fn bench_min_ps(b): i64 {
 # Maximum single-op time in picoseconds over the eligible windows, when the row resolves.
 # Follows the mean when it does not — otherwise an unresolved row could print max < min.
 fn bench_max_ps(b): i64 {
+    if (b == 0) { return 0; }
     if (bench_min_resolved(b) == 1) { return load64(b + 40); }
     return bench_avg_ps(b);
 }
 
 # Return the minimum single-iteration time in nanoseconds
-fn bench_min_ns(b): i64 { return _bench_round(bench_min_ps(b)); }
+fn bench_min_ns(b): i64 {
+    if (b == 0) { return 0; }
+    return _bench_round(bench_min_ps(b));
+}
 # Return the maximum single-iteration time in nanoseconds
-fn bench_max_ns(b): i64 { return _bench_round(bench_max_ps(b)); }
+fn bench_max_ns(b): i64 {
+    if (b == 0) { return 0; }
+    return _bench_round(bench_max_ps(b));
+}
 
 # How many iterations of a `per_ps`-picosecond operation fill `_BENCH_MARGIN` (4) times
 # the window at which the clock's `err` ns of worst-case error, once per each of `pairs`
@@ -739,6 +775,7 @@ fn _bench_chunk_for(per_ps, err, pairs): i64 {
 # rows, on the hpet dev box): 61 unresolved against 10 under a size-chosen-before-it-ran
 # rule.
 fn bench_run(b, fp, n): i64 {
+    if (b == 0) { return 0; }
     if (n <= 0) { return 0; }
     var fl = bench_clock_overhead_ns();
     var done = 0;
@@ -801,6 +838,7 @@ fn bench_run(b, fp, n): i64 {
 # across the batches that resolve one.
 #
 #   var b = bench_new("my_fast_op");
+#   if (b == 0) { return 1; }         # the allocation was refused
 #   bench_run_batch(b, &my_fast_op, 10000, 100);
 #   bench_report(b);
 #
@@ -816,6 +854,7 @@ fn bench_run(b, fp, n): i64 {
 # Batch-time a zero-arg function pointer. Calls fp batch_size times per round,
 # measures total elapsed with one clock pair per round. Runs `rounds` rounds.
 fn bench_run_batch(b, fp, batch_size, rounds): i64 {
+    if (b == 0) { return 0; }
     var ri = 0;
     while (ri < rounds) {
         var start = now_ns();
@@ -832,6 +871,7 @@ fn bench_run_batch(b, fp, batch_size, rounds): i64 {
 
 # Batch-time a one-arg function pointer. Like bench_run_batch but passes arg to each call.
 fn bench_run_batch1(b, fp, arg, batch_size, rounds): i64 {
+    if (b == 0) { return 0; }
     var ri = 0;
     while (ri < rounds) {
         var start = now_ns();
@@ -848,6 +888,7 @@ fn bench_run_batch1(b, fp, arg, batch_size, rounds): i64 {
 
 # Batch-time a two-arg function pointer. Like bench_run_batch but passes arg1, arg2 to each call.
 fn bench_run_batch2(b, fp, arg1, arg2, batch_size, rounds): i64 {
+    if (b == 0) { return 0; }
     var ri = 0;
     while (ri < rounds) {
         var start = now_ns();
@@ -865,6 +906,7 @@ fn bench_run_batch2(b, fp, arg1, arg2, batch_size, rounds): i64 {
 # Convenience: batch-time an inline loop body (no function pointer needed)
 # Usage:
 #   var b = bench_new("inline_op");
+#   if (b == 0) { return 1; }         # the allocation was refused
 #   var rounds = 100;
 #   var batch = 10000;
 #   var ri = 0;
@@ -879,6 +921,7 @@ fn bench_run_batch2(b, fp, arg1, arg2, batch_size, rounds): i64 {
 
 # Record start timestamp for an inline batch measurement
 fn bench_batch_start(b): i64 {
+    if (b == 0) { return 0; }
     store64(b + 8, now_ns());
     return 0;
 }
@@ -886,6 +929,7 @@ fn bench_batch_start(b): i64 {
 # Stop batch timing, update stats with per-op time. Returns per-op nanoseconds,
 # net of one clock read (v6.5.19; rounded rather than truncated since v6.6.5).
 fn bench_batch_stop(b, batch_size): i64 {
+    if (b == 0) { return 0; }
     var end = now_ns();
     var ps = _bench_record(b, end - load64(b + 8), batch_size, 1, 1);
     return _bench_round(ps);
@@ -1036,6 +1080,7 @@ fn bench_report_clock(): i64 {
 # row shape above is a CONSUMER-FACING GRAMMAR — goonj, hisab, mabda, chitra, vani,
 # libro and szal parse it — so nothing sub-nanosecond may go INSIDE it.
 fn _bench_report_ps(b): i64 {
+    if (b == 0) { return 0; }
     var unres = 1 - bench_min_resolved(b);
     if (unres == 0 && bench_avg_ps(b) >= 100000) { return 0; }
     _bench_puts("    [per op in ps: mean ");
@@ -1063,8 +1108,13 @@ fn _bench_report_ps(b): i64 {
     return 0;
 }
 
-# Print benchmark report
+# Print benchmark report. A refused `bench_new` (b == 0) prints one named line,
+# "  (bench_new refused)", which carries no " avg" so no row parser takes it for a row.
 fn bench_report(b): i64 {
+    if (b == 0) {
+        _bench_puts("  (bench_new refused)\n");
+        return 0;
+    }
     if (_bench_floor_shown == 0) {
         _bench_floor_shown = 1;
         bench_clock_overhead_ns();
@@ -1097,6 +1147,7 @@ fn bench_report(b): i64 {
 # Print all benchmarks in a vec
 fn bench_report_all(benches): i64 {
     println("=== Benchmarks ===");
+    if (benches == 0) { return 0; }
     var len = vec_len(benches);
     var bi = 0;
     while (bi < len) {

@@ -83,6 +83,24 @@ enum SysNr {
     SYS_PROCESS_VM_READV = 310;
     SYS_PROCESS_VM_WRITEV = 311;
     SYS_MKNODAT = 259;
+    # 6.6.12 — the xattr family, fchown, statx and getrlimit: the same "the constant exists so
+    # cross-platform source COMPILES" contract, NOT rerouted — Windows has no extended-attribute,
+    # POSIX-owner, statx or rlimit syscall. The stubs below decline explicitly. CHANGELOG [6.6.12]
+    SYS_SETXATTR = 188;
+    SYS_LSETXATTR = 189;
+    SYS_FSETXATTR = 190;
+    SYS_GETXATTR = 191;
+    SYS_LGETXATTR = 192;
+    SYS_FGETXATTR = 193;
+    SYS_LISTXATTR = 194;
+    SYS_LLISTXATTR = 195;
+    SYS_FLISTXATTR = 196;
+    SYS_REMOVEXATTR = 197;
+    SYS_LREMOVEXATTR = 198;
+    SYS_FREMOVEXATTR = 199;
+    SYS_FCHOWN = 93;
+    SYS_STATX = 332;
+    SYS_GETRLIMIT = 97;
 }
 
 # File descriptors mirror Linux convention. GetStdHandle maps
@@ -545,18 +563,18 @@ enum Statfs {
 }
 
 # access(path, mode) — 0xF019 (61465) → kernel32!GetFileAttributesW, live since v6.1.18.
-# ⚠ THE REROUTE TAKES AN ALREADY-WIDE (UTF-16) PATH, which is the one non-obvious part — it is
-# decoded by `_win_widen`, which refuses (-1 here) what it cannot widen whole (6.6.11).
+# The reroute takes the NARROW UTF-8 path and widens it in the emitter — invalid UTF-8 is
+# refused, and a path of 248+ units is made absolute and `\\?\`-prefixed. ⛔ 6.6.12: it took a
+# path widened HERE with no prefix and a 260-unit cap, so access() of an existing long path was
+# -1 on real Windows while open() of the same path worked.
 # INVALID_FILE_ATTRIBUTES is 0xFFFFFFFF → the path does not exist (or is unreachable).
 # Returns 0 on success and -1 otherwise, the POSIX contract callers expect.
 # NOTE: existence only. W_OK is deliberately NOT modelled from FILE_ATTRIBUTE_READONLY —
 # a read-only ACL, a directory and a locked file all differ from the DOS attribute bit, and
 # a wrong "writable" answer is worse than an unmodelled one. Callers needing write
-# permission should attempt the open and handle the failure.
+# permission should attempt the open and handle the failure. CHANGELOG [6.6.12]
 fn sys_access(path, mode): i64 {
-    var wp[520];
-    if (_win_widen(&wp, path, 260) < 0) { return 0 - 1; }   # 6.6.11: refused, not cut at 259
-    var attrs = syscall(61465, &wp);
+    var attrs = syscall(61465, path);
     if (attrs == 4294967295) { return 0 - 1; }
     return 0;
 }
@@ -614,10 +632,10 @@ fn sys_truncate(path, length): i64 {
 # sequence, an encoded surrogate, anything past U+10FFFF) or no room. REFUSE, NEVER TRUNCATE: the
 # byte-per-unit loops this replaced zero-extended UTF-8 as Latin-1 and cut at their cap, so a
 # non-ASCII name was answered as some other name and a long one as its own prefix. It is the ONE
-# stdlib decoder: `_win_widen` below, lib/fs_win.cyr's `_fs_widen`, lib/fs.cyr's `is_symlink`
-# and lib/io.cyr's `_xdir_exists` all call it, so what the narrow-path reroutes open
-# (MultiByteToWideChar, in the emitter) the wide-path ones can also stat and list.
-# CHANGELOG [6.6.11]
+# stdlib decoder, behind `_win_widen` below — which `sys_symlink` uses for CreateSymbolicLinkW
+# (0xF03E), the one reroute that still takes wide paths. Since 6.6.12 the stat/list reroutes
+# (0xF016 FindFirstFileW, 0xF019 GetFileAttributesW) take narrow paths and are decoded by the
+# emitter, like open. CHANGELOG [6.6.11], [6.6.12]
 fn _win_widen_n(dst, src, n, cap): i64 {
     var i = 0;
     var o = 0;
@@ -695,39 +713,44 @@ fn _win_widen(dst, src, cap): i64 {
 fn sys_symlink(target, linkpath): i64 {
     var wl[1040];
     var wt[1040];
-    var wr[2080];
+    var rr[3120];
     if (_win_widen(&wl, linkpath, 519) < 0) { return 0 - 1; }   # 6.6.11: refused, never cut
     var tn = _win_widen(&wt, target, 519);
     if (tn < 0) { return 0 - 1; }
-    # Resolve the target as the link will: absolute ('\...', 'X:...') as-is, else against
-    # the link's directory (the part of linkpath up to its last separator).
+    # Resolve the target as the link will: absolute ('\...', '/...', 'X:...') as-is, else against
+    # the link's directory (the part of linkpath up to its last separator). Built NARROW (UTF-8):
+    # the GetFileAttributesW reroute takes a narrow path since 6.6.12. Both inputs passed
+    # `_win_widen` at 519 units, so each is under 1557 bytes and `rr` holds the two plus a NUL.
     var abs = 0;
-    if (tn > 0) {
-        if (load16(&wt) == 92) { abs = 1; }
-    }
-    if (tn > 1) {
-        if (load16(&wt + 2) == 58) { abs = 1; }
+    var t0 = load8(target);
+    if (t0 == 92) { abs = 1; }
+    if (t0 == 47) { abs = 1; }
+    if (t0 != 0) {
+        if (load8(target + 1) == 58) { abs = 1; }
     }
     var ri = 0;
     if (abs == 0) {
         var ls = 0 - 1;
         var li = 0;
-        while (load16(&wl + li * 2) != 0) {
-            if (load16(&wl + li * 2) == 92) { ls = li; }
+        while (load8(linkpath + li) != 0) {
+            var lc = load8(linkpath + li);
+            if (lc == 92) { ls = li; }
+            if (lc == 47) { ls = li; }
             li = li + 1;
         }
         while (ri <= ls) {
-            store16(&wr + ri * 2, load16(&wl + ri * 2));
+            store8(&rr + ri, load8(linkpath + ri));
             ri = ri + 1;
         }
     }
     var ti = 0;
-    while (ti <= tn) {
-        store16(&wr + (ri + ti) * 2, load16(&wt + ti * 2));
+    while (load8(target + ti) != 0) {
+        store8(&rr + ri + ti, load8(target + ti));
         ti = ti + 1;
     }
+    store8(&rr + ri + ti, 0);
     var kind = 0;
-    var at = syscall(61465, &wr);                 # GetFileAttributesW
+    var at = syscall(61465, &rr);                 # GetFileAttributesW (narrow; 6.6.12)
     if (at != 4294967295) {
         if ((at & 16) != 0) { kind = 1; }         # SYMBOLIC_LINK_FLAG_DIRECTORY
     }
@@ -774,6 +797,41 @@ fn sys_process_vm_readv(pid, local_iov, liovcnt, remote_iov, riovcnt, flags): i6
 fn sys_process_vm_writev(pid, local_iov, liovcnt, remote_iov, riovcnt, flags): i64 { return 0 - 38; }
 # Create a filesystem node (FIFO / device). Declines: Windows named pipes live in \\.\pipe\.
 fn sys_mknodat(dirfd, path, mode, dev): i64 { return 0 - 38; }
+# ── 6.6.12: PE peers for the xattr / fchown / statx / getrlimit wrappers in
+# lib/syscalls_linux_common.cyr. Windows has none of them as a syscall (alternate data
+# streams, security descriptors and job-object limits are different object models, not
+# renumbers), so each declines with -38/-ENOSYS; the caller's `r < 0` fires. Present so a
+# portable consumer (kriya) BUILDS for PE. CHANGELOG [6.6.12]
+# Set an extended attribute. Declines: NTFS alternate data streams are a different object model.
+fn sys_setxattr(path, name, value, size, flags): i64 { return 0 - 38; }
+# Set an extended attribute on a symlink itself. Declines, same reason as sys_setxattr.
+fn sys_lsetxattr(path, name, value, size, flags): i64 { return 0 - 38; }
+# Set an extended attribute by descriptor. Declines, same reason as sys_setxattr.
+fn sys_fsetxattr(fd, name, value, size, flags): i64 { return 0 - 38; }
+# Read an extended attribute. Declines, same reason as sys_setxattr.
+fn sys_getxattr(path, name, value, size): i64 { return 0 - 38; }
+# Read an extended attribute of a symlink itself. Declines, same reason as sys_setxattr.
+fn sys_lgetxattr(path, name, value, size): i64 { return 0 - 38; }
+# Read an extended attribute by descriptor. Declines, same reason as sys_setxattr.
+fn sys_fgetxattr(fd, name, value, size): i64 { return 0 - 38; }
+# List extended attribute names. Declines, same reason as sys_setxattr.
+fn sys_listxattr(path, list, size): i64 { return 0 - 38; }
+# List a symlink's own extended attribute names. Declines, same reason as sys_setxattr.
+fn sys_llistxattr(path, list, size): i64 { return 0 - 38; }
+# List extended attribute names by descriptor. Declines, same reason as sys_setxattr.
+fn sys_flistxattr(fd, list, size): i64 { return 0 - 38; }
+# Remove an extended attribute. Declines, same reason as sys_setxattr.
+fn sys_removexattr(path, name): i64 { return 0 - 38; }
+# Remove a symlink's own extended attribute. Declines, same reason as sys_setxattr.
+fn sys_lremovexattr(path, name): i64 { return 0 - 38; }
+# Remove an extended attribute by descriptor. Declines, same reason as sys_setxattr.
+fn sys_fremovexattr(fd, name): i64 { return 0 - 38; }
+# Change a descriptor's owner and group. Declines: Windows ownership lives in a security descriptor, not a uid/gid pair.
+fn sys_fchown(fd, uid, gid): i64 { return 0 - 38; }
+# Extended stat. Declines: Windows has no statx.
+fn sys_statx(dirfd, path, flags, mask, buf): i64 { return 0 - 38; }
+# Read a resource limit. Declines: Windows has no rlimits; per-process limits are job-object settings.
+fn sys_getrlimit(resource, rlim): i64 { return 0 - 38; }
 # ── v6.6.8: PE peers for the fcntl surface in lib/syscalls_linux_common.cyr. Windows has no
 # fcntl (non-blocking I/O is ioctlsocket(FIONBIO) on a SOCKET, or OVERLAPPED on a HANDLE —
 # different object models, not a renumber), so all three decline with -38/-ENOSYS. A caller

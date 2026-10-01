@@ -1,6 +1,27 @@
 # `ganita_f64_atan2` answers NaN when both arguments are infinite
 
-**Status:** 🟡 **OPEN** — found by abaco 2.4.9's project audit; not repaired.
+> ✅ **RESOLVED in ganita 1.2.11** (2026-10-01), together with its companion
+> [`2026-09-30-f64-atan2-signed-zero-and-nan`](2026-09-30-f64-atan2-signed-zero-and-nan.md),
+> by the merged patch below. The companion's banner covers the shared parts and the
+> one departure (a NaN argument returns the NaN operand).
+>
+> - **How.** When both arguments are infinite, the answer comes from the sign bits
+>   before the quotient is formed: ±π/4 (`0x3FE921FB54442D18`) for x = +∞ and ±3π/4
+>   (`_F64_3PI_4` = `0x4002D97C7F3321D2`) for x = −∞. `atan2(−0, −∞)` is −π, through the
+>   companion's fix.
+> - **The repro exits 0** (was 4) on x86_64 and on aarch64 (qemu). It is the
+>   regression witness.
+> - **One-infinite sweep.** 400,000 pairs with exactly one argument infinite, 0 wrong.
+>   1.2.10 got 6,195 of them wrong, every one (−0, −∞).
+> - **f32.** `ganita_f32_atan2(±inf, ±inf)` returns `0x3F490FDB` / `0xBF490FDB` /
+>   `0x4016CBE4` / `0xC016CBE4` on both architectures.
+> - **Suite.** All 20 rows of this repro are in the shared group (65 assertions).
+> - **Records corrected.** Addenda were added to
+>   `archived/2026-09-07-f64-transcendental-accuracy.md` (§4 was never closed, though
+>   its banner says it was) and `archived/2026-09-07-f32-nan-inf-edges.md` (§2 blamed
+>   `exp`).
+
+**Status:** ✅ **RESOLVED in ganita 1.2.11** — found by abaco 2.4.9's project audit.
 **Placement:** unpinned.
 **Discovered:** 2026-09-30, abaco 2.4.9 project audit (finding `eval-functions-atan2-nan-signed-zero-inf`:
 `atan2` in abaco's expression evaluator. abaco fixed the NaN-input half on its side and deferred the

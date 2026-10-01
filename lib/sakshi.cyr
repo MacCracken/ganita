@@ -1,5 +1,5 @@
 # sakshi.cyr — tracing, error handling, and structured logging for Cyrius
-# Bundled distribution of sakshi v2.5.5
+# Bundled distribution of sakshi v2.5.6
 # Source: https://github.com/MacCracken/sakshi
 # License: GPL-3.0-only
 #
@@ -254,10 +254,13 @@ fn _sk_clock_now_ns_raw(): i64 {
     # sakshi_span_exit computed elapsed = 0. The AGNOS note records that this
     # cost two iron burns on the 3D arc before it was understood.
     #
-    # #95 is rdtsc-backed and calibrated at boot against the live tick, so it
-    # needs no interrupts, and it is microsecond rather than 10 ms granular.
-    # It returns -1 (never a plausible 0) when calibration was refused, which is
-    # what makes the fallback below safe to distinguish.
+    # #95 is rdtsc-backed, so it needs no interrupts, and it is microsecond
+    # rather than 10 ms granular. The kernel calibrates it at boot against the
+    # ACPI PM timer when the FADT advertises one (agnos 1.57.6), else against
+    # live LAPIC ticks, whose 100 Hz reload is itself measured against the PM
+    # timer or the PIT (agnos-userland-abi.md, row 95). It returns -1 (never a
+    # plausible 0) when calibration was refused, and then for the rest of that
+    # boot, which is what makes the fallback below safe to distinguish.
     #
     # Both numbers MUST be literals — a `var` does not const-fold, and agnos has
     # no reroute for either. ⚠ #95 collides with Linux `umask`, so this must stay
@@ -420,11 +423,14 @@ fn _sk_clock_init(): i64 {
     _sk_clock_init_done = 1;
 
     #ifdef CYRIUS_TARGET_AGNOS
-    # agnos uses uptime_ms directly (see _sk_now_ns) — no TSC calibration: no
-    # cpuid invariant-TSC check, no nanosleep window. (The 100 Hz uptime_ms tick
-    # is far too coarse to calibrate a GHz TSC over a short window, and #35
-    # (nanosleep) is agnos `sysinfo`, not sleep.) Set nonzero sentinels so the
-    # idempotent guard + any `_sk_tsc_scale == 0` check are satisfied.
+    # agnos reads the kernel clock directly (see _sk_now_ns and
+    # _sk_clock_now_ns_raw): uptime_us (#95, µs) first, uptime_ms (#40) only
+    # when #95 answers -1. So no TSC calibration here: no cpuid invariant-TSC
+    # check, no nanosleep window. The kernel has already calibrated the TSC
+    # behind #95; a userland window against the 100 Hz uptime_ms tick would be
+    # far too coarse, and #35 (nanosleep) is agnos `sysinfo`, not sleep. Set
+    # nonzero sentinels so the idempotent guard + any `_sk_tsc_scale == 0`
+    # check are satisfied.
     _sk_tsc_freq_hz = 1;
     _sk_tsc_scale = 1;
     _sk_clock_init_done = 1;
@@ -553,11 +559,13 @@ fn _sk_clock_install(scale, ticks, ns): i64 {
 # made two processes' timestamps incomparable.
 fn _sk_now_ns(): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
-    # agnos: skip the rdtsc TSC fast-path entirely. uptime_ms (#40) is ~10 ms-
-    # granular at the 100 Hz tick, so calibrating a GHz TSC against a short
-    # window would yield a ~±100% garbage frequency. Read uptime_ms directly —
-    # coarse but correct; mirrors chrono.cyr's agnos clock. All span/output
-    # capture flows through here, so this covers every consumer time-stamp.
+    # agnos: skip the rdtsc TSC fast-path entirely and read the kernel clock
+    # through _sk_clock_now_ns_raw: uptime_us (#95, µs, TSC-backed and
+    # calibrated by the kernel) first, uptime_ms (#40) only when #95 answers -1.
+    # Calibrating a GHz TSC in userland against the ~10 ms-granular #40 tick
+    # would yield a ~±100% garbage frequency, and the kernel has already done
+    # it. Mirrors chrono.cyr's agnos clock. All span/output capture flows
+    # through here, so this covers every consumer time-stamp.
     return _sk_clock_now_ns_raw();
     #endif
     #ifndef CYRIUS_TARGET_AGNOS

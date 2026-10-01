@@ -830,7 +830,7 @@ test_group("hardening: math domains and overflow (1.2.3)");
 # the sum rounded to 0 and the answer was -inf; below -1.34e154 the x*x
 # overflowed first and the answer came back +inf, wrong in SIGN as well.
 # Oddness is the assertion that discriminates, and it is checked bit-for-bit
-# across all three regimes of the implementation.
+# across all four regimes of the implementation (x = 1 is the 1.2.11 log1p one).
 assert_eq(ganita_f64_asinh(f64_neg(t_d(1))), f64_neg(ganita_f64_asinh(t_d(1))),
   "asinh is odd at x = 1 (bit-exact)");
 assert_eq(ganita_f64_asinh(f64_neg(t_d(10))), f64_neg(ganita_f64_asinh(t_d(10))),
@@ -856,9 +856,10 @@ assert_eq(ganita_f64_asinh(t_d(0)), t_d(0), "asinh(0) = 0");
 # size of the answer. `result * (n - i)` wrapped i64 silently from n = 62 up and
 # returned plausible-looking wrong counts, sometimes negative.
 assert_eq(ganita_binomial(52, 5), 2598960, "binomial(52,5) = 2598960 (a poker hand)");
-assert_eq(ganita_binomial(61, 30), 232714176627630544, "binomial(61,30) is EXACT at the boundary");
-assert_eq(ganita_binomial(62, 31), 0 - 1,
-  "binomial(62,31) -> -1: the intermediate does not fit, so it refuses rather than wrapping");
+assert_eq(ganita_binomial(61, 30), 232714176627630544,
+  "binomial(61,30) is EXACT (every product on the way fits: the multiply-first path throughout)");
+assert_eq(ganita_binomial(62, 30), 450883717216034179,
+  "binomial(62,30) is EXACT: the value fits, so neither a wrap (<= 1.2.2) nor a refusal (1.2.3-1.2.10)");
 assert_eq(ganita_binomial(5, 2), 10, "binomial(5,2) = 10 unchanged");
 assert_eq(ganita_binomial(2, 5), 0, "binomial(k > n) = 0 unchanged");
 # The overflow test also bounds the loop: binomial(2^62, 2^61) used to run
@@ -895,6 +896,116 @@ assert_eq(f64_lt(f64_abs(f32_to(ganita_f32_sin(t_f32(1)))), t_d(1)) , 1,
 # NaN and infinity still give NaN: there is no sine of infinity.
 assert_eq(t_is_nan(ganita_f32_sin(0x7F800000)), 1, "f32_sin(+inf) -> NaN");
 assert_eq(t_is_nan(ganita_f32_cos(0xFF800000)), 1, "f32_cos(-inf) -> NaN");
+
+test_group("binomial: exact whenever C(n, k) fits in i64 (1.2.11)");
+# ⭐ Filed as docs/development/issues/archived/2026-09-30-binomial-refuses-representable-values.md
+# (found by abaco 2.4.8, whose evaluator began reporting the -1 as a math error).
+# 1.2.3 to 1.2.10 refused whenever C(n, i)·(n - i) did not fit, and that product is
+# (i + 1)·C(n, i + 1): every C(n, k) above i64_MAX / min(k, n - k) came back -1
+# although it fits — 113 of the 2500 values with n <= 70 that fit. 1.2.11 divides
+# through gcd(C(n, i), i + 1) first when the product would wrap, so the only
+# product it forms is the next coefficient. Expected values are exact integers from
+# Python's math.comb; -1 marks a true value above i64_MAX.
+var BN_MAX = 0x7FFFFFFFFFFFFFFF;
+
+# The filing's table: every value fits, and 1.2.10 returned -1 for each. Rows 6-8
+# are also the LAST n whose C(n, k) fits, for k = 2, 3, 4.
+assert_eq(ganita_binomial(62, 28), 349615716557887465,
+  "C(62,28) exact: 1.2.10's first refusal in (n, k) order, the smallest with n <= 70");
+assert_eq(ganita_binomial(62, 31), 465428353255261088,
+  "C(62,31) exact: binomial's own comment named it as a value which fits");
+assert_eq(ganita_binomial(66, 33), 7219428434016265740, "C(66,33) exact: the largest central coefficient in i64");
+assert_eq(ganita_binomial(67, 29), 7886597962249166160, "C(67,29) exact: the largest 1.2.10 refused with n <= 70");
+assert_eq(ganita_binomial(3037000501, 2), 4611686020018625250,
+  "C(3037000501,2) exact: 1.2.10's first refusal at k = 2");
+assert_eq(ganita_binomial(4294967296, 2), 9223372034707292160,
+  "C(2^32,2) = 2^63 - 2^31 exact: the last n that fits at k = 2");
+assert_eq(ganita_binomial(3810779, 3), 9223371416043870029, "C(3810779,3) exact: the last n that fits at k = 3");
+assert_eq(ganita_binomial(121977, 4), 9223148185681446450, "C(121977,4) exact: the last n that fits at k = 4");
+
+# Controls, right on 1.2.10 as well: the refusal stays exactly where the value
+# leaves i64, and values that never needed the gcd step are unchanged.
+assert_eq(ganita_binomial(67, 33), 0 - 1, "C(67,33) = 14226520737620288370 > i64_MAX -> -1");
+assert_eq(ganita_binomial(4294967297, 2), 0 - 1, "C(2^32+1,2) > i64_MAX -> -1: the first n that overflows at k = 2");
+assert_eq(ganita_binomial(3810780, 3), 0 - 1, "C(3810780,3) > i64_MAX -> -1: the first n that overflows at k = 3");
+assert_eq(ganita_binomial(BN_MAX, 2), 0 - 1, "C(i64_MAX,2) > i64_MAX -> -1");
+assert_eq(ganita_binomial(BN_MAX, 1), BN_MAX, "C(i64_MAX,1) = i64_MAX exact");
+assert_eq(ganita_binomial(3037000500, 2), 4611686016981624750, "C(3037000500,2) exact: 1.2.10's last answer at k = 2");
+
+# The k = 2/3/4 boundaries. With rows 6-8 above (last n that fits) and the two
+# controls before, this completes last-fits / first-overflows for each k.
+assert_eq(ganita_binomial(121978, 4), 0 - 1, "C(121978,4) > i64_MAX -> -1: the first n that overflows at k = 4");
+# Where 1.2.10's refusal band began: the last n answered by multiplying first all
+# the way, then the first n whose final step needs the gcd division.
+assert_eq(ganita_binomial(2642246, 3), 3074454030718368980, "C(2642246,3) exact (multiply-first throughout)");
+assert_eq(ganita_binomial(2642247, 3), 3074457521449010115, "C(2642247,3) exact (gcd step; 1.2.10 refused)");
+assert_eq(ganita_binomial(86251, 4), 2305765318049421250, "C(86251,4) exact (multiply-first throughout)");
+assert_eq(ganita_binomial(86252, 4), 2305872254572844375, "C(86252,4) exact (gcd step; 1.2.10 refused)");
+
+# Mirrors: C(n, n - k) folds to C(n, k), so each side gives the same answer.
+assert_eq(ganita_binomial(4294967296, 4294967294), 9223372034707292160, "C(2^32,2^32-2) = C(2^32,2) exact");
+assert_eq(ganita_binomial(4294967297, 4294967295), 0 - 1, "C(2^32+1,2^32-1) = C(2^32+1,2) -> -1");
+assert_eq(ganita_binomial(67, 38), 7886597962249166160, "C(67,38) = C(67,29) exact");
+assert_eq(ganita_binomial(3810779, 3810776), 9223371416043870029, "C(3810779,3810776) = C(3810779,3) exact");
+assert_eq(ganita_binomial(121978, 121974), 0 - 1, "C(121978,121974) = C(121978,4) -> -1");
+assert_eq(ganita_binomial(BN_MAX, BN_MAX - 1), BN_MAX, "C(i64_MAX,i64_MAX-1) = i64_MAX exact");
+assert_eq(ganita_binomial(BN_MAX, BN_MAX), 1, "C(i64_MAX,i64_MAX) = 1");
+assert_eq(ganita_binomial(BN_MAX, 0), 1, "C(i64_MAX,0) = 1");
+# CWE-834: a huge min(k, n - k) still refuses within a few iterations, never 2^62.
+assert_eq(ganita_binomial(BN_MAX, 4611686018427387904), 0 - 1, "C(i64_MAX,2^62) -> -1 at once");
+
+# The private Euclid helper, directly (the binomial rows reach it only inside the loop).
+assert_eq(_gn_gcd(12, 18), 6, "_gn_gcd(12,18) = 6");
+assert_eq(_gn_gcd(18, 12), 6, "_gn_gcd(18,12) = 6 (argument order does not matter)");
+assert_eq(_gn_gcd(4611686018427387904, 3298534883328), 1099511627776, "_gn_gcd(2^62, 3*2^40) = 2^40");
+# F(92) and F(91), the largest consecutive Fibonacci pair in i64: Euclid's worst case (Lamé).
+assert_eq(_gn_gcd(7540113804746346429, 4660046610375530309), 1, "_gn_gcd(F92, F91) = 1");
+assert_eq(_gn_gcd(BN_MAX, BN_MAX), BN_MAX, "_gn_gcd(i64_MAX, i64_MAX) = i64_MAX");
+assert_eq(_gn_gcd(1, BN_MAX), 1, "_gn_gcd(1, i64_MAX) = 1");
+
+# Every C(n, k), 0 <= k <= n <= 70, against Pascal's rule built by addition alone,
+# with -1 marking a cell above i64_MAX (two non-negative terms either fit or fail
+# a > MAX - b): an oracle independent of the function under test. Stores the cell
+# count, the oracle's -1 count and the cells binomial gets wrong at out, out + 8,
+# out + 16; returns the wrong count.
+fn t_bn_pascal(out): i64 {
+    var prev = alloc(72 * 8);
+    var cur = alloc(72 * 8);
+    var cells = 0;
+    var over = 0;
+    var wrong = 0;
+    var n = 0;
+    while (n <= 70) {
+        var k = 0;
+        while (k <= n) {
+            var c = 1;
+            if (k > 0 && k < n) {
+                var a = load64(prev + (k - 1) * 8);
+                var b = load64(prev + k * 8);
+                if (a < 0 || b < 0) { c = 0 - 1; }
+                else { if (a > BN_MAX - b) { c = 0 - 1; } else { c = a + b; } }
+            }
+            store64(cur + k * 8, c);
+            if (c < 0) { over = over + 1; }
+            if (ganita_binomial(n, k) != c) { wrong = wrong + 1; }
+            cells = cells + 1;
+            k = k + 1;
+        }
+        var t = prev;
+        prev = cur;
+        cur = t;
+        n = n + 1;
+    }
+    store64(out, cells);
+    store64(out + 8, over);
+    store64(out + 16, wrong);
+    return wrong;
+}
+var BN_SW = alloc(24);
+t_bn_pascal(BN_SW);
+assert_eq(load64(BN_SW), 2556, "the sweep visits all 2556 cells with 0 <= k <= n <= 70");
+assert_eq(load64(BN_SW + 8), 56, "Pascal's rule puts 56 of them above i64_MAX, as math.comb does");
+assert_eq(load64(BN_SW + 16), 0, "every C(n,k) with n <= 70 matches Pascal's triangle (1.2.10: 113 refused)");
 
 test_group("linalg/math: f64 pow domain (1.1.4)");
 # pow is exp(y * ln base); ln is undefined at and below zero, so every base <= 0
@@ -1080,8 +1191,8 @@ assert_eq(t_dclose(f32_to(ganita_f32_exp2(t_f32(3))), t_d(8)), 1, "exp2(3) = 8 u
 test_group("hardening: f64 transcendental accuracy (1.2.4)");
 # ⭐ CANCELLATION. sinh/tanh/atanh/asinh all evaluated a form that subtracts two
 # nearly equal quantities near zero, so everything below ~1e-17 came back as a
-# hard 0.0 and 1e-16 was 44% wrong. Each is x + O(x^3), and below 2^-26 the
-# cubic term is under half a ulp — so `== x` EXACTLY is the assertion, not
+# hard 0.0 and 1e-16 was 44% wrong. Each is x + O(x^3), and at 1e-18 the cubic
+# term is far under half a ulp — so `== x` EXACTLY is the assertion, not
 # "close to x". That discriminates: the old code returned 0.0, which is close to
 # 1e-18 in absolute terms and infinitely wrong in relative ones.
 var T18 = f64_div(t_d(1), f64_mul(t_d(1000000000), t_d(1000000000)));
@@ -1089,7 +1200,8 @@ assert_eq(ganita_f64_sinh(T18), T18, "sinh(1e-18) == 1e-18 exactly (was 0.0)");
 assert_eq(ganita_f64_tanh(T18), T18, "tanh(1e-18) == 1e-18 exactly (was 0.0)");
 assert_eq(ganita_f64_atanh(T18), T18, "atanh(1e-18) == 1e-18 exactly (was 0.0)");
 assert_eq(ganita_f64_asinh(T18), T18, "asinh(1e-18) == 1e-18 exactly");
-# The ordinary range is untouched.
+# The ordinary range was untouched by 1.2.4. (1.2.11 reroutes it through expm1;
+# these still hold to 1e-9.)
 assert_eq(t_dclose(ganita_f64_sinh(t_d(1)), f64_div(f64_sub(F64_E, f64_div(t_d(1), F64_E)), t_d(2))), 1,
   "sinh(1) = (e - 1/e)/2 unchanged");
 assert_eq(t_dclose(ganita_f64_tanh(t_d(1)), f64_div(ganita_f64_sinh(t_d(1)), ganita_f64_cosh(t_d(1)))), 1,
@@ -1220,6 +1332,112 @@ assert_eq(f64_lt(f64_div(f64_abs(f64_sub(ganita_f64_acos(f64_sub(t_d(1), D50)), 
 assert_eq(t_dclose(ganita_f64_acos(f64_div(t_d(1), t_d(2))), f64_div(F64_PI, t_d(3))), 1,
   "acos(0.5) = pi/3 unchanged");
 
+test_group("f64 atan2: the whole C99 F.10.1.4 table — signed zeros, infinities, NaN (1.2.11)");
+# ⭐ Two filings, one function. docs/development/issues/archived/2026-09-30-f64-atan2-signed-zero-and-nan.md
+# (hisab): the zero rows were decided with f64_eq, which cannot see the sign of a zero,
+# so atan2(-0, -1) came back +pi where carg(conj z) = -carg(z) needs -pi, and a NaN y at
+# x = ±0 fell through to -pi/2. docs/development/issues/archived/2026-09-30-f64-atan2-infinite-arguments.md
+# (abaco): with both arguments infinite, y/x is inf/inf = NaN, and NaN came back where
+# C99 gives ±pi/4 and ±3pi/4. All 12 rows of the first filing's repro and all 20 of the
+# second's are here, with the table's remaining sign combinations added beside them.
+# Bit-exact, because the sign of a zero is the answer on the zero rows. Every expected
+# value is the double (or float) nearest the exact multiple of pi, checked with mpmath
+# at 400 bits: fl(pi), fl(pi/2) and fl(pi/4) are 0.276 ulp below, fl(3pi/4) 0.207 ulp.
+var AT2_NZ = 0x8000000000000000;
+var AT2_ONE = 0x3FF0000000000000;
+var AT2_NONE = 0xBFF0000000000000;
+var AT2_PINF = 0x7FF0000000000000;
+var AT2_NINF = 0xFFF0000000000000;
+var AT2_PI = 0x400921FB54442D18;
+var AT2_NPI = 0xC00921FB54442D18;
+var AT2_HPI = 0x3FF921FB54442D18;
+var AT2_NHPI = 0xBFF921FB54442D18;
+var AT2_QPI = 0x3FE921FB54442D18;
+var AT2_NQPI = 0xBFE921FB54442D18;
+var AT2_TQPI = 0x4002D97C7F3321D2;
+var AT2_NTQPI = 0xC002D97C7F3321D2;
+var AT2_NAN = 0x7FF8000000000000;
+# Signed zeros (the hisab filing's 10 bit-pattern rows; its 2 NaN rows are below).
+assert_eq(ganita_f64_atan2(0, 0), 0, "atan2(+0, +0) = +0");
+assert_eq(ganita_f64_atan2(AT2_NZ, 0), AT2_NZ, "atan2(-0, +0) = -0 (was +0)");
+assert_eq(ganita_f64_atan2(0, AT2_NZ), AT2_PI, "atan2(+0, -0) = +pi (was +0)");
+assert_eq(ganita_f64_atan2(AT2_NZ, AT2_NZ), AT2_NPI, "atan2(-0, -0) = -pi (was +0)");
+assert_eq(ganita_f64_atan2(0, AT2_NONE), AT2_PI, "atan2(+0, -1) = +pi");
+assert_eq(ganita_f64_atan2(AT2_NZ, AT2_NONE), AT2_NPI, "atan2(-0, -1) = -pi (was +pi: the branch cut)");
+assert_eq(ganita_f64_atan2(0, AT2_ONE), 0, "atan2(+0, +1) = +0");
+assert_eq(ganita_f64_atan2(AT2_NZ, AT2_ONE), AT2_NZ, "atan2(-0, +1) = -0");
+assert_eq(ganita_f64_atan2(AT2_ONE, AT2_NZ), AT2_HPI, "atan2(+1, -0) = +pi/2");
+assert_eq(ganita_f64_atan2(AT2_NONE, 0), AT2_NHPI, "atan2(-1, +0) = -pi/2");
+assert_eq(ganita_f64_atan2(AT2_ONE, 0), AT2_HPI, "atan2(+1, +0) = +pi/2");
+assert_eq(ganita_f64_atan2(AT2_NONE, AT2_NZ), AT2_NHPI, "atan2(-1, -0) = -pi/2");
+# Both infinite (the abaco filing's 4 failing rows).
+assert_eq(ganita_f64_atan2(AT2_PINF, AT2_PINF), AT2_QPI, "atan2(+inf, +inf) = +pi/4 (was NaN)");
+assert_eq(ganita_f64_atan2(AT2_NINF, AT2_PINF), AT2_NQPI, "atan2(-inf, +inf) = -pi/4 (was NaN)");
+assert_eq(ganita_f64_atan2(AT2_PINF, AT2_NINF), AT2_TQPI, "atan2(+inf, -inf) = +3pi/4 (was NaN)");
+assert_eq(ganita_f64_atan2(AT2_NINF, AT2_NINF), AT2_NTQPI, "atan2(-inf, -inf) = -3pi/4 (was NaN)");
+# y infinite, x finite: ±pi/2 whatever x is, its zeros included.
+assert_eq(ganita_f64_atan2(AT2_PINF, AT2_ONE), AT2_HPI, "atan2(+inf, +1) = +pi/2");
+assert_eq(ganita_f64_atan2(AT2_NINF, AT2_ONE), AT2_NHPI, "atan2(-inf, +1) = -pi/2");
+assert_eq(ganita_f64_atan2(AT2_PINF, AT2_NONE), AT2_HPI, "atan2(+inf, -1) = +pi/2");
+assert_eq(ganita_f64_atan2(AT2_NINF, AT2_NONE), AT2_NHPI, "atan2(-inf, -1) = -pi/2");
+assert_eq(ganita_f64_atan2(AT2_PINF, AT2_NZ), AT2_HPI, "atan2(+inf, -0) = +pi/2");
+assert_eq(ganita_f64_atan2(AT2_NINF, 0), AT2_NHPI, "atan2(-inf, +0) = -pi/2");
+# y finite, x infinite: ±0 toward +inf, ±pi toward -inf, signed as y — the zeros too.
+assert_eq(ganita_f64_atan2(AT2_ONE, AT2_PINF), 0, "atan2(+1, +inf) = +0");
+assert_eq(ganita_f64_atan2(AT2_NONE, AT2_PINF), AT2_NZ, "atan2(-1, +inf) = -0");
+assert_eq(ganita_f64_atan2(AT2_ONE, AT2_NINF), AT2_PI, "atan2(+1, -inf) = +pi");
+assert_eq(ganita_f64_atan2(AT2_NONE, AT2_NINF), AT2_NPI, "atan2(-1, -inf) = -pi");
+assert_eq(ganita_f64_atan2(0x7FEFFFFFFFFFFFFF, AT2_NINF), AT2_PI, "atan2(DBL_MAX, -inf) = +pi");
+assert_eq(ganita_f64_atan2(0x8000000000000001, AT2_PINF), AT2_NZ, "atan2(-4.9e-324, +inf) = -0");
+assert_eq(ganita_f64_atan2(0, AT2_PINF), 0, "atan2(+0, +inf) = +0");
+assert_eq(ganita_f64_atan2(AT2_NZ, AT2_PINF), AT2_NZ, "atan2(-0, +inf) = -0");
+assert_eq(ganita_f64_atan2(0, AT2_NINF), AT2_PI, "atan2(+0, -inf) = +pi");
+assert_eq(ganita_f64_atan2(AT2_NZ, AT2_NINF), AT2_NPI, "atan2(-0, -inf) = -pi (was +pi)");
+# Finite controls in the four quadrants the both-infinite rows answer for.
+assert_eq(ganita_f64_atan2(AT2_ONE, AT2_ONE), AT2_QPI, "atan2(+1, +1) = +pi/4");
+assert_eq(ganita_f64_atan2(AT2_NONE, AT2_ONE), AT2_NQPI, "atan2(-1, +1) = -pi/4");
+assert_eq(ganita_f64_atan2(AT2_ONE, AT2_NONE), AT2_TQPI, "atan2(+1, -1) = +3pi/4");
+assert_eq(ganita_f64_atan2(AT2_NONE, AT2_NONE), AT2_NTQPI, "atan2(-1, -1) = -3pi/4");
+# NaN in either place is NaN out, so the NaN test has to run before the zero rows:
+# atan2(NaN, ±0) was -pi/2, and a NaN x beside a zero y would otherwise get the zero
+# row's ±0 or ±pi.
+assert_eq(t_f64_is_nan(ganita_f64_atan2(AT2_NAN, 0)), 1, "atan2(NaN, +0) = NaN (was -pi/2)");
+assert_eq(t_f64_is_nan(ganita_f64_atan2(AT2_NAN, AT2_NZ)), 1, "atan2(NaN, -0) = NaN (was -pi/2)");
+assert_eq(t_f64_is_nan(ganita_f64_atan2(AT2_ONE, AT2_NAN)), 1, "atan2(+1, NaN) = NaN");
+assert_eq(t_f64_is_nan(ganita_f64_atan2(AT2_NAN, AT2_ONE)), 1, "atan2(NaN, +1) = NaN");
+assert_eq(t_f64_is_nan(ganita_f64_atan2(AT2_NAN, AT2_NAN)), 1, "atan2(NaN, NaN) = NaN");
+assert_eq(t_f64_is_nan(ganita_f64_atan2(AT2_NZ, AT2_NAN)), 1, "atan2(-0, NaN) = NaN, not the zero row");
+assert_eq(t_f64_is_nan(ganita_f64_atan2(AT2_PINF, AT2_NAN)), 1, "atan2(+inf, NaN) = NaN");
+assert_eq(t_f64_is_nan(ganita_f64_atan2(AT2_NAN, AT2_NINF)), 1, "atan2(NaN, -inf) = NaN");
+# Which NaN: the operand itself, payload and sign bit kept, and y's when both are
+# NaN. Quiet NaNs with distinct payloads, so the rows tell y from x and still hold if
+# a later body quiets its NaN operand.
+var AT2_NANP = 0x7FF8000000000123;
+var AT2_NNANP = 0xFFF8000000000456;
+assert_eq(ganita_f64_atan2(AT2_NANP, 0), AT2_NANP, "atan2(NaN, +0) is y itself, payload kept");
+assert_eq(ganita_f64_atan2(AT2_NNANP, AT2_NZ), AT2_NNANP, "atan2(-NaN, -0) is y itself, sign kept");
+assert_eq(ganita_f64_atan2(AT2_ONE, AT2_NNANP), AT2_NNANP, "atan2(+1, -NaN) is x itself");
+assert_eq(ganita_f64_atan2(0, AT2_NANP), AT2_NANP, "atan2(+0, NaN) is x itself, not the zero row");
+assert_eq(ganita_f64_atan2(AT2_NANP, AT2_NNANP), AT2_NANP, "atan2(NaN, -NaN) is y: y first");
+assert_eq(ganita_f64_atan2(AT2_NNANP, AT2_NANP), AT2_NNANP, "atan2(-NaN, NaN) is y: y first");
+# ganita_f32_atan2 widens onto ganita_f64_atan2, so it inherits every row. Expected
+# values are the floats nearest ±pi/4, ±3pi/4, ±pi and ±pi/2.
+assert_eq(ganita_f32_atan2(F_INF, F_INF), 0x3F490FDB, "f32 atan2(+inf, +inf) = +pi/4 (was NaN)");
+assert_eq(ganita_f32_atan2(F_NINF, F_INF), 0xBF490FDB, "f32 atan2(-inf, +inf) = -pi/4 (was NaN)");
+assert_eq(ganita_f32_atan2(F_INF, F_NINF), 0x4016CBE4, "f32 atan2(+inf, -inf) = +3pi/4 (was NaN)");
+assert_eq(ganita_f32_atan2(F_NINF, F_NINF), 0xC016CBE4, "f32 atan2(-inf, -inf) = -3pi/4 (was NaN)");
+assert_eq(ganita_f32_atan2(F_0, F_0), F_0, "f32 atan2(+0, +0) = +0");
+assert_eq(ganita_f32_atan2(F_NZ, F_0), F_NZ, "f32 atan2(-0, +0) = -0 (was +0)");
+assert_eq(ganita_f32_atan2(F_0, F_NZ), 0x40490FDB, "f32 atan2(+0, -0) = +pi (was +0)");
+assert_eq(ganita_f32_atan2(F_NZ, F_NZ), 0xC0490FDB, "f32 atan2(-0, -0) = -pi (was +0)");
+assert_eq(ganita_f32_atan2(F_0, F_M1), 0x40490FDB, "f32 atan2(+0, -1) = +pi");
+assert_eq(ganita_f32_atan2(F_NZ, F_M1), 0xC0490FDB, "f32 atan2(-0, -1) = -pi (was +pi)");
+assert_eq(ganita_f32_atan2(F_NZ, F_1), F_NZ, "f32 atan2(-0, +1) = -0");
+assert_eq(ganita_f32_atan2(F_M1, F_0), 0xBFC90FDB, "f32 atan2(-1, +0) = -pi/2");
+assert_eq(ganita_f32_atan2(F_1, F_NZ), 0x3FC90FDB, "f32 atan2(+1, -0) = +pi/2");
+assert_eq(t_is_nan(ganita_f32_atan2(FNAN, F_0)), 1, "f32 atan2(NaN, +0) = NaN (was -pi/2)");
+assert_eq(t_is_nan(ganita_f32_atan2(F_1, FNAN)), 1, "f32 atan2(+1, NaN) = NaN");
+
 test_group("f64 pow: within 1 ulp of the correctly rounded value, everywhere (1.2.8)");
 # ⭐ pow was hundreds of ulp out on both of its old paths. `exp(y*ln x)` turns the
 # rounding of y*ln x into a relative error of about |y*ln x| ulp (909 ulp at
@@ -1232,6 +1450,7 @@ test_group("f64 pow: within 1 ulp of the correctly rounded value, everywhere (1.
 # of the two old paths. 1.2.7 fails 94 of them.
 var PW_BAD = 0;
 var PW_MAX = 0;
+# One pow reference row: tallies the bit-pattern distance into PW_MAX and PW_BAD.
 fn t_pw1(x, y, want): i64 {
     var got = ganita_f64_pow(x, y);
     var d = got - want;
@@ -1360,6 +1579,288 @@ assert_eq(ganita_f64_pow(PA_HALF, t_d(1075)), 0, "pow(0.5, 1075) underflows to +
 assert_eq(ganita_f64_pow(t_d(2), t_d(1023)), 0x7FE0000000000000, "pow(2, 1023) is exact");
 assert_eq(ganita_f64_pow(t_d(2), t_d(1024)), 0x7FF0000000000000, "pow(2, 1024) overflows to +inf");
 assert_eq(ganita_f64_pow(t_d(0 - 3), t_d(33)), t_d(0 - 5559060566555523), "pow(-3, 33) = -(3^33) exactly");
+
+test_group("f64 sinh/tanh/atanh/asinh/acosh/asin: no cancellation band above the cutoff (1.2.11)");
+# ⭐ CANCELLATION above the cutoff. Below 2^-26 (1e-8 for asinh) these return x, but
+# just above it the direct forms differenced two numbers near 1 and lost about eps/|x|
+# relative: 4e7 ulp for sinh at 2e-8, 1.3e8 for asinh, 2.5e7 for acosh at 1 + 2^-52,
+# and asin lost 1,024 ulp near +-1 to the rounding of x·x. 1.2.11 routes the band
+# through ports of fdlibm's expm1 and log1p, which never form the 1 + small. Wanted
+# bits are correctly rounded (mpmath, 300 bits, rounded once). The first 16 rows and
+# the first 11 kernel rows are the filing's; 1.2.10 fails all 16 band rows. Filed as
+# docs/development/issues/archived/2026-09-30-f64-hyperbolic-and-asin-cancellation-band.md.
+var HB_BAD = 0;
+var HB_MAX = 0;
+# Scores one row: counts it in HB_BAD when the result is NaN, has the wrong sign or is
+# more than 2 ulp (bit-pattern distance) from `want`, and keeps the largest distance in
+# HB_MAX. fid: 1 sinh, 2 tanh, 3 atanh, 4 asinh, 5 acosh, 6 asin, 7 _gn_expm1,
+# 8 _gn_log1p, 9 cosh.
+fn t_hb1(fid, x, want): i64 {
+    var got = 0;
+    if (fid == 1) { got = ganita_f64_sinh(x); }
+    if (fid == 2) { got = ganita_f64_tanh(x); }
+    if (fid == 3) { got = ganita_f64_atanh(x); }
+    if (fid == 4) { got = ganita_f64_asinh(x); }
+    if (fid == 5) { got = ganita_f64_acosh(x); }
+    if (fid == 6) { got = ganita_f64_asin(x); }
+    if (fid == 7) { got = _gn_expm1(x); }
+    if (fid == 8) { got = _gn_log1p(x); }
+    if (fid == 9) { got = ganita_f64_cosh(x); }
+    var d = 0x0010000000000000;
+    if (t_f64_is_nan(got) == 0 && (got >> 63) == (want >> 63)) {
+        d = (got & 0x7FFFFFFFFFFFFFFF) - (want & 0x7FFFFFFFFFFFFFFF);
+        if (d < 0) { d = 0 - d; }
+    }
+    if (d > HB_MAX) { HB_MAX = d; }
+    if (d > 2) { HB_BAD = HB_BAD + 1; }
+    return 0;
+}
+t_hb1(1, 0x3E5528F5C28F5993, 0x3E5528F5C28F5993);   # sinh(1.9706785678861335e-8): 1.2.10 4.1e7 ulp off
+t_hb1(1, 0x3EB0C6F7A0B5ED8D, 0x3EB0C6F7A0B5F0A0);   # sinh(1e-6): 1.2.10 returned less than x
+t_hb1(1, 0xBF847AE147AE147B, 0xBF847AF7A654E9EF);   # sinh(-0.01)
+t_hb1(2, 0x3E5528F5C28F5993, 0x3E5528F5C28F5992);   # tanh(1.9706785678861335e-8)
+t_hb1(2, 0x3E7AD7F29ABCAF48, 0x3E7AD7F29ABCAF2F);   # tanh(1e-7)
+t_hb1(2, 0xBF30000000000000, 0xBF2FFFFFF555555A);   # tanh(-2^-12)
+t_hb1(3, 0x3E591EB851EB8368, 0x3E591EB851EB8369);   # atanh(2.339482307433937e-8)
+t_hb1(3, 0xBEB0000000000000, 0xBEB0000000000555);   # atanh(-2^-20)
+t_hb1(3, 0x3F50624DD2F1A9FC, 0x3F50624E2E91ED17);   # atanh(0.001)
+t_hb1(4, 0x3E4FBF258BF2565D, 0x3E4FBF258BF2565D);   # asinh(1.4783193667728686e-8): 1.2.10 1.3e8 ulp off
+t_hb1(4, 0x3E7AD7F29ABCAF48, 0x3E7AD7F29ABCAF3B);   # asinh(1e-7)
+t_hb1(4, 0xBFA999999999999A, 0xBFA996DF55A826BB);   # asinh(-0.05)
+t_hb1(5, 0x3FF0000000000001, 0x3E56A09E667F3BCC);   # acosh(1 + 2^-52): 1.2.10 2.5e7 ulp off
+t_hb1(5, 0x3FF0000000001000, 0x3EB6A09E667F39EA);   # acosh(1 + 2^-40)
+t_hb1(6, 0x3FEFFFFFFC000000, 0x3FF9217B54442BC3);   # asin(1 - 2^-27): 1.2.10 1,024 ulp off
+t_hb1(6, 0xBFEFFFFFFC000000, 0xBFF9217B54442BC3);   # asin(-(1 - 2^-27))
+# More rows per function, on each branch 1.2.11 gave it.
+t_hb1(1, 0xBFD999999999999A, 0xBFDA49C41F850ED2);   # sinh(-0.4)
+t_hb1(1, 0x3FE8000000000000, 0x3FEA506B2DD3C690);   # sinh(0.75): expm1's k = 1
+t_hb1(1, 0x4014000000000000, 0x40528D0166F07374);   # sinh(5): the E + E/(E+1) form
+t_hb1(1, 0xC03E000000000000, 0xC29370470AEC28ED);   # sinh(-30): e^|x|/2
+t_hb1(2, 0x3FD3333333333333, 0x3FD2A4DDA7D914FA);   # tanh(0.3)
+t_hb1(2, 0x3FE3333333333333, 0x3FE12F8292D2CCFC);   # tanh(0.6): expm1(-1.2), k = -2
+t_hb1(2, 0xC008000000000000, 0xBFEFD77D111A0B00);   # tanh(-3): the 1 - 2/(E+2) form
+t_hb1(3, 0xBFD3333333333333, 0xBFD3CF2B50617C95);   # atanh(-0.3)
+t_hb1(3, 0x3FE8000000000000, 0x3FEF2272AE325A57);   # atanh(0.75): the 2|x|/(1-|x|) form
+t_hb1(4, 0xBFD3333333333333, 0xBFD2EC4EA565FCC1);   # asinh(-0.3)
+t_hb1(4, 0x3FF8000000000000, 0x3FF31DC0090B63D8);   # asinh(1.5)
+t_hb1(4, 0x3FE0000000000031, 0x3FDECC2CAEC51661);   # asinh(1/2 + 49·2^-53): the direct form is 3 ulp off
+t_hb1(5, 0x3FF004189374BC6A, 0x3FA6E53ACBCDEBA3);   # acosh(1.001): 1.2.10 133 ulp off
+t_hb1(5, 0x3FF8000000000000, 0x3FEECC2CAEC5160A);   # acosh(1.5)
+t_hb1(6, 0x3FE8000000000000, 0x3FEB235315C680DC);   # asin(0.75)
+t_hb1(6, 0xBFEFFFFFFAA19C47, 0xBFF9216709C28B31);   # asin(-0.99999999): 1.2.10 175 ulp off
+# The two fdlibm kernels the fix rests on: every reduction branch of each.
+t_hb1(7, 0x3E10000000000000, 0x3E10000000200000);   # expm1(2^-30)
+t_hb1(7, 0x3EE4F8B588E368F1, 0x3EE4F8BC681CDFB6);   # expm1(1e-5)
+t_hb1(7, 0xBFE0000000000000, 0xBFD92E9A0720D3EC);   # expm1(-0.5): k = -1
+t_hb1(7, 0x3FF0000000000000, 0x3FFB7E151628AED3);   # expm1(1): k = 1
+t_hb1(7, 0x403E000000000000, 0x42A370470AEC26ED);   # expm1(30): 20 <= k <= 56
+t_hb1(7, 0xC044000000000000, 0xBFF0000000000000);   # expm1(-40): below -56 ln2, -1
+t_hb1(7, 0x3FC999999999999A, 0x3FCC56ECF2C56468);   # expm1(0.2): k = 0
+t_hb1(7, 0x3FD999999999999A, 0x3FDF7A0E4BEEFF80);   # expm1(0.4): k = 1 with r < -1/4
+t_hb1(7, 0xBFF0000000000000, 0xBFE43A54E4E98864);   # expm1(-1): k = -1
+t_hb1(7, 0xC014000000000000, 0xBFEFC8CD803FE559);   # expm1(-5): k <= -2
+t_hb1(7, 0x4014000000000000, 0x40626D389970338F);   # expm1(5): 2 <= k < 20
+t_hb1(7, 0x402A000000000000, 0x411B00B1916AC955);   # expm1(13): k = 19
+t_hb1(7, 0x402E000000000000, 0x4148F0CC2FAD2A87);   # expm1(15): k = 22
+t_hb1(7, 0x4043C00000000000, 0x437FB37161577EDD);   # expm1(39.5): k = 57
+t_hb1(7, 0x4049000000000000, 0x44719103E4080B45);   # expm1(50): k > 56
+t_hb1(7, 0x40862D999999999A, 0x7FED75AE7A50EE14);   # expm1(709.7): k = 1024
+t_hb1(8, 0x3E10000000000000, 0x3E0FFFFFFFC00000);   # log1p(2^-30)
+t_hb1(8, 0x3EE4F8B588E368F1, 0x3EE4F8AEA9AE7317);   # log1p(1e-5)
+t_hb1(8, 0xBFE0000000000000, 0xBFE62E42FEFA39EF);   # log1p(-0.5) = -ln 2
+t_hb1(8, 0x3FF0000000000000, 0x3FE62E42FEFA39EF);   # log1p(1) = ln 2
+t_hb1(8, 0x4202A05F20000000, 0x4037069E2AA3184E);   # log1p(1e10)
+t_hb1(8, 0x3D70000000000000, 0x3D6FFFFFFFFFF000);   # log1p(2^-40): x - x²/2
+t_hb1(8, 0xBFD0000000000000, 0xBFD269621134DB92);   # log1p(-0.25): k = 0, f = x
+t_hb1(8, 0x3FE0000000000000, 0x3FD9F323ECBF984C);   # log1p(0.5): u/2 normalised
+t_hb1(8, 0x3FF0000004000000, 0x3FE62E4302FA39EF);   # log1p(1 + 2^-26): |f| < 2^-20
+t_hb1(8, 0x4007FFFFFFFFFFFF, 0x3FF62E42FEFA39EF);   # log1p(3 - 2^-51): f just below 0
+t_hb1(8, 0xBFE3333333333333, 0xBFED5240F0E0E077);   # log1p(-0.6): k = -1
+t_hb1(8, 0x43B0000000000000, 0x4044CB5ECF0A9650);   # log1p(2^60): 1 + x is x
+t_hb1(8, 0x3FDAE147AE147AE1, 0x3FD6712984EC8F15);   # log1p(0.42): just past sqrt(2) - 1
+# Past log1p's k = 0 cut at sqrt(2) - 1, 1 + x is renormalised to f near -1/4. Taking
+# f = x up to 1/2 instead leaves these 9 and 38 ulp off.
+t_hb1(8, 0x3FDE68CB648F13AE, 0x3FD8E165543789D9);   # log1p(0.4751461488743257)
+t_hb1(5, 0x3FF154EA93DD5681, 0x3FD9EF22BE758EAF);   # acosh(1.0832315231286034): log1p of 0.4996
+# 1 + x rounds here, and without the correction term c the result is 2 ulp off.
+t_hb1(8, 0xBFD30011C5F923FB, 0xBFD68AE185B41854);   # log1p(-0.29687923749275996)
+# expm1's correction term c, likewise: without it this tanh row is 2 ulp off.
+t_hb1(2, 0x3FCB5E62C497F5A0, 0x3FCAF587AF9B39DA);   # tanh(0.21381792640015096): expm1(-0.4276)
+# log1p's c / u where 1 + x rounds with u far above 1 (k > 0). Without the division
+# by u the atanh row is 32 ulp off and the log1p row about 2^44 ulp off.
+t_hb1(3, 0x3FEFC0639D5D3B1F, 0x40063085F0F8752C);   # atanh(0.9922349999922949)
+t_hb1(8, 0x430FFFFFFFFFFFF9, 0x4041542457337D43);   # log1p(1125899906842623.1): u ~ 2^50
+assert_eq(HB_BAD, 0, "67 band, branch and kernel rows are within 2 ulp of the correctly rounded value");
+assert(HB_MAX <= 1, "the largest error over the 67 rows is at most 1 ulp");
+var HB_SIGN = 0x8000000000000000;
+var HB_NAN = f64_div(t_d(0), t_d(0));
+assert_eq(_gn_expm1(0xFFF0000000000000), 0xBFF0000000000000, "expm1(-inf) = -1");
+assert_eq(_gn_expm1(0x7FF0000000000000), 0x7FF0000000000000, "expm1(+inf) = +inf");
+assert_eq(_gn_expm1(HB_SIGN), HB_SIGN, "expm1(-0) = -0");
+assert_eq(_gn_expm1(0x3C80000000000000), 0x3C80000000000000, "expm1(2^-55) = 2^-55 (below 2^-54, x itself)");
+assert_eq(_gn_expm1(0x4086300000000000), 0x7FF0000000000000, "expm1(710) = +inf (past o_threshold)");
+# From about 710.13 (k = 1025) 2^k no longer fits the exponent field, so only the
+# o_threshold guard keeps expm1 from answering -1 there.
+assert_eq(_gn_expm1(t_d(720)), 0x7FF0000000000000, "expm1(720) = +inf (the o_threshold guard)");
+assert_eq(t_f64_is_nan(_gn_expm1(HB_NAN)), 1, "expm1(NaN) is NaN");
+assert_eq(_gn_log1p(0xBFF0000000000000), 0xFFF0000000000000, "log1p(-1) = -inf");
+assert_eq(t_f64_is_nan(_gn_log1p(0xC000000000000000)), 1, "log1p(-2) is NaN");
+assert_eq(t_f64_is_nan(_gn_log1p(0xFFF0000000000000)), 1, "log1p(-inf) is NaN");
+assert_eq(_gn_log1p(HB_SIGN), HB_SIGN, "log1p(-0) = -0");
+assert_eq(_gn_log1p(0x7FF0000000000000), 0x7FF0000000000000, "log1p(+inf) = +inf");
+assert_eq(t_f64_is_nan(_gn_log1p(HB_NAN)), 1, "log1p(NaN) is NaN");
+assert_eq(ganita_f64_atanh(t_d(1)), 0x7FF0000000000000, "atanh(1) = +inf, as before");
+assert_eq(ganita_f64_atanh(t_d(0 - 1)), 0xFFF0000000000000, "atanh(-1) = -inf, as before");
+assert_eq(t_f64_is_nan(ganita_f64_atanh(0x3FF0000000000001)), 1, "atanh(1 + 2^-52) is NaN");
+assert_eq(ganita_f64_asin(t_d(1)), F64_PI_2, "asin(1) = pi/2, correctly rounded");
+assert_eq(ganita_f64_asin(t_d(0 - 1)), F64_PI_2 | HB_SIGN, "asin(-1) = -pi/2");
+assert_eq(t_f64_is_nan(ganita_f64_asin(0x3FF0000000000001)), 1, "asin(1 + 2^-52) is NaN");
+assert_eq(t_f64_is_nan(ganita_f64_asin(t_d(0 - 2))), 1, "asin(-2) is NaN");
+assert_eq(ganita_f64_acosh(t_d(1)), 0, "acosh(1) = +0 through the log1p form");
+assert_eq(t_f64_is_nan(ganita_f64_acosh(0x3FEFFFFFFFFFFFFF)), 1, "acosh(1 - 2^-53) is NaN");
+assert_eq(ganita_f64_sinh(HB_SIGN), HB_SIGN, "sinh(-0) = -0");
+assert_eq(ganita_f64_tanh(HB_SIGN), HB_SIGN, "tanh(-0) = -0");
+assert_eq(ganita_f64_atanh(HB_SIGN), HB_SIGN, "atanh(-0) = -0");
+assert_eq(ganita_f64_asinh(HB_SIGN), HB_SIGN, "asinh(-0) = -0");
+assert_eq(ganita_f64_asin(HB_SIGN), HB_SIGN, "asin(-0) = -0");
+assert_eq(ganita_f64_tanh(0xFFF0000000000000), t_d(0 - 1), "tanh(-inf) = -1");
+assert_eq(ganita_f64_asinh(0xFFF0000000000000), 0xFFF0000000000000, "asinh(-inf) = -inf");
+# Odd, bit for bit: f(-x) is f(x) with the sign bit set. 1.2.10's sinh was not on
+# 2^-26 <= |x| < 500, where its negative side formed e^|x| as 1/exp(x), and neither was
+# atanh, which divided (1 + x)/(1 - x) on x itself; each of these now computes on |x|
+# and re-signs. 600 patterns over [2^-26, 64); NaNs (atanh and asin
+# past 1) are skipped, since a NaN's sign is the target's, not the function's.
+var hb_odd_bad = 0;
+var hb_i = 0;
+while (hb_i < 600) {
+    var hbx = 0x3E50000000000000 + hb_i * 0xDA740DA740DA;
+    var hbf = 1;
+    while (hbf <= 6) {
+        if (hbf != 5) {
+            var hbp = 0;
+            var hbn = 0;
+            if (hbf == 1) { hbp = ganita_f64_sinh(hbx); hbn = ganita_f64_sinh(hbx | HB_SIGN); }
+            if (hbf == 2) { hbp = ganita_f64_tanh(hbx); hbn = ganita_f64_tanh(hbx | HB_SIGN); }
+            if (hbf == 3) { hbp = ganita_f64_atanh(hbx); hbn = ganita_f64_atanh(hbx | HB_SIGN); }
+            if (hbf == 4) { hbp = ganita_f64_asinh(hbx); hbn = ganita_f64_asinh(hbx | HB_SIGN); }
+            if (hbf == 6) { hbp = ganita_f64_asin(hbx); hbn = ganita_f64_asin(hbx | HB_SIGN); }
+            if (t_f64_is_nan(hbp) == 0 && hbn != (hbp | HB_SIGN)) { hb_odd_bad = hb_odd_bad + 1; }
+        }
+        hbf = hbf + 1;
+    }
+    hb_i = hb_i + 1;
+}
+assert_eq(hb_odd_bad, 0, "sinh/tanh/atanh/asinh/asin are odd bit for bit over 600 patterns in [2^-26, 64)");
+# Where each reroute switches form. Every row is correctly rounded (mpmath, 400 bits),
+# the same bits on x86_64 and aarch64, and sits where moving that cut (sinh's and
+# tanh's 1, atanh's 1/2, asinh's and acosh's 2, asin's 1/2) changes the answer. They
+# come from a 180-mutant campaign on the merged 1.2.11 tree: every one of them failed
+# no row before these were added.
+assert_eq(ganita_f64_sinh(0x3FE6365179CD66EA), 0x3FE80A12DC5CB255, "sinh(0.6941306475593738) is correctly rounded");
+assert_eq(ganita_f64_sinh(0x3FF0A2B2C10F4B6E), 0x3FF3CC8B683CE511, "sinh(1.0397212544819143) is correctly rounded");
+assert_eq(ganita_f64_tanh(0x3FE00C1A910F3E29), 0x3FDDA65A3BCE1AC1, "tanh(0.501477511710566) is correctly rounded");
+assert_eq(ganita_f64_tanh(0x3FF0DF137FFE5D0F), 0x3FE912B80E0EC424, "tanh(1.0544619560003559) is correctly rounded");
+assert_eq(ganita_f64_atanh(0x3FD208AE5531AD2B), 0x3FD2890ABBF48D2C, "atanh(0.28177984542590434) is correctly rounded");
+assert_eq(ganita_f64_atanh(0x3FE01591F61DB760), 0x3FE1B0BA125DE75E, "atanh(0.5026330763773608) is correctly rounded");
+assert_eq(ganita_f64_asinh(0x3FF8ADD6C4A6ADEA), 0x3FF37D3E6529B7E0, "asinh(1.5424411470111132) is correctly rounded");
+assert_eq(ganita_f64_asinh(0x3FFFFFFFFFFFFFFF), 0x3FF719218313D087, "asinh(2 - 2^-52), the last log1p argument");
+assert_eq(ganita_f64_asinh(0x400064ED23FAF841), 0x3FF77285C6A7DB79, "asinh(2.0492804347004783) is correctly rounded");
+assert_eq(ganita_f64_acosh(0x3FF974B11964D897), 0x3FF0A2B15B693C1E, "acosh(1.5909892074537646) is correctly rounded");
+assert_eq(ganita_f64_acosh(0x40036C50663BB379), 0x3FF88E6DD7D16991, "acosh(2.4278877245873756) is correctly rounded");
+assert_eq(ganita_f64_asin(0x3FD04ECB2C790A9A), 0x3FD07D57F70A5CCE, "asin(0.254809182577597) is correctly rounded");
+assert_eq(ganita_f64_asin(0x3FE0566BEE8924C3), 0x3FE12577D9666F0B, "asin(0.5105495127583243) is correctly rounded");
+# sinh's 22 between the expm1 form and e^|x|/2: below 22 e^-|x| still counts. With the
+# cut moved down to 5, sinh(5.5) came back 1.4e11 ulp off and no row noticed.
+assert_eq(ganita_f64_sinh(0x403053279ABBCE37), 0x415774232D8539F1, "sinh(16.324823065615615) is correctly rounded");
+assert_eq(ganita_f64_sinh(0x4037EC489A17BD04), 0x4206D75B186D487F, "sinh(23.92298281745481) is correctly rounded");
+# How the kernels choose a branch, not only that each branch runs: expm1's k = +-1 and
+# ln2/2 cuts, its k > 56 cut; log1p's k = 0 bands (both signs), its sqrt(2) cut on
+# the normalised mantissa, its 2^53 cut and the |f| < 2^-20 branch.
+assert_eq(ganita_f64_sinh(0x3FD62E4270BFDEBD), 0x3FD6A09DCFA43841, "sinh(0.3465734578198683), just below ln2/2");
+assert_eq(ganita_f64_sinh(0x3FD62E430E8EB2EF), 0x3FD6A09E7705A5CF, "sinh(0.34657360478995164), just above ln2/2");
+assert_eq(_gn_expm1(0x40433D6094280429), 0x4366D9E8416515CF, "expm1(38.47950984910887) is correctly rounded");
+assert_eq(_gn_expm1(0x404399BFADC1F812), 0x4377830EF81E06D9, "expm1(39.20116207095283), k = 57");
+assert_eq(ganita_f64_atanh(0x3FC5F619318AD05C), 0x3FC62E42955CDF5B, "atanh(0.17157282752089287) is correctly rounded");
+assert_eq(ganita_f64_atanh(0x3FC5F61A859495FF), 0x3FC62E43F3B6DF61, "atanh(0.17157298586350575) is correctly rounded");
+assert_eq(_gn_log1p(0xBE428E768BD21E29), 0xBE428E768D2A761D, "log1p(-8.641041988077045e-09): x - x²/2");
+assert_eq(_gn_log1p(0xBFD2BEC406D8410C), 0xBFD62E442A900EFB, "log1p(-0.29289341610366715): k = 0, f = x");
+assert_eq(_gn_log1p(0xBFD2BEC51E174B9A), 0xBFD62E45B57A0C6F, "log1p(-0.2928936761720081): past the k = 0 band");
+assert_eq(_gn_log1p(0x4333FFFFA806E5A2), 0x4042222664BFE299, "log1p(5629498058270114.0): below 2^53, c kept");
+assert_eq(_gn_log1p(0x3FF00001F9B1673A), 0x3FE62E44F8AB918E, "log1p(1.0000018838531575): |f| < 2^-20");
+
+test_group("f64 sinh/cosh: the overflow band within 1 bit pattern of correctly rounded (1.2.11)");
+# ⭐ OVERFLOW band. Between ~709.78, where f64_exp overflows, and ~710.4759, where
+# sinh/cosh do, both returned exp(|x| - ln 2) from 709 up: rounding |x| - ln 2 near 709
+# costs up to half an ulp of 709, and exp turns that into up to ~500 ulp (496 at
+# 710.4755). 1.2.11 keeps 0.5·exp(|x|) up to exp's own overflow and above it forms
+# exp(|x| - c)·2^2042, c the double nearest 2043·ln 2, with |x| - c exact. Wanted bits
+# are correctly rounded (mpmath, 400 bits); the |x| = 708 rows sit below the branch
+# and were right before. 1.2.10 fails all 8 band rows. Filed as
+# docs/development/issues/archived/2026-09-30-f64-sinh-cosh-overflow-band.md.
+HB_BAD = 0;
+HB_MAX = 0;
+t_hb1(1, 0x40862C0000000000, 0x7FD81E9B4B52D0C9);   # sinh(709.5): 1.2.10 373 ulp off
+t_hb1(1, 0x4086300000000000, 0x7FE3E21A464507F9);   # sinh(710)
+t_hb1(1, 0x408633CDDA05A699, 0x7FEFFD294EF597D8);   # sinh(710.4755135003535): 1.2.10 496 ulp off
+t_hb1(1, 0xC08633CDDA05A699, 0xFFEFFD294EF597D8);   # sinh(-710.4755135003535)
+t_hb1(9, 0x40862C0000000000, 0x7FD81E9B4B52D0C9);   # cosh(709.5)
+t_hb1(9, 0x4086300000000000, 0x7FE3E21A464507F9);   # cosh(710): 1.2.10 308 ulp off
+t_hb1(9, 0x408633CDDA05A699, 0x7FEFFD294EF597D8);   # cosh(710.4755135003535)
+t_hb1(9, 0xC08633CDDA05A699, 0x7FEFFD294EF597D8);   # cosh(-710.4755135003535)
+t_hb1(1, 0x4086200000000000, 0x7FB586F6BF260CF1);   # sinh(708): control
+t_hb1(9, 0x4086200000000000, 0x7FB586F6BF260CF1);   # cosh(708): control
+# 710.4758600739439 is the largest double whose sinh/cosh is finite.
+t_hb1(1, 0x408633CE8FB9F87D, 0x7FEFFFFFFFFFFD3B);   # sinh at the threshold
+t_hb1(9, 0x408633CE8FB9F87D, 0x7FEFFFFFFFFFFD3B);   # cosh at the threshold
+# Either side of exp's overflow threshold, 709.782712893384: 0.5·exp, then 2^2042.
+t_hb1(1, 0x40862E42FEFA39EF, 0x7FDFFFFFFFFFFF2A);   # sinh(709.78271289338397)
+t_hb1(9, 0x40862E42FEFA39F0, 0x7FE0000000000195);   # cosh(709.78271289338409)
+# (w/2)·w with w = exp(|x|/2), which doubles exp's error, is 3 bit patterns off at the
+# first three arguments on aarch64 and 2 off at the last two on both targets.
+t_hb1(1, 0x408628A6E9D4C625, 0x7FCFBE326E9EBAF2);   # sinh(709.0815006850213)
+t_hb1(9, 0x408628A6E9D4C625, 0x7FCFBE326E9EBAF2);   # cosh(709.0815006850213)
+t_hb1(1, 0x408628B5C7560156, 0x7FCFF9651CB153EC);   # sinh(709.08875910941674)
+t_hb1(9, 0x408628B5C7560156, 0x7FCFF9651CB153EC);   # cosh(709.08875910941674)
+t_hb1(1, 0x408633CCDD1C42CD, 0x7FEFF9364192F8C4);   # sinh(710.47503110960827)
+t_hb1(9, 0x408633CCDD1C42CD, 0x7FEFF9364192F8C4);   # cosh(710.47503110960827)
+t_hb1(9, 0x408628ACA1E31A37, 0x7FCFD4EBBBDDF36A);   # cosh(709.08429315017463)
+t_hb1(1, 0x408633C6F3BB4D3F, 0x7FEFE19E7A7C1DB6);   # sinh(710.4721445687245)
+assert_eq(HB_BAD, 0, "the 22 overflow-band rows are within 2 bit patterns of correctly rounded (1.2.10: 8 were not)");
+assert(HB_MAX <= 1, "every one of the 22 overflow-band rows is at most 1 bit pattern from correctly rounded");
+assert_eq(ganita_f64_sinh(0x408633CE8FB9F87E), 0x7FF0000000000000, "sinh(710.475860073944) = +inf: one ulp past it");
+assert_eq(ganita_f64_sinh(0xC08633CE8FB9F87E), 0xFFF0000000000000, "sinh(-710.475860073944) = -inf");
+assert_eq(ganita_f64_cosh(0x408633CE8FB9F87E), 0x7FF0000000000000, "cosh(710.475860073944) = +inf");
+assert_eq(ganita_f64_cosh(0xC08633CE8FB9F87E), 0x7FF0000000000000, "cosh(-710.475860073944) = +inf");
+assert_eq(ganita_f64_sinh(t_d(1500)), 0x7FF0000000000000, "sinh(1500) = +inf: the 2^2042 scaling overflows, no NaN");
+assert_eq(ganita_f64_cosh(t_d(0 - 1500)), 0x7FF0000000000000, "cosh(-1500) = +inf");
+assert_eq(_gn_exp_half(0x7FF0000000000000), 0x7FF0000000000000, "_gn_exp_half(+inf) = +inf: inf times 2^2042, no NaN");
+# sinh odd and cosh even, bit for bit, across the band: 200 patterns over (709, 710.4759].
+var hb_sym_bad = 0;
+hb_i = 0;
+while (hb_i < 200) {
+    var hbo = 0x4086280000000001 + hb_i * 0xF1CE0EE0A;
+    if (ganita_f64_sinh(hbo | HB_SIGN) != (ganita_f64_sinh(hbo) | HB_SIGN)) { hb_sym_bad = hb_sym_bad + 1; }
+    if (ganita_f64_cosh(hbo | HB_SIGN) != ganita_f64_cosh(hbo)) { hb_sym_bad = hb_sym_bad + 1; }
+    hb_i = hb_i + 1;
+}
+assert_eq(hb_sym_bad, 0, "sinh is odd and cosh even, bit for bit, over 200 patterns in (709, 710.4759]");
+# cosh's cuts. Its two-exponential form gives way to e^|x|/2 at 709, but from about
+# 18.7 up 1/e^|x| is under half an ulp of e^|x| and the two agree bit for bit, so that
+# cut matters only if it moves below 18.7: the first row fails then (e^|x|/2 is 2 ulp
+# off there). _gn_exp_half switches from 0.5·exp to the 2^2042 form at exp's own
+# overflow; the second row fails if that cut moves.
+assert_eq(ganita_f64_cosh(0xC031E147AE147AD0), 0x417BC4C9040453AA, "cosh(-17.87999999999994) is correctly rounded");
+assert_eq(ganita_f64_cosh(0x4086290C6B4DCF1D), 0x7FD0AD8DA73D10F9, "cosh(709.1310640410262) is correctly rounded");
+# cosh even below the band too. Through 1.2.10 a negative x formed e^|x| as the rounded
+# 1/exp(x), and about one argument in six came back an ulp from its mirror.
+var hb_even_bad = 0;
+hb_i = 0;
+while (hb_i < 600) {
+    var hbe = 0x3E50000000000000 + hb_i * 0xF191111ABCDE;
+    if (ganita_f64_cosh(hbe | HB_SIGN) != ganita_f64_cosh(hbe)) { hb_even_bad = hb_even_bad + 1; }
+    hb_i = hb_i + 1;
+}
+assert_eq(hb_even_bad, 0, "cosh is even bit for bit over 600 patterns in [2^-26, 709)");
 
 test_group("f64 cbrt: correctly rounded, odd, exact on every cube (1.2.6)");
 # ⭐ Filed by tanmatra ahead of its Rust -> Cyrius port, which asserts golden values
@@ -1598,6 +2099,160 @@ _ganita_mat_mul_into(KA, KB, KT, 1);
 assert_eq(ganita_mat_eq(KT, ganita_mat_transpose(ganita_mat_mul(KA, KB)), 0), 1,
   "_ganita_mat_mul_into(transposed) == transpose(A * B), bit for bit, for a 3x4 * 4x2");
 
+test_group("f64/f32 tan: fdlibm k_tan on the stdlib reducer (1.2.11)");
+# ⭐ Filed by abaco (docs/development/issues/archived/2026-09-30-f64-tan-missing.md): there was
+# no tangent at all, and the f64_sin(x) / f64_cos(x) a consumer had to write is two
+# results within 1 ulp each and then a rounded division — up to 2 ulp. Every expected
+# f64 pattern below is the correctly rounded tan of the exact binary input (mpmath at
+# 320+ bits, rounded once); every f32 one likewise in single precision. The first
+# eight rows are the filing's repro, the last two of them its controls: sin/cos misses
+# the first six by 2 ulp each.
+var TN_SIGN = 0x8000000000000000;
+var TN_INF = 0x7FF0000000000000;
+var TN_NAN = f64_div(t_d(0), t_d(0));
+assert_eq(ganita_f64_tan(0x3FE8ABFD0623CAB4), 0x3FEF1759205E500C, "tan(0.770994674674816) is correctly rounded");
+assert_eq(ganita_f64_tan(0xBFE5FA427B8CEBDD), 0xBFEA3D30361F2EFF, "tan(-0.6867992795081325) is correctly rounded");
+assert_eq(ganita_f64_tan(0x3FF0280821E3AFE2), 0x3FF9766548EDEC10, "tan(1.0097733806423936) is correctly rounded");
+assert_eq(ganita_f64_tan(0xC0440926381A5059), 0x3FEEFB395BD7179D, "tan(-40.07147885594231) is correctly rounded");
+assert_eq(ganita_f64_tan(0xC04D0D3B48837D32), 0xC04F115FAB4615F4, "tan(-58.10337168140758) is correctly rounded");
+assert_eq(ganita_f64_tan(0x404661D6B1124C50), 0x3FEFC99B5776134D, "tan(44.764364370283715) is correctly rounded");
+assert_eq(ganita_f64_tan(0x3FE0000000000000), 0x3FE17B4F5BF3474A, "tan(0.5) is correctly rounded (control)");
+assert_eq(ganita_f64_tan(0x4008000000000000), 0xBFC23EF71254B86F, "tan(3.0) is correctly rounded (control)");
+
+# IEEE special values. The sign of zero is part of the answer.
+assert_eq(ganita_f64_tan(0), 0, "tan(+0) = +0");
+assert_eq(ganita_f64_tan(TN_SIGN), TN_SIGN, "tan(-0) = -0 (the kernel alone would give +0)");
+assert_eq(t_f64_is_nan(ganita_f64_tan(TN_INF)), 1, "tan(+inf) is NaN");
+assert_eq(t_f64_is_nan(ganita_f64_tan(TN_INF | TN_SIGN)), 1, "tan(-inf) is NaN");
+assert_eq(t_f64_is_nan(ganita_f64_tan(TN_NAN)), 1, "tan(NaN) is NaN");
+# Below 2^-27, tan(x) = x is the correctly rounded answer, subnormals included; 2^-27
+# itself is the first argument the kernel sees.
+assert_eq(ganita_f64_tan(0x3E45798EE2308C3A), 0x3E45798EE2308C3A, "tan(1e-8) = 1e-8");
+assert_eq(ganita_f64_tan(0x3E3FFFFFFFFFFFFF), 0x3E3FFFFFFFFFFFFF, "tan(2^-27 - 1 ulp) = itself");
+assert_eq(ganita_f64_tan(0x3E40000000000000), 0x3E40000000000000, "tan(2^-27) = 2^-27, through the kernel");
+assert_eq(ganita_f64_tan(1), 1, "tan(2^-1074) = 2^-1074 (the min subnormal survives)");
+assert_eq(ganita_f64_tan(1 | TN_SIGN), 1 | TN_SIGN, "tan(-2^-1074) = -2^-1074");
+# Just above 2^-27 returning x is no longer right: from about 1.82 * 2^-27, x³/3 is
+# over half a ulp and the correctly rounded tan is x + 1 ulp. These rows fail if the
+# guard moves up, to 2^-26 say (the bound f64_sin and this module's _F64_TINY use).
+assert_eq(ganita_f64_tan(0x3E4D800000000000), 0x3E4D800000000001,
+  "tan(1.84375 * 2^-27) is x + 1 ulp: the 2^-27 guard must not move up at all");
+assert_eq(ganita_f64_tan(0x3E4F000000000000), 0x3E4F000000000001, "tan(1.9375 * 2^-27) is x + 1 ulp");
+assert_eq(ganita_f64_tan(0x3E4FFFFFFFFFFFFF), 0x3E50000000000000,
+  "tan(2^-26 - 1 ulp) is x + 1 ulp: the 2^-27 guard must not move up");
+
+# |x| >= 0.6744 (high word 0x3FE59428 up) folds onto pi/4 - |x|; one ulp below the
+# boundary is the polynomial alone. Both sides of it, and the double nearest pi/4.
+assert_eq(ganita_f64_tan(0x3FE59427FFFFFFFF), 0x3FE99427887A14D4,
+  "tan just below the 0.6744 fold (polynomial alone) is correctly rounded");
+assert_eq(ganita_f64_tan(0x3FE5942800000000), 0x3FE99427887A14D6,
+  "tan at the 0.6744 fold (high word 0x3FE59428) is correctly rounded");
+assert_eq(ganita_f64_tan(0x3FE6666666666666), 0x3FEAF406C2FC78AE, "tan(0.7), folded, is correctly rounded");
+assert_eq(ganita_f64_tan(0xBFE6666666666666), 0xBFEAF406C2FC78AE, "tan(-0.7): the fold puts the sign back");
+assert_eq(ganita_f64_tan(0x3FE921FB54442D18), 0x3FEFFFFFFFFFFFFF, "tan(double nearest pi/4) = 1 - 2^-53");
+# The top of the unreduced range is the last double with high word 0x3FE921FB; the
+# next one is the first the reducer sees (n = 1, so -1/tan of y = x - pi/2).
+assert_eq(ganita_f64_tan(0x3FE921FBFFFFFFFF), 0x3FF00000ABBBD680,
+  "tan(0x3FE921FBFFFFFFFF), the last unreduced argument, is correctly rounded");
+assert_eq(ganita_f64_tan(0x3FE921FC00000000), 0x3FF00000ABBBD681,
+  "tan(0x3FE921FC00000000), the first reduced argument, is correctly rounded");
+# 24 ulp above the fold, the polynomial alone would round the other way: this row
+# fails if the fold's threshold moves up even one step in the high word.
+assert_eq(ganita_f64_tan(0x3FE5942800000018), 0x3FE99427887A14FD,
+  "tan(0x3FE5942800000018), just past the fold, is correctly rounded");
+# 37 ulp below the fold, the folded form would round the other way: this row fails if
+# the threshold moves down even one step in the high word.
+assert_eq(ganita_f64_tan(0x3FE59427FFFFFFDB), 0x3FE99427887A1499,
+  "tan(0x3FE59427FFFFFFDB), 37 ulp below the fold (polynomial alone), is correctly rounded");
+# T5 one unit up in its last place moves this one.
+assert_eq(ganita_f64_tan(0x3FE59427D82C1B48), 0x3FE994274733A829, "tan(0.6743354055514397) is correctly rounded");
+# Rows that pin the coefficients: each is correctly rounded here and comes back an ulp
+# off if T1, T2, T3 or T4 is raised by one unit in its last place, or T5 by 128
+# (found by mutating each one; a decrease is not caught by these rows).
+assert_eq(ganita_f64_tan(0x3FE0DDFBD7C146EC), 0x3FE29FF29CE703A0, "tan(0.5270976270641916) is correctly rounded");
+assert_eq(ganita_f64_tan(0x3FE57FB8C9F5E0DC), 0x3FE972BAF39C7FF5, "tan(0.6718410439052849) is correctly rounded");
+assert_eq(ganita_f64_tan(0xBFE2FB51C907B6C8), 0xBFE592CB23355F4C, "tan(-0.5931786466951161) is correctly rounded");
+assert_eq(ganita_f64_tan(0x3FED850AB2CAEB30), 0x3FF51F036B8516EC, "tan(0.9224904529613465) is correctly rounded");
+assert_eq(ganita_f64_tan(0x3FEE382900668714), 0x3FF61BFAAB40F3BB, "tan(0.9443554885694732) is correctly rounded");
+
+# An odd quadrant (n odd after reduction) returns -1/tan(y): through the fold when
+# |y| >= 0.6744 (0.8, 2.3), through the compensated division when it is not.
+assert_eq(ganita_f64_tan(0x3FE999999999999A), 0x3FF079664793B60B, "tan(0.8): n = 1, folded -1/tan");
+assert_eq(ganita_f64_tan(0x4002666666666666), 0xBFF1E84C9047C337, "tan(2.3): n = 1, folded -1/tan");
+assert_eq(ganita_f64_tan(0x3FF0000000000000), 0x3FF8EB245CBEE3A6, "tan(1.0): n = 1, compensated -1/tan");
+assert_eq(ganita_f64_tan(0x3FF8000000000000), 0x402C33ED50B88777, "tan(1.5): n = 1, compensated -1/tan");
+assert_eq(ganita_f64_tan(0x4000000000000000), 0xC0017AF62E0950F8, "tan(2.0): n = 1, compensated -1/tan");
+assert_eq(ganita_f64_tan(0xC000000000000000), 0x40017AF62E0950F8, "tan(-2.0) = -tan(2.0)");
+# The doubles nearest two poles, where the answer is -1/y for a reduced y of about
+# -6.1e-17 and -1.8e-16, and nearest the zero at pi.
+assert_eq(ganita_f64_tan(0x3FF921FB54442D18), 0x434D02967C31CDB5,
+  "tan(double nearest pi/2) = 1.633123935319537e16, correctly rounded");
+assert_eq(ganita_f64_tan(0x4012D97C7F3321D2), 0x4333570EFD768923,
+  "tan(double nearest 3pi/2) = 5443746451065123, correctly rounded");
+assert_eq(ganita_f64_tan(0x400921FB54442D18), 0xBCA1A62633145C07, "tan(double nearest pi) = -1.2246467991473532e-16");
+
+# Large arguments go through the stdlib's exact reduction, as f64_sin's do.
+assert_eq(ganita_f64_tan(0x4059000000000000), 0xBFE2CA74D62B5D38, "tan(100) is correctly rounded");
+assert_eq(ganita_f64_tan(0x412E848000000000), 0xBFD7E9768AB734C0, "tan(1e6) is correctly rounded");
+assert_eq(ganita_f64_tan(0x4480F0CF064DD592), 0xBFFA0F79C1B6B258,
+  "tan(1e22) is 1 ulp off the correctly rounded ...B257 (0.544 ulp from the exact), the same bits on every target");
+# Where the error peaks (see ganita_f64_tan): a reduced argument just below the 0.6744
+# fold, with a tail. Both rows are 1 ulp off, as fdlibm's kernel itself is. The second
+# is the worst error found at 1.2.11, in a sweep of every f32 value as an argument.
+assert_eq(ganita_f64_tan(0xC275D8CBF99ED8A3), 0xBFE96DE59812187E,
+  "tan(-1501304953325.5398) is 1 ulp off the correctly rounded ...187D (0.886 ulp from the exact)");
+assert_eq(ganita_f64_tan(0x4725D8E500000000), 0xBFE99390066D26E8,
+  "tan(5.67186889e34) is 1 ulp off the correctly rounded ...26E9 (0.940 ulp from the exact)");
+assert_eq(ganita_f64_tan(0x7E70000000000000), 0xBFC4A41D560C08CC, "tan(2^1000) is correctly rounded");
+assert_eq(ganita_f64_tan(0x7FEFFFFFFFFFFFFF), 0xBF74530CFE729484, "tan(DBL_MAX) is correctly rounded");
+
+# Odd, bit for bit: tan(-x) must be tan(x) with the sign bit flipped. 512 random bit
+# patterns from the cbrt group's generator; NaN results are skipped.
+var tn_odd_bad = 0;
+var tns = 1;
+while (tns <= 512) {
+    var tnx = t_cb_mix(tns + 20000) & 0x7FFFFFFFFFFFFFFF;
+    if (t_f64_is_nan(tnx) == 0) {
+        var tnp = ganita_f64_tan(tnx);
+        if (t_f64_is_nan(tnp) == 0) {
+            if (ganita_f64_tan(tnx | TN_SIGN) != (tnp ^ TN_SIGN)) { tn_odd_bad = tn_odd_bad + 1; }
+        }
+    }
+    tns = tns + 1;
+}
+assert_eq(tn_odd_bad, 0, "tan(-x) == tan(x) with the sign bit flipped, over 512 random bit patterns");
+
+# The kernel directly: iy = 1 is tan(x + y), iy = -1 is -1/tan(x + y).
+assert_eq(_gn_k_tan(0x3FE0000000000000, 0, 1), 0x3FE17B4F5BF3474A, "_gn_k_tan(0.5, 0, 1) = tan(0.5)");
+assert_eq(_gn_k_tan(0x3FE0000000000000, 0, 0 - 1), 0xBFFD49AD7E47C0A3,
+  "_gn_k_tan(0.5, 0, -1) = -1/tan(0.5), correctly rounded");
+assert_eq(_gn_k_tan(0x3FE70A3D70A3D70A, 0, 0 - 1), 0xBFF23E1B1E365198,
+  "_gn_k_tan(0.72, 0, -1) = -1/tan(0.72) through the fold, correctly rounded");
+
+# f32: widened onto ganita_f64_tan and narrowed once.
+assert_eq(ganita_f32_tan(0), 0, "f32 tan(+0) = +0");
+assert_eq(ganita_f32_tan(0x80000000), 0x80000000, "f32 tan(-0) = -0");
+assert_eq(t_is_nan(ganita_f32_tan(0x7F800000)), 1, "f32 tan(+inf) is NaN");
+assert_eq(t_is_nan(ganita_f32_tan(0xFF800000)), 1, "f32 tan(-inf) is NaN");
+assert_eq(t_is_nan(ganita_f32_tan(f32_from(TN_NAN))), 1, "f32 tan(NaN) is NaN");
+assert_eq(ganita_f32_tan(1), 1, "f32 tan(min subnormal) = itself");
+assert_eq(ganita_f32_tan(0x3F800000), 0x3FC75923, "f32 tan(1) is correctly rounded");
+assert_eq(ganita_f32_tan(0x3F000000), 0x3F0BDA7B, "f32 tan(0.5) is correctly rounded");
+assert_eq(ganita_f32_tan(0x3F333333), 0x3F57A036, "f32 tan(0.7) is correctly rounded");
+assert_eq(ganita_f32_tan(0x3FC00000), 0x41619F6B, "f32 tan(1.5) is correctly rounded");
+assert_eq(ganita_f32_tan(0xC0000000), 0x400BD7B1, "f32 tan(-2) is correctly rounded");
+assert_eq(ganita_f32_tan(0x3FC90FDB), 0xCBAE8A4A, "f32 tan(float nearest pi/2) = -22877332, correctly rounded");
+assert_eq(ganita_f32_tan(0x60AD78EC), 0x3F5ED890, "f32 tan(1e20) is correctly rounded");
+assert_eq(ganita_f32_tan(0x7F7FFFFF), 0xBF1C9ECA, "f32 tan(FLT_MAX) is correctly rounded");
+assert_eq(ganita_f32_tan(0xFF7FFFFF), 0x3F1C9ECA, "f32 tan(-FLT_MAX) is correctly rounded");
+# An exhaustive sweep of every non-negative finite f32 found 7 inputs whose double tan
+# lies within 2 ulp of a single-precision midpoint, the only places narrowing could
+# misround; none does. Two of them: the double for 3.64902137e19 lies EXACTLY on one.
+assert_eq(ganita_f32_tan(0x5FFD33A4), 0x3FD06C8C,
+  "f32 tan(3.64902137e19) is correctly rounded (its double tan sits exactly on an f32 midpoint)");
+assert_eq(ganita_f32_tan(0x408174DD), 0x3FA29B31,
+  "f32 tan(4.04551554) is correctly rounded (its double tan is 2 ulp below an f32 midpoint)");
+
 test_group("back-compat aliases");
 var a2 = mat_new(4, 5);
 assert_eq(mat_rows(a2), 4, "alias mat_rows");
@@ -1723,6 +2378,7 @@ assert_eq(f64_sinh(t_d(1)), ganita_f64_sinh(t_d(1)), "alias f64_sinh");
 assert_eq(f64_cosh(t_d(1)), ganita_f64_cosh(t_d(1)), "alias f64_cosh");
 assert_eq(f64_tanh(t_d(1)), ganita_f64_tanh(t_d(1)), "alias f64_tanh");
 assert_eq(f64_pow(t_d(2), t_d(10)), ganita_f64_pow(t_d(2), t_d(10)), "alias f64_pow");
+assert_eq(f64_tan(t_d(1)), ganita_f64_tan(t_d(1)), "alias f64_tan (1.2.11)");
 assert_eq(f64_asin(CHALF), ganita_f64_asin(CHALF), "alias f64_asin");
 assert_eq(f64_acos(CHALF), ganita_f64_acos(CHALF), "alias f64_acos");
 assert_eq(f64_atan2(t_d(1), t_d(2)), ganita_f64_atan2(t_d(1), t_d(2)), "alias f64_atan2");

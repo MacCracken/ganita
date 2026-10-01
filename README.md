@@ -13,13 +13,16 @@ Written in [Cyrius](https://github.com/MacCracken/cyrius).
 
 ## Status
 
-**1.2.10** — toolchain 6.6.11; CI's `cyrius coverage` floor is 100 % (139/139). See
+**1.2.11** — the six 2026-09-30 filings closed: `binomial` exact up to i64_MAX, `atan2` on the
+whole C99 table, the hyperbolic family and `asin` free of their cancellation band, `sinh`/`cosh`
+within 1 ulp to overflow, and a new `tan` (f64 and f32); toolchain 6.6.12. See
 [`CHANGELOG.md`](CHANGELOG.md) for the full history and
 [`docs/development/state.md`](docs/development/state.md) for the live snapshot.
 Recent releases in brief:
 
 | | |
 |---|---|
+| **1.2.11** | `ganita_f64_tan` / `ganita_f32_tan` (fdlibm `k_tan`; tan needs stdlib math ≥ 6.6.9, [ADR 0003](docs/adr/0003-tan-uses-stdlib-rem-pio2.md)); `binomial` refuses only past i64_MAX; `atan2` signed zeros / NaN / (±∞, ±∞); sinh/tanh/atanh/asinh/acosh/asin up to 1.3e8 ulp → ~2; sinh/cosh overflow band 495 → 1 ulp; toolchain 6.6.12 |
 | **1.2.10** | toolchain 6.6.11; `cyrius coverage --min 100` (6.6.11 no longer counts the uncallable `main`) |
 | **1.2.9** | f32 `sin` / `cos` correct past 2^63 (the NaN guard dropped — stdlib's `f64_sin` reduces every finite argument since cyrius 6.6.9); toolchain 6.6.10 |
 | **1.2.8** | `pow` within 1 ulp everywhere — an fdlibm `e_pow` core replaces `exp(y·ln x)` (909 ulp) and the squaring path (772 ulp); toolchain 6.6.9 |
@@ -40,14 +43,16 @@ Recent releases in brief:
 |--------|---------------|---------|
 | `matrix` | `ganita_mat_*` | dense f64 matrix: new / from / identity / get / set / add / sub / scale / mul / transpose / dot / print |
 | `linalg` | `ganita_mat_*` | copy / neg / row / col / set_row / set_col / submatrix / trace / eq / is_symmetric / frobenius / max_norm · LU / det / inverse / Cholesky / QR / Gaussian-elim / least-squares / eigen-sym / SVD / pseudo-inverse / rank / condition |
-| `math_advanced` | `ganita_f64_*`, `ganita_fibonacci`/`ganita_binomial` | transcendental (sinh/cosh/tanh/pow/cbrt/asin/acos/atan2/asinh/acosh/atanh/hypot) + number theory |
+| `math_advanced` | `ganita_f64_*`, `ganita_fibonacci`/`ganita_binomial` | transcendental (sinh/cosh/tanh/pow/cbrt/tan/asin/acos/atan2/asinh/acosh/atanh/hypot) + number theory |
 | `math_f32` | `ganita_f32_*` | single-precision scalar tier: native arithmetic (add/sub/mul/div), comparators (lt/le/gt/ge), shape (abs/neg/sign/min/max/clamp/floor/ceil/trunc/round/lerp), sqrt, and transcendental forwarders |
 
 ### Back-compat aliases
 
-`src/_compat.cyr` forwards 54 names (`mat_mul`, `f64_pow`, `binomial`, …)
+`src/_compat.cyr` forwards 55 names (`mat_mul`, `f64_pow`, `binomial`, …)
 to the canonical `ganita_*` API for the migration window. Deprecated; removed
-once the ecosystem re-pins.
+once the ecosystem re-pins. Two of them, `f64_cbrt` (1.2.6) and `f64_tan`
+(1.2.11), are not legacy names: they arrived with their functions, under the
+stdlib-style name the requesting consumer reaches for.
 
 ## Two contracts worth knowing before you call anything
 
@@ -86,8 +91,13 @@ include "lib/math.cyr"     # f64 builtin polyfills (_f64_exp_polyfill, …) + F6
 include "lib/ganita.cyr"
 ```
 
-The transcendental functions lower `f64_exp`/`f64_ln` to software polyfills
-that live in stdlib `math.cyr` — keep it in scope alongside ganita.
+Stdlib `math.cyr` is needed on every target: the `F64_*` constants, the software
+polyfills `f64_exp`/`f64_ln` lower to, and — for `ganita_f64_tan`, `f64_tan` and
+`ganita_f32_tan` — its fdlibm argument reduction `_f64_rem_pio2`, which stdlib math
+has carried **since cyrius 6.6.9**. On an older stdlib everything else still builds
+and behaves the same (x86_64 builds print one `undefined function '_f64_rem_pio2'`
+warning), and a call to tan is a compile-time error.
+See [ADR 0003](docs/adr/0003-tan-uses-stdlib-rem-pio2.md).
 
 ## Examples
 

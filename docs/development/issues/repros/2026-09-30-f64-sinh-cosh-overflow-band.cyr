@@ -3,12 +3,19 @@
 # exp(|x| - ln2), and rounding |x| - ln2 (an argument near 709) costs up to ~500 ulp
 # once exp amplifies it.
 #
+# ✅ FIXED IN 1.2.11 -- this file is now a regression witness, not a bug report.
+# Past exp's overflow, sinh and cosh take e^|x|/2 as exp(|x| - c)·2^2042 with
+# c the double nearest 2043·ln 2 (|x| - c is exact), and the program exits 0. The
+# rows are pinned in the suite as well (tests/ganita.tcyr, "f64 sinh/cosh: within
+# 1 ulp up to the overflow threshold (1.2.11)"). Filed with
+# docs/development/issues/archived/2026-09-30-f64-sinh-cosh-overflow-band.md.
+#
 # Self-proving: the exit code is the number of rows more than 2 ulp from the correctly
 # rounded value (mpmath, 300 bits). The last two rows (|x| = 708, below the branch)
 # are controls.
 #
 #   cyrius build docs/development/issues/repros/2026-09-30-f64-sinh-cosh-overflow-band.cyr /tmp/shband
-#   /tmp/shband; echo "exit=$?"      # -> 8 on ganita 1.2.10
+#   /tmp/shband; echo "exit=$?"      # -> 0 from 1.2.11; 8 on 1.2.4 .. 1.2.10
 
 include "lib/syscalls.cyr"
 include "lib/string.cyr"

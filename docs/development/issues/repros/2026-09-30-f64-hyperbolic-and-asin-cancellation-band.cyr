@@ -4,6 +4,11 @@
 # loses up to ~1,000 ulp near |x| = 1. Each evaluates a form that subtracts two
 # nearly equal numbers, or rounds 1 + small before ln sees it.
 #
+# ✅ FIXED IN 1.2.11 -- this file is now a regression witness, not a bug report.
+# The band goes through fdlibm expm1 / log1p forms (and asin through
+# (1 - |x|)(1 + |x|)), and the program exits 0. The rows are pinned in the suite
+# as well (tests/ganita.tcyr, "... no cancellation band above the cutoff (1.2.11)").
+#
 # Self-proving: the exit code is the number of rows below that come back MORE
 # THAN 2 ULP from the correctly rounded value -- 0 when every row is right. The
 # distance is the difference of the two bit patterns (same sign), which is the
@@ -11,15 +16,15 @@
 # the distance. The wanted bits are the correctly rounded value, computed with
 # mpmath at 300 bits and rounded once to 53.
 #
-# Filed with docs/development/issues/2026-09-30-f64-hyperbolic-and-asin-cancellation-band.md.
+# Filed with docs/development/issues/archived/2026-09-30-f64-hyperbolic-and-asin-cancellation-band.md.
 # Found by abaco 2.4.9's project audit: abaco's `sinh` / `tanh` / `asinh` /
 # `acosh` / `atanh` / `asin` builtins pass ganita's values straight through.
 #
 # Build and run from the ganita repo root:
 #   cyrius build docs/development/issues/repros/2026-09-30-f64-hyperbolic-and-asin-cancellation-band.cyr /tmp/hypcanc
-#   /tmp/hypcanc; echo "exit=$?"      # -> 16 on ganita 1.2.10 (all 16 band rows; the 3 controls pass)
-# Built with --aarch64 and run under qemu-aarch64: the same 16, with the same
-# bits (only the acosh(2.5) control differs, by 1 ulp: x87 ln vs the polyfill).
+#   /tmp/hypcanc; echo "exit=$?"      # -> 0 from 1.2.11; 16 on 1.2.10 (all 16 band rows)
+# Built with --aarch64 and run under qemu-aarch64: the same on both versions (the
+# acosh(2.5) control differs by 1 ulp between the two, x87 ln vs the polyfill).
 #
 # Inputs and wanted values are written as bit patterns so the program means the
 # same thing on every toolchain.

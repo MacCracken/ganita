@@ -2,13 +2,20 @@
 # f64_sin(x) / f64_cos(x): two results within 1 ulp each and a rounded division,
 # up to 2 ulp from the correctly rounded tan(x).
 #
+# ✅ FIXED IN 1.2.11 -- this file is now a regression witness, not a bug report.
+# `candidate_tan` is swapped to ganita_f64_tan (fdlibm k_tan on stdlib's reducer),
+# exactly as the filing specified, and the program exits 0. Through 1.2.10 there
+# was no tangent; with `candidate_tan` returning the sin/cos quotient it exits 6.
+# The rows are pinned in the suite as well (tests/ganita.tcyr, "f64/f32 tan").
+# Filed with docs/development/issues/archived/2026-09-30-f64-tan-missing.md.
+#
 # Self-proving: the exit code is the number of rows MORE than 1 ulp from the
 # correctly rounded tan (Python Fraction/Decimal, 120 digits, pi by Machin). An
 # fdlibm k_tan is within 1 ulp everywhere, so the repro exits 0 once
 # `candidate_tan` is swapped to the new function. The last two rows are controls.
 #
 #   cyrius build docs/development/issues/repros/2026-09-30-f64-tan-missing.cyr /tmp/tanm
-#   /tmp/tanm; echo "exit=$?"      # -> 6 on ganita 1.2.10 (sin/cos division)
+#   /tmp/tanm; echo "exit=$?"      # -> 0 from 1.2.11 (6 with the sin/cos quotient as candidate)
 
 include "lib/syscalls.cyr"
 include "lib/string.cyr"
@@ -20,8 +27,8 @@ include "lib/math.cyr"
 
 include "src/math_advanced.cyr"
 
-# Swap to the new tangent once it exists.
-fn candidate_tan(x): i64 { return f64_div(f64_sin(x), f64_cos(x)); }
+# The 1.2.11 tangent. Through 1.2.10 this was f64_div(f64_sin(x), f64_cos(x)).
+fn candidate_tan(x): i64 { return ganita_f64_tan(x); }
 
 fn out(s) { syscall(1, 1, s, strlen(s)); return 0; }
 

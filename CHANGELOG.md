@@ -4,6 +4,175 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.11] — 2026-10-01 — the six 2026-09-30 filings closed; `tan` in f64 and f32; toolchain 6.6.12
+
+Six filings closed: four from abaco (2.4.8 – 2.4.11), one from hisab, one from abaco's final
+review. Each one's repro now exits 0 on x86_64 and on aarch64 (qemu), and stays in
+`docs/development/issues/repros/` as a regression witness. **New public functions:**
+`ganita_f64_tan`, `ganita_f32_tan` and the alias `f64_tan`. **Requirement:** the three tangent
+functions need stdlib `math` from cyrius **6.6.9** or later
+([ADR 0003](docs/adr/0003-tan-uses-stdlib-rem-pio2.md)). Toolchain **6.6.11 → 6.6.12**.
+**844 assertions** (was 597).
+
+All accuracy figures below are worst errors against mpmath (≥ 320 bits, worst points rechecked at
+1000), on dense grids plus targeted hunts, on both architectures. "Bit-identical across targets"
+is claimed only for the new kernels and for tan. sinh/cosh from 22, asinh/acosh from 2, asin
+and atan2 call target builtins, and those differed by target before 1.2.11 too.
+
+### Fixed — `ganita_binomial` refused C(n, k) that fit in i64
+
+Its contract says −1 means "the true value does not fit in i64". Since 1.2.3 it actually meant
+"`min(k, n−k)·C(n, k)` does not fit". So `binomial(62, 31)`, `(66, 33)`,
+`(2^32, 2)` and every other value above `i64_MAX / min(k, n−k)` came back −1. Every value it did
+return was exact; abaco 2.4.8 hit the refusals. Now it multiplies first while `C(n, i)·(n − i)`
+fits, the 1.2.10 arithmetic. Otherwise it divides through `gcd(C(n, i), i + 1)` first
+(private `_gn_gcd`), so the only product formed is `C(n, i + 1)` itself. It returns −1
+**exactly** when C(n, k) > i64_MAX. Over 30,040 cases against Python's exact `math.comb` there
+are 0 mismatches on either architecture; 1.2.10 misses 3,848. The CWE-834 loop bound still
+holds: it refuses by the 34th iteration. `binomial(66, 33)` now takes ~230 ns to answer, where
+1.2.10 took 99 ns to refuse; `(61, 30)` is unchanged at ~128 ns.
+
+### Fixed — `ganita_f64_atan2`: signed zeros, a NaN `y` at `x = ±0`, and two infinities
+
+`atan2` decided its quadrant with `f64_eq` / `f64_gt`, which cannot see the sign of a zero. It
+tested nothing for infinity, so:
+- `atan2(−0, +0)`, `(+0, −0)`, `(−0, −0)` and `(−0, x < 0)` lost the sign or the ±π;
+- `atan2(NaN, ±0)` fell through to −π/2;
+- all four `(±∞, ±∞)` were `∞/∞ = NaN`.
+
+hisab found the signed-zero rows through `cx_arg(cx_conj(z))`, which cyrius 6.6.8's IEEE
+`f64_neg` made reachable. abaco found the NaN and infinity rows.
+
+Now NaN is handled first, zeros are decided on their sign bits, and both-infinite returns
+±π/4 or ±3π/4. On the full C99 F.10.1.4 table (289 pairs from 17 values) every special row
+is bit-exact; 1.2.10 fails 19. Every finite non-zero pair keeps the 1.2.10 arithmetic **bit for
+bit** (1,000,000 random pairs, both architectures). Cost: about 4 ns per call (57 vs 53 ns).
+
+**One deliberate choice:** a NaN argument returns **the NaN operand** (y first), payload kept,
+as `ganita_f64_hypot` and every one-argument function in the module do. C99 asks only for a NaN.
+`ganita_f32_atan2` follows: `(±inf, ±inf)` gives `0x3F490FDB` / `0xBF490FDB` /
+`0x4016CBE4` / `0xC016CBE4`, and `atan2(−0, −1)` gives `0xC0490FDB`.
+
+### Fixed — sinh / tanh / atanh / asinh / acosh / asin cancelled just above their cutoffs
+
+1.2.4's small-|x| guards return `x` below 2^-26 (1e-8 for asinh). Just above the guard, each
+function still evaluated a form that differences two numbers near 1, losing about eps/|x|
+relative. acosh lost the same way in x − 1 near 1, and asin near ±1 formed `1 − x·x`.
+Two private fdlibm 5.3 ports now carry the band: `_gn_expm1` (`s_expm1.c`) and `_gn_log1p`
+(`s_log1p.c`). Each was re-checked constant by constant; their worst errors are 0.83 and
+0.84 ulp, bit-identical on both architectures. The reroutes:
+- sinh, for |x| < 22, and tanh, for 2^-26 ≤ |x| ≤ 20, go through expm1;
+- atanh, asinh (1e-8 ≤ |x| < 2) and acosh (1 ≤ x < 2) go through log1p;
+- asin forms `1 − x²` as `(1 − |x|)(1 + |x|)` from |x| = ½ up.
+
+sinh, tanh and atanh now compute on |x| and re-sign, so all five odd functions are **odd bit for
+bit**. Worst error, 1.2.10 → 1.2.11:
+
+| function | band | 1.2.10 | 1.2.11 |
+|---|---|---|---|
+| sinh | 2^-26 ≤ \|x\| < 1 | 3.98e7 ulp | 1.77 |
+| tanh | 2^-26 ≤ \|x\| < 1 | 3.36e7 | **2.18** (see below) |
+| atanh | 2^-26 ≤ \|x\| < 1 | 3.17e7 | 1.70 |
+| asinh | 1e-8 ≤ \|x\| < 1 | 1.33e8 | 1.61 |
+| acosh | 1 < x < 2 | 2.52e7 | 2.12 |
+| asin | ½ ≤ \|x\| < 1 | 1,021 | 1.38 |
+| tanh | 1 ≤ \|x\| ≤ 20 | 2.43 | 0.81 |
+| sinh | 1 ≤ \|x\| < 22 | 1.86 | 1.17 |
+
+The new code has the lower worst error in every sub-window of every band. **tanh and acosh are
+not within 2 ulp:** fdlibm's forms reach 2.18 and 2.12. About 0.08% of tanh on [0.21, 0.26] is
+over 2 ulp, and 3 of 200,000 dense acosh points. None is more than 2 bit patterns from correctly
+rounded. No bound is proven. Cost: about 20–25 ns more per call in the band (sinh(1e-3)
+56 → ~80 ns), and sinh / tanh roughly double at 1 ≤ |x| < 22 (55 → ~110 ns).
+
+### Fixed — sinh / cosh were up to 496 ulp off for 709 < |x| ≤ 710.4759
+
+Past exp's overflow, both returned `exp(|x| − ln 2)`. Rounding `|x| − ln 2` near 709 cost up to
+half an ulp of 709, and exp amplified that to ~500 ulp. The filing's `(w/2)·w`, w = exp(|x|/2),
+was still 3 bit patterns off on aarch64, so a different form shipped: the private
+`_gn_exp_half`.
+- Up to exp's own threshold it is 0.5·exp(|x|).
+- Above it, it is FreeBSD `k_exp.c`'s exp(|x| − c)·2^1023·2^1019, with c the double nearest
+  2043·ln 2. |x| − c is exact, and the multiplies can only overflow.
+- 2043 is the k in 512..2047 whose k·ln 2 lies nearest a double.
+
+Over 242,000 band points the worst is 1.04 ulp on x86_64 and 0.96 on aarch64, never more than
+1 bit pattern from correctly rounded. The largest finite argument still gives
+`0x7FEFFFFFFFFFFD3B`.
+
+### Fixed — `cosh` was not even
+
+`ganita_f64_cosh` evaluated `exp(x)` on the signed argument, so a negative x formed e^|x| as the
+rounded `1/exp(x)`. About one argument in six came back an ulp from its mirror, the same defect
+this release fixes in sinh. It now computes on |x|. Found by the merged-tree mutation review.
+
+### Added — `ganita_f64_tan`, `f64_tan`, `ganita_f32_tan`
+
+There was no tangent, so consumers divided `f64_sin(x)` by `f64_cos(x)`: up to 2 ulp off,
+correctly rounded at ~68% of arguments. abaco 2.4.10 carried its own kernel.
+
+`ganita_f64_tan` ports fdlibm 5.3 `s_tan.c` + `k_tan.c`
+(private `_gn_k_tan`) and reduces through stdlib math's `_f64_rem_pio2`, the reducer
+`f64_sin` / `f64_cos` use. It is within 1 ulp everywhere measured (worst found 0.940 ulp). On
+[−π/2, π/2] the worst is 0.77 ulp with 96.4% correctly rounded; the quotient gives 1.84 ulp
+and 68.4%. It is 5–24% faster than the quotient.
+
+`ganita_f32_tan` widens onto it and is **correctly rounded for every f32**. All 2^31
+non-negative finite f32 values were scanned on both architectures. 45 lie within 16 double-ulps
+of an f32 midpoint, and every one rounds correctly by mpmath.
+
+`f64_tan` joins `_compat` (55 aliases), as `f64_cbrt` did at 1.2.6: under the
+stdlib-style name the consumer reaches for.
+
+⚠ `_f64_rem_pio2` is stdlib-private and first shipped in **cyrius 6.6.9**. On a 6.6.0 – 6.6.8
+stdlib, the bundle still builds and every other function is unchanged. x86_64 builds print
+`warning: undefined function '_f64_rem_pio2'`, and calling a tangent function is a
+compile-time error. [ADR 0003](docs/adr/0003-tan-uses-stdlib-rem-pio2.md) records why.
+
+### Tests
+
+**597 → 844 assertions**, green on x86_64 and on aarch64 (qemu). Five new groups:
+- binomial: 37, including an in-suite Pascal sweep of every n ≤ 70;
+- atan2's C99 table: 65;
+- the cancellation band: 58;
+- the overflow band: 13;
+- tan in f64 and f32: 73.
+
+There is also one row in the alias group. Every expected f64/f32 value is a correctly rounded
+bit pattern.
+
+Each unit was verified by an independent adversarial agent: its own oracle sweeps on both
+architectures, and mutation tests. A 180-mutant campaign on the merged tree then left 45 real
+survivors, among them sinh's 22 cut, which could move down to 5 and give 1.4e11 ulp at
+sinh(5.5) with the suite green. 30 rows were added and every survivor now fails. The 53 that
+remain are equivalent, by proof or exhaustive check.
+
+Tool coverage is 142/142. Word-boundary coverage is 152/170 (89.4%; was 144/162), so CI's floor
+for it rises **88 → 89**. Bench: 16 new rows in `tests/ganita.bcyr` (binomial, atan2, the
+hyperbolic band, tan versus sin/cos).
+
+### Changed
+
+- **Toolchain pin 6.6.11 → 6.6.12**, moved and gated before any `src/` change. `lib/` was
+  re-vendored with `cyrius lib sync --full`: 111 files, 22 changed, `lib/math.cyr` not among them,
+  `diff -rq` clean against the snapshot. `cyrius.lock` re-locked, `dist/` regenerated. Verified
+  against the published 6.6.12 tarball in an isolated `CYRIUS_HOME`.
+- **`cyrius audit` docs are complete again.** The 1.2.8 pow helper `t_pw1` had no doc comment,
+  so audit reported one undocumented fn. CI does not run audit.
+- `cyrius.cyml`, `scripts/consumer-check.sh` and the module header no longer say x86_64 needs no
+  `math` at build time. That was already false in 1.2.10 (`F64_LN2`).
+- **Records corrected.** `archived/2026-09-07-f64-transcendental-accuracy.md` said "all four
+  groups closed" at 1.2.4. Its §1 band, §2 overflow accuracy, §3 acosh near 1 and §4 atan2
+  stayed open until now, and an addendum says so. `archived/2026-09-07-f32-nan-inf-edges.md` §2
+  blamed `exp` for f32 atan2's NaN.
+- README, getting-started, roadmap and `docs/development/state.md` are refreshed. ADR 0003 is new.
+
+### Consumers
+
+abaco and hisab get these fixes when cyrius next folds ganita: 6.6.12 ships `lib/ganita.cyr`
+1.2.9. abaco can then drop `abaco_binomial` and `_eval_k_tan`, and hisab can test `cx_arg` on
+the signed-zero branch cut.
+
 ## [1.2.10] — 2026-09-30 — toolchain 6.6.11; the tool coverage floor is 100
 
 CI only. Toolchain **6.6.10 → 6.6.11** (the vendored `lib/` is the full 6.6.11 snapshot).

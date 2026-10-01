@@ -22,9 +22,9 @@ cyrius distlib --all                      # regenerate dist/ganita.cyr
 |---|---|
 | `src/matrix.cyr` | storage layer — row-major dense f64 matrix, the `ganita_mat_new` guard |
 | `src/linalg.cyr` | decompositions and solvers, built on `matrix.cyr` |
-| `src/math_advanced.cyr` | f64 transcendental + number theory, self-contained over f64 builtins |
+| `src/math_advanced.cyr` | f64 transcendental + number theory; needs stdlib `math` (tan: ≥ 6.6.9, [ADR 0003](../adr/0003-tan-uses-stdlib-rem-pio2.md)) |
 | `src/math_f32.cyr` | the single-precision scalar tier |
-| `src/_compat.cyr` | 54 back-compat aliases — **must stay last**, it references every `ganita_*` symbol |
+| `src/_compat.cyr` | 55 back-compat aliases — **must stay last**, it references every `ganita_*` symbol |
 | `src/main.cyr` | full-bundle compile smoke (exits 42) |
 | `src/test.cyr` | the `[build].test` entry |
 | `tests/ganita.tcyr` | the suite — its current assertion count is in [`state.md`](../development/state.md) |
@@ -49,7 +49,10 @@ include "lib/ganita.cyr"
 
 Keep `math` in scope alongside ganita: `ganita_f64_sinh` and friends lower
 `f64_exp` / `f64_ln` to software polyfills that live in stdlib `math.cyr`, and the
-`F64_*` constants live there too.
+`F64_*` constants live there too. `ganita_f64_tan` (and `ganita_f32_tan`) also call
+its argument reduction `_f64_rem_pio2`, which stdlib math carries from cyrius 6.6.9;
+on an older stdlib a call to tan does not compile
+([ADR 0003](../adr/0003-tan-uses-stdlib-rem-pio2.md)).
 
 Start from [`docs/examples/`](../examples/) — five runnable programs covering the
 matrix basics, the three routes to a square solve, least-squares fitting, the

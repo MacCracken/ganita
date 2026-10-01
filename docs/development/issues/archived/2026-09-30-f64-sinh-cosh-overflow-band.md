@@ -1,6 +1,29 @@
 # `ganita_f64_sinh` / `ganita_f64_cosh` are up to ~500 ulp off for 709 < |x| ≤ 710.47
 
-**Status:** 🟡 **OPEN** — found during abaco 2.4.9's final review; not repaired.
+> ✅ **RESOLVED in ganita 1.2.11** (2026-10-01), but **not** with the form proposed
+> below.
+>
+> - **Why not (w/2)·w.** w = exp(|x|/2) squares exp's error. Verification found it
+>   still 3 bit patterns off on aarch64, for example at sinh(709.0815006850213), and up
+>   to 2.5 ulp.
+> - **What shipped.** sinh (from 22) and cosh (from 709) call the private
+>   `_gn_exp_half`. Up to exp's own overflow threshold (fdlibm's cut,
+>   `0x40862E42FEFA39EF`) it is 0.5·exp(|x|): exp's one rounding, then an exact halving.
+>   Above that it is FreeBSD `k_exp.c`'s form, exp(|x| − c)·2^1023·2^1019, with c the
+>   double nearest 2043·ln 2. |x| − c is exact (Sterbenz) and exp(|x| − c) is normal.
+>   The two multiplies are exact, so they can only overflow, never round. 2043 is the
+>   k in 512..2047 for which k·ln 2 lies nearest a double (2.8e-17 away, against
+>   8.6e-17 for FreeBSD's 1799).
+> - **Measured** over (709, 710.4759] on 242,000 points: 1.04 ulp worst on x86_64 and
+>   0.96 on aarch64. That is never more than 1 bit pattern from the correctly rounded
+>   value; 1.2.10 was 496 ulp off. The largest finite argument still gives
+>   `0x7FEFFFFFFFFFFD3B`, and the next double gives ±inf.
+> - **The repro exits 0** (was 8) on both architectures. It is the regression witness.
+> - **Suite.** 22 rows, every one within 1 bit pattern, plus the threshold, ±inf and
+>   odd/even checks. Rows pin each cut.
+> - **Cost.** About 8 ns more per call in the band (sinh(710) 44 → ~52 ns).
+
+**Status:** ✅ **RESOLVED in ganita 1.2.11** — found during abaco 2.4.9's final review.
 **Placement:** unpinned.
 **Discovered:** 2026-09-30, while verifying the cancellation-band filing
 (`2026-09-30-f64-hyperbolic-and-asin-cancellation-band.md`) for abaco 2.4.9.

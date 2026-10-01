@@ -1,6 +1,42 @@
 # No f64 tangent: `f64_sin(x) / f64_cos(x)`, the only stand-in, is up to 2 ulp off
 
-**Status:** 🟡 **OPEN** — feature request from abaco 2.4.11; abaco ships its own kernel from 2.4.10.
+> ✅ **RESOLVED in ganita 1.2.11** (2026-10-01). New: `ganita_f64_tan`, the `f64_tan` alias,
+> and `ganita_f32_tan`. The f32 one is the consumer request "please don't leave f32_tan
+> in the cold".
+>
+> - **How.**
+>   - A port of fdlibm 5.3 `s_tan.c` + `k_tan.c` (private `_gn_k_tan`), checked line by
+>     line against fdlibm and against abaco 2.4.10's `_eval_k_tan`.
+>   - It reduces through stdlib math's `_f64_rem_pio2`, as this filing suggested,
+>     which is the reducer `f64_sin` / `f64_cos` use. That symbol is private, and
+>     stdlib has carried it only since **cyrius 6.6.9**. The decision and its cost on
+>     older pins (a compile error if tan is called, a warning otherwise on x86_64)
+>     are recorded in [ADR 0003](../../adr/0003-tan-uses-stdlib-rem-pio2.md).
+>   - `ganita_f32_tan` widens onto it.
+> - **Measured** against mpmath:
+>   - Within 1 ulp everywhere measured. The worst found is 0.940 ulp, at
+>     x = 0x4725D8E500000000.
+>   - On [−π/2, π/2]: 0.77 ulp worst, 96.4% correctly rounded. The sin/cos quotient
+>     on the same inputs: 1.84 ulp, 68.4%.
+>   - On [1, 1e300]: 0.81 ulp, 96.4% (sin/cos 1.82, 67.7%).
+>   - Every f32 value as an argument: 98.1% correctly rounded, the same bits on x86_64
+>     and aarch64.
+> - **`ganita_f32_tan` is correctly rounded for every f32.** All 2,139,095,040
+>   non-negative finite f32 values were scanned on both architectures. 45 lie within
+>   16 double-ulps of an f32 rounding midpoint (7 within 2, one exactly on one), and
+>   every one rounds correctly by mpmath. Negative arguments follow by bit-exact
+>   oddness.
+> - **The repro exits 0**, with `candidate_tan` swapped to `ganita_f64_tan` exactly as
+>   specified. With the sin/cos quotient as the candidate it exits 6. It is the
+>   regression witness.
+> - **Suite.** The tan group (73 assertions) covers the 8 repro rows, ±0, ±inf, NaN,
+>   odd symmetry, the 2^-27 guard pinned from both sides, both sides of the 0.6744
+>   fold, the coefficients, the odd-quadrant −1/tan path, large arguments up to
+>   DBL_MAX, f32 rows, and `f64_tan` in the alias group.
+> - **Cost.** Faster than the quotient it replaces: 5% to 24% across runs, not 2×.
+>   tan's kernel alone costs about 2.4× sin's.
+
+**Status:** ✅ **RESOLVED in ganita 1.2.11** — feature request from abaco 2.4.11; abaco ships its own kernel from 2.4.10.
 **Placement:** unpinned.
 **Discovered:** 2026-09-30, abaco 2.4.10 (replacing its evaluator's `sin / cos` tangent).
 **Severity:** Low — a missing primitive. The stand-in is finite and close, but it is correctly

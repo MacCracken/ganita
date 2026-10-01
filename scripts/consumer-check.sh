@@ -15,9 +15,9 @@
 # vendored only the declared leaves. Hence `--no-deps`: the consumer's explicit
 # includes are the ONLY stdlib in scope, which is the consumer's real situation.
 #
-# ganita's sidecar names `math` — the f64-builtin polyfills the transcendental
-# functions rely on. Native-f64 targets do not need it at build time, but the
-# sidecar declares it and a consumer is entitled to take that literally.
+# ganita's sidecar names `math` — the F64_* constants, the f64-builtin polyfills
+# the transcendental functions rely on, and (from 1.2.11) the `_f64_rem_pio2`
+# reducer behind ganita_f64_tan. Every target needs it at build time.
 #
 # Usage: scripts/consumer-check.sh [workdir]   (default: build/.consumer-check)
 #

@@ -1,6 +1,33 @@
 # `ganita_f64_atan2` ignores the sign of a zero, and answers a NaN `y` at `x = ±0` with −π/2
 
-**Status:** 🟡 **OPEN** — found by hisab on its cyrius 6.6.6 → 6.6.12 bump; not repaired.
+> ✅ **RESOLVED in ganita 1.2.11** (2026-10-01), together with its companion
+> [`2026-09-30-f64-atan2-infinite-arguments`](2026-09-30-f64-atan2-infinite-arguments.md):
+> one rewrite of `ganita_f64_atan2`, the merged patch from that filing.
+>
+> - **How.** NaN is handled first. Zeros are decided on their sign bits, never with
+>   `f64_eq` / `f64_gt`: atan2(±0, x > 0 or +0) = ±0, atan2(±0, x < 0 or −0) = ±π,
+>   and atan2(y ≠ 0, ±0) = ±π/2. Every finite non-zero pair keeps the 1.2.10
+>   arithmetic, **bit for bit** (1,000,000 random pairs, x86_64 and aarch64). The
+>   special-case tests are inline on the magnitude bits, about 4 ns per call; written
+>   as helper calls they cost 12.
+> - **One deliberate departure from the sketch.** A NaN argument returns **the NaN
+>   operand** (y if y is NaN, else x), payload kept, rather than the default NaN
+>   `0/0`. That is the convention `ganita_f64_hypot` and every one-argument function in
+>   the module follow, and C99 asks only for a NaN.
+> - **The repro exits 0** (was 5) on both architectures. It is the regression witness.
+> - **Checked against the full C99 F.10.1.4 table**: 289 pairs built from 17 values
+>   (±0, ±denormal_min, ±1e-300, ±1, ±1e300, ±DBL_MAX, ±inf, three NaNs). All 189
+>   special rows are bit-exact on both architectures, including the signs of zero;
+>   1.2.10 fails 19.
+> - **Suite.** One group serves both filings, with 65 assertions: all 12 rows of this
+>   repro, the companion's 20, NaN-ness and NaN-payload rows, and 15 f32 rows
+>   (`ganita_f32_atan2` widens onto this function). The doc comment and the
+>   inverse-trig banner now state the C99 table, and the "(0, 0) ... convention — C
+>   libm matches" note is gone.
+> - **Consumer impact.** hisab's `cx_arg(cx_conj(-1 + 0i))` is now −π, and atan2's range
+>   is [−π, π].
+
+**Status:** ✅ **RESOLVED in ganita 1.2.11** — found by hisab on its cyrius 6.6.6 → 6.6.12 bump.
 **Placement:** unpinned.
 **Discovered:** 2026-09-30, hisab 3.2.2 (verifying what cyrius 6.6.8's IEEE `f64_neg` changed)
 **Severity:** Medium — a wrong branch of a public function (C99 Annex F conformance), and one

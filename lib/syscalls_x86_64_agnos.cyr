@@ -788,6 +788,40 @@ fn sys_process_vm_readv(pid, local_iov, liovcnt, remote_iov, riovcnt, flags): i6
 fn sys_process_vm_writev(pid, local_iov, liovcnt, remote_iov, riovcnt, flags): i64 { return 0 - 38; }
 # Create a filesystem node (FIFO / device). agnos has no device nodes or FIFOs.
 fn sys_mknodat(dirfd, path, mode, dev): i64 { return 0 - 38; }
+# ── 6.6.12: agnos peers for the xattr / fchown / statx / getrlimit wrappers. ⛔ Same rule as
+# the blocks above — NO `SYS_*` Linux constant is minted (agnos 93 is gpu_modeset_op). agnos
+# has no extended attributes, no fchown, no statx and no rlimits, so each is an
+# explicit -38/-ENOSYS stub. CHANGELOG [6.6.12]
+# Set an extended attribute. Declines: agnos has no extended attributes.
+fn sys_setxattr(path, name, value, size, flags): i64 { return 0 - 38; }
+# Set an extended attribute on a symlink itself. Declines, same reason as sys_setxattr.
+fn sys_lsetxattr(path, name, value, size, flags): i64 { return 0 - 38; }
+# Set an extended attribute by descriptor. Declines, same reason as sys_setxattr.
+fn sys_fsetxattr(fd, name, value, size, flags): i64 { return 0 - 38; }
+# Read an extended attribute. Declines, same reason as sys_setxattr.
+fn sys_getxattr(path, name, value, size): i64 { return 0 - 38; }
+# Read an extended attribute of a symlink itself. Declines, same reason as sys_setxattr.
+fn sys_lgetxattr(path, name, value, size): i64 { return 0 - 38; }
+# Read an extended attribute by descriptor. Declines, same reason as sys_setxattr.
+fn sys_fgetxattr(fd, name, value, size): i64 { return 0 - 38; }
+# List extended attribute names. Declines, same reason as sys_setxattr.
+fn sys_listxattr(path, list, size): i64 { return 0 - 38; }
+# List a symlink's own extended attribute names. Declines, same reason as sys_setxattr.
+fn sys_llistxattr(path, list, size): i64 { return 0 - 38; }
+# List extended attribute names by descriptor. Declines, same reason as sys_setxattr.
+fn sys_flistxattr(fd, list, size): i64 { return 0 - 38; }
+# Remove an extended attribute. Declines, same reason as sys_setxattr.
+fn sys_removexattr(path, name): i64 { return 0 - 38; }
+# Remove a symlink's own extended attribute. Declines, same reason as sys_setxattr.
+fn sys_lremovexattr(path, name): i64 { return 0 - 38; }
+# Remove an extended attribute by descriptor. Declines, same reason as sys_setxattr.
+fn sys_fremovexattr(fd, name): i64 { return 0 - 38; }
+# Change a descriptor's owner and group. Declines: agnos has no fchown call.
+fn sys_fchown(fd, uid, gid): i64 { return 0 - 38; }
+# Extended stat. Declines: agnos has no statx; use sys_stat.
+fn sys_statx(dirfd, path, flags, mask, buf): i64 { return 0 - 38; }
+# Read a resource limit. Declines: agnos has no resource limits.
+fn sys_getrlimit(resource, rlim): i64 { return 0 - 38; }
 
 # ── v6.6.8: agnos peers for the fcntl surface. agnos has no fcntl and no per-fd status
 # flags, so all three decline with -38/-ENOSYS — NOT sock_set_nonblocking's `return 0`,

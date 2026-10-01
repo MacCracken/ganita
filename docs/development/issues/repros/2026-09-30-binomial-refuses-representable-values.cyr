@@ -1,6 +1,12 @@
 # ganita_binomial returns -1 ("does not fit in i64") for C(n, k) that DO fit:
 # every one above i64_MAX / min(k, n - k).
 #
+# ✅ FIXED IN 1.2.11 -- this file is now a regression witness, not a bug report.
+# binomial divides through gcd(C(n, i), i + 1) when multiplying first would wrap,
+# so it refuses exactly when C(n, k) > i64_MAX, and the program exits 0. The rows
+# and the n <= 70 sweep are pinned in the suite as well (tests/ganita.tcyr,
+# "binomial: exact whenever C(n, k) fits in i64 (1.2.11)").
+#
 # Self-proving: the exit code is the number of rows below that come back wrong --
 # 0 when every row is right. Each row prints what it got and the exact value
 # (-1 where the true value is above i64_MAX). The last row checks every C(n, k)
@@ -8,14 +14,14 @@
 # independent of the one under test, and prints how many of the 2556 cells
 # differ; that row counts once.
 #
-# Filed with docs/development/issues/2026-09-30-binomial-refuses-representable-values.md.
+# Filed with docs/development/issues/archived/2026-09-30-binomial-refuses-representable-values.md.
 # Found by abaco 2.4.8: its evaluator began reporting ganita's -1 as a math error,
 # so `binomial(62, 31)` became one although the value fits (through 2.4.7 the -1
 # passed through as the answer). abaco 2.4.9 stopped calling ganita's binomial.
 #
 # Build and run from the ganita repo root:
 #   cyrius build docs/development/issues/repros/2026-09-30-binomial-refuses-representable-values.cyr /tmp/binomr
-#   /tmp/binomr; echo "exit=$?"      # -> 9 on ganita 1.2.10 (8 named rows + the sweep, 113 cells)
+#   /tmp/binomr; echo "exit=$?"      # -> 0 from 1.2.11; 9 on 1.2.3 .. 1.2.10 (8 rows + the sweep, 113 cells)
 #
 # Every input and expected value is an exact integer (no floating point), so the
 # program means the same thing on every toolchain. The expected values were

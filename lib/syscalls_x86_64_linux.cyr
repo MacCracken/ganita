@@ -147,6 +147,25 @@ enum SysNr {
     SYS_PROCESS_VM_READV = 310;
     SYS_PROCESS_VM_WRITEV = 311;
     SYS_MKNODAT = 259;
+    # 6.6.12 — the xattr family, fchown, statx and getrlimit: NO NAME in either Linux peer until
+    # now, so consumers wrote numbers (kriya's aarch64 arm returned -ENOSYS by hand for the four
+    # xattr calls it needed). The aarch64 peer spells these through the private alias band —
+    # see its comment — and lib/syscalls_linux_common.cyr carries the wrappers. CHANGELOG [6.6.12]
+    SYS_SETXATTR = 188;
+    SYS_LSETXATTR = 189;
+    SYS_FSETXATTR = 190;
+    SYS_GETXATTR = 191;
+    SYS_LGETXATTR = 192;
+    SYS_FGETXATTR = 193;
+    SYS_LISTXATTR = 194;
+    SYS_LLISTXATTR = 195;
+    SYS_FLISTXATTR = 196;
+    SYS_REMOVEXATTR = 197;
+    SYS_LREMOVEXATTR = 198;
+    SYS_FREMOVEXATTR = 199;
+    SYS_FCHOWN = 93;
+    SYS_STATX = 332;
+    SYS_GETRLIMIT = 97;
     # v6.6.5 — peer asymmetries closed. The aarch64 peer declared all four; this one used
     # raw literals below, so the correspondence table had no row and raw 294 on aarch64
     # (kexec_file_load) went undiagnosed.

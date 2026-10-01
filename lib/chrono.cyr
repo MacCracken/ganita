@@ -108,11 +108,15 @@ fn clock_now_ns(): i64 {
     # in the return register — it does NOT fill the `&ts` timespec. So take the
     # return value (ns) with the Darwin id; `&ts` is just the 3rd-arg placeholder
     # the route expects.
-    # x86-macOS takes this SAME arm and is not "dead": since v6.5.16 EMACHO_CLOCK_X86 composes
-    # ns from BSD gettimeofday and returns them in rax — the same return-value contract (it is
-    # the REALTIME clock at µs resolution there, and it ALSO writes a timeval into `&ts`, which
-    # is why nothing may read the buffer). This line read "x86-macOS does not route 228 → clock
-    # stays dead there; HELD" until 6.6.8; lib/bench.cyr's twin was corrected at 6.6.5.
+    # x86-macOS takes this SAME arm and is not "dead": since v6.5.16 EMACHO_CLOCK_X86 issues
+    # BSD gettimeofday and returns ns in rax — the same return-value contract. For clock id 0
+    # it is the timeval composed to ns (wall time, µs resolution); for EVERY other id, since
+    # 6.6.12, it is the mach_absolute_time gettimeofday copies out through its third argument,
+    # which is ns at Intel's 1:1 timebase — so this id-4 read is monotonic there too (until
+    # 6.6.12 the id was ignored and it was the REALTIME clock). It ALSO writes a timeval into
+    # `&ts` for every id, which is why nothing may read the buffer. This line read "x86-macOS
+    # does not route 228 → clock stays dead there; HELD" until 6.6.8; lib/bench.cyr's twin was
+    # corrected at 6.6.5.
     # ⚠ The raw-228 contract across the reroutes is "returns the value; the buffer is
     # unspecified": ns in the return register on both Macs (ms on PE, GetTickCount64), with
     # arm64-macOS and PE never touching the buffer and x86-macOS filling a timeval. Portable
@@ -356,13 +360,13 @@ fn is_leap_year(y): i64 {
     return 1;
 }
 
-# Convert epoch seconds to date components {year, month, day, hour, min, sec}
-# Returns alloc'd 48-byte struct
-fn epoch_to_date(epoch): i64 {
+# Decode epoch seconds into the 48-byte {year, month, day, hour, min, sec} at `r`, which
+# the caller owns (a stack buffer is fine). Allocates nothing once the month table exists.
+# Returns r, or 0 when the month table could not be allocated (its first use, under a
+# refused alloc). CHANGELOG [6.6.12]
+fn _epoch_to_date_into(epoch, r): i64 {
     _chrono_init_mdays();
     if (_chrono_mdays == 0) { return 0; }     # 6.6.10: the month table could not be allocated
-    var r = alloc(48);
-    if (r == 0) { return 0; }
     var secs = epoch;
     var days = secs / 86400;
     var rem = secs % 86400;
@@ -391,6 +395,16 @@ fn epoch_to_date(epoch): i64 {
     store64(r + 8, m + 1);                # month (1-indexed)
     store64(r + 16, days + 1);            # day (1-indexed)
     return r;
+}
+
+# Convert epoch seconds to date components {year, month, day, hour, min, sec}
+# Returns alloc'd 48-byte struct, or 0 when an allocation is refused.
+fn epoch_to_date(epoch): i64 {
+    _chrono_init_mdays();
+    if (_chrono_mdays == 0) { return 0; }     # 6.6.10: the month table could not be allocated
+    var r = alloc(48);
+    if (r == 0) { return 0; }
+    return _epoch_to_date_into(epoch, r);
 }
 
 # Write 2-digit zero-padded number to buffer
@@ -495,18 +509,30 @@ fn dt_epoch_secs(dt): i64 { return dt / 1000000000; }
 # Epoch nanoseconds of a DateTime.
 fn dt_epoch_ns(dt): i64 { return dt; }
 
-# Year (UTC). Field accessors decode via epoch_to_date, keeping its layout private.
-fn dt_year(dt): i64   { return load64(epoch_to_date(dt / 1000000000)); }
-# Month 1-12 (UTC).
-fn dt_month(dt): i64  { return load64(epoch_to_date(dt / 1000000000) + 8); }
-# Day of month 1-31 (UTC).
-fn dt_day(dt): i64    { return load64(epoch_to_date(dt / 1000000000) + 16); }
-# Hour 0-23 (UTC).
-fn dt_hour(dt): i64   { return load64(epoch_to_date(dt / 1000000000) + 24); }
-# Minute 0-59 (UTC).
-fn dt_minute(dt): i64 { return load64(epoch_to_date(dt / 1000000000) + 32); }
-# Second 0-59 (UTC).
-fn dt_second(dt): i64 { return load64(epoch_to_date(dt / 1000000000) + 40); }
+# One field of a DateTime, decoded into a STACK buffer. -1 only when the month table could
+# never be allocated (0 cannot be the sentinel: it is a valid hour, minute and second).
+#
+# ⛔ Through 6.6.11 each accessor was `load64(epoch_to_date(..) + off)`: an alloc(48) per
+# call that was never freed (48 B leaked per field read), and a SIGSEGV once 6.6.10 taught
+# epoch_to_date to return 0 on a refused allocation. CHANGELOG [6.6.12]
+fn _dt_field(dt, off): i64 {
+    var d[48];
+    if (_epoch_to_date_into(dt / 1000000000, &d) == 0) { return 0 - 1; }
+    return load64(&d + off);
+}
+
+# Year (UTC), or -1 when the month table could not be allocated.
+fn dt_year(dt): i64   { return _dt_field(dt, 0); }
+# Month 1-12 (UTC), or -1 when the month table could not be allocated.
+fn dt_month(dt): i64  { return _dt_field(dt, 8); }
+# Day of month 1-31 (UTC), or -1 when the month table could not be allocated.
+fn dt_day(dt): i64    { return _dt_field(dt, 16); }
+# Hour 0-23 (UTC), or -1 when the month table could not be allocated.
+fn dt_hour(dt): i64   { return _dt_field(dt, 24); }
+# Minute 0-59 (UTC), or -1 when the month table could not be allocated.
+fn dt_minute(dt): i64 { return _dt_field(dt, 32); }
+# Second 0-59 (UTC), or -1 when the month table could not be allocated.
+fn dt_second(dt): i64 { return _dt_field(dt, 40); }
 
 # --- Duration: Rust-chrono-style unit constructors (reuse the {secs,nsecs} dur_new) ---
 # Duration of n seconds (Duration::seconds).

@@ -272,6 +272,14 @@ fn ganita_f32_exp2(x): i64 {
 fn ganita_f32_sin(x): i64 { return f32_from(f64_sin(f32_to(x))); }
 # Cosine, x in radians. Correct for every finite f32 — see ganita_f32_sin.
 fn ganita_f32_cos(x): i64 { return f32_from(f64_cos(f32_to(x))); }
+# Tangent, x in radians, through ganita_f64_tan (1.2.11), which reduces any finite
+# argument exactly, as f64_sin does — see ganita_f32_sin. CORRECTLY ROUNDED for every
+# f32, by exhaustive check rather than by construction: the double is within 1 ulp,
+# so narrowing it can misround only where it lies within that of an f32 midpoint. Of
+# all 2,139,095,040 non-negative finite inputs, 7 give a double within 2 ulp of one
+# (one exactly on it), and all 7 narrow to the correctly rounded single (320-bit
+# reference). Negatives mirror them bit for bit: tan is odd and so is ganita_f64_tan.
+fn ganita_f32_tan(x): i64 { return f32_from(ganita_f64_tan(f32_to(x))); }
 # Arctangent, result in radians.
 fn ganita_f32_atan(x): i64 { return f32_from(f64_atan(f32_to(x))); }
 # Round to nearest, ties to even.

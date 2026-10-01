@@ -1,11 +1,16 @@
 # ganita_f64_atan2 ignores the sign of a zero y and of a zero x, and answers a NaN y
 # at x = +-0 with -pi/2.
 #
+# ✅ FIXED IN 1.2.11 -- this file is now a regression witness, not a bug report.
+# Zeros are decided on their sign bits and a NaN operand is returned before any
+# quadrant test, and the program exits 0. Every row is pinned in the suite as well
+# (tests/ganita.tcyr, "f64 atan2: the whole C99 F.10.1.4 table").
+#
 # Self-proving: the exit code is the number of rows of the C99 Annex F (F.10.1.4)
 # atan2 table below that come back wrong -- 0 when every row is right. Each row is
 # printed with the bits it got and the bits C99 specifies.
 #
-# Filed with docs/development/issues/2026-09-30-f64-atan2-signed-zero-and-nan.md.
+# Filed with docs/development/issues/archived/2026-09-30-f64-atan2-signed-zero-and-nan.md.
 # Found by hisab (3.2.2, the cyrius 6.6.6 -> 6.6.12 bump): from cyrius 6.6.8 on,
 # `f64_neg(+0)` is an IEEE sign flip and yields -0, so `cx_conj(-1 + 0i)` carries a
 # -0 imaginary part into atan2 -- and gets +pi back where carg(conj z) = -carg(z)
@@ -13,7 +18,7 @@
 #
 # Build and run from the ganita repo root:
 #   cyrius build docs/development/issues/repros/2026-09-30-f64-atan2-signed-zero-and-nan.cyr /tmp/atan2z
-#   /tmp/atan2z; echo "exit=$?"      # -> 5 on ganita 1.2.10 (4 signed-zero rows + 1 NaN row)
+#   /tmp/atan2z; echo "exit=$?"      # -> 0 from 1.2.11; 5 on 1.2.10 (4 signed-zero rows + 1 NaN row)
 #
 # Zeros are written as bit patterns (0x8000000000000000 is -0.0) so the program means
 # the same thing on every toolchain, including those whose f64_neg(+0) is +0.

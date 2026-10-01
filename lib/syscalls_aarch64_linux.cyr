@@ -296,6 +296,32 @@ enum SysNr {
     SYS_PROCESS_VM_READV = 310;     # x86 process_vm_readv  → ESYSXLAT 310→270
     SYS_PROCESS_VM_WRITEV = 311;    # x86 process_vm_writev → ESYSXLAT 311→271
     SYS_MKNODAT = 259;              # x86 mknodat           → ESYSXLAT 259→33
+    # ⚠ 6.6.12 — the xattr family, fchown and statx take the PRIVATE ALIAS BAND (see the
+    # comment above SYS_FCHOWNAT), NOT their native numbers and NOT the x86 ones. Native
+    # 5/6/7/9/10/11/12/16 and 55 are x86-compat row SOURCES (fstat, lstat, poll, mmap,
+    # mprotect, munmap, brk, ioctl, getsockopt), so `syscall(9, …)` meant as lgetxattr ran
+    # mmap; the x86 numbers 188..199 are no escape either (191..197 are native aarch64 calls,
+    # 198/199 this peer's own SYS_SOCKET/SYS_SOCKETPAIR). 8/13/14/15/291 are free as sources,
+    # but a native declaration below 1000 would drop the raw-x86-literal warning for lseek (8)
+    # and epoll_create1 (291) — programs/gen_syscall_xlat.cyr's is_native_a64 reads THIS enum.
+    # Renumbered at the tail of ESYSXLAT's ELF arm; on arm64-macOS the xattr/statx wrappers
+    # decline (lib/syscalls_linux_common.cyr) and fchown's 1055 routes to Darwin 123.
+    # getrlimit is the NATIVE 163: neither a row source nor a row product. CHANGELOG [6.6.12]
+    SYS_SETXATTR = 1005;            # private alias → ESYSXLAT 1005→5
+    SYS_LSETXATTR = 1006;           # private alias → ESYSXLAT 1006→6
+    SYS_FSETXATTR = 1007;           # private alias → ESYSXLAT 1007→7
+    SYS_GETXATTR = 1008;            # private alias → ESYSXLAT 1008→8
+    SYS_LGETXATTR = 1009;           # private alias → ESYSXLAT 1009→9
+    SYS_FGETXATTR = 1010;           # private alias → ESYSXLAT 1010→10
+    SYS_LISTXATTR = 1011;           # private alias → ESYSXLAT 1011→11
+    SYS_LLISTXATTR = 1012;          # private alias → ESYSXLAT 1012→12
+    SYS_FLISTXATTR = 1013;          # private alias → ESYSXLAT 1013→13
+    SYS_REMOVEXATTR = 1014;         # private alias → ESYSXLAT 1014→14
+    SYS_LREMOVEXATTR = 1015;        # private alias → ESYSXLAT 1015→15
+    SYS_FREMOVEXATTR = 1016;        # private alias → ESYSXLAT 1016→16
+    SYS_FCHOWN = 1055;              # private alias → ESYSXLAT 1055→55 (a64) / →123 (Darwin)
+    SYS_STATX = 1291;               # private alias → ESYSXLAT 1291→291
+    SYS_GETRLIMIT = 163;            # native (→194 on Darwin)
 }
 
 # AT_FDCWD / AT_EMPTY_PATH / AT_REMOVEDIR (+ AT_SYMLINK_* / UTIME_*) are
@@ -659,9 +685,18 @@ fn sys_stat(path, buf): i64 {
     return syscall(SYS_NEWFSTATAT, AT_FDCWD, path, buf, 0);
 }
 
-# Duplicate fd oldfd to newfd. Translates to dup3(oldfd, newfd, 0).
+# Duplicate fd oldfd to newfd. Translates to dup3(oldfd, newfd, 0) on Linux.
+# ⚠ On arm64-macOS it issues the x86 dup2 number 33 (ESYSXLAT routes 33 → BSD dup2 90):
+# Darwin has no dup3, and the Mach-O arm deliberately has no 24 row — the one it had
+# (24 → 90) silently dropped dup3's flags, so dup3(…, O_CLOEXEC) left FD_CLOEXEC clear.
+# CHANGELOG [6.6.12]
 fn sys_dup2(oldfd, newfd): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return syscall(33, oldfd, newfd);
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
     return syscall(SYS_DUP3, oldfd, newfd, 0);
+    #endif
 }
 
 # Create a directory at path with given mode.

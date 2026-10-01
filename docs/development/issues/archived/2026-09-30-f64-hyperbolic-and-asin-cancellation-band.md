@@ -1,6 +1,49 @@
 # `ganita_f64_sinh`, `tanh`, `atanh` and `asinh` still cancel just above their small-|x| cutoffs; `acosh` near 1 and `asin` near ±1 cancel the same way
 
-**Status:** 🟡 **OPEN** — found by abaco 2.4.9's project audit; not repaired.
+> ✅ **RESOLVED in ganita 1.2.11** (2026-10-01). All six functions are rerouted, using the
+> tested patch below. Both kernels were re-checked constant by constant against
+> fdlibm 5.3.
+>
+> - **How.**
+>   - `_gn_expm1` (s_expm1.c) and `_gn_log1p` (s_log1p.c) are private. The worst
+>     error found is 0.83 / 0.84 ulp, and the results are bit-identical on x86_64 and
+>     aarch64.
+>   - sinh (|x| < 22) and tanh (2^-26 ≤ |x| ≤ 20) go through expm1. atanh, asinh
+>     (1e-8 ≤ |x| < 2) and acosh (1 ≤ x < 2) go through log1p. asin from |x| = ½ up
+>     forms 1 − x² as (1 − |x|)(1 + |x|).
+>   - sinh, tanh and atanh now compute on |x| and re-sign, so all five odd functions
+>     are odd bit for bit. 1.2.10's sinh and atanh were not.
+> - **Measured** against mpmath (≥ 320 bits), worst error 1.2.10 → 1.2.11, on dense
+>   grids plus targeted hunts, both architectures:
+>
+>   | function | band | 1.2.10 | 1.2.11 |
+>   |---|---|---|---|
+>   | sinh | 2^-26 ≤ \|x\| < 1 | 3.98e7 ulp | 1.77 |
+>   | tanh | 2^-26 ≤ \|x\| < 1 | 3.36e7 | **2.18** (fdlibm's form; ~0.08% of [0.21, 0.26] is over 2 ulp, none more than 2 bit patterns) |
+>   | atanh | 2^-26 ≤ \|x\| < 1 | 3.17e7 | 1.70 |
+>   | asinh | 1e-8 ≤ \|x\| < 1 | 1.33e8 | 1.61 |
+>   | acosh | 1 < x < 2 | 2.52e7 | 2.12 (3 of 200,000 dense points over 2) |
+>   | asin | 1 − 2^-53 … ½ | 1,021 | 1.38 |
+>   | tanh | 1 ≤ \|x\| ≤ 20 | 2.43 | 0.81 |
+>   | sinh | 1 ≤ \|x\| < 22 | 1.86 | 1.17 |
+>
+>   In every sub-window of every rerouted band, the new code has the lower worst
+>   error. This filing's ~2.05 for tanh and acosh came from a coarser grid; the
+>   denser hunts above found 2.18 and 2.12. No bound is proven.
+> - **The repro exits 0** (was 16) on both architectures. It is the regression witness.
+> - **Suite.** The group has 67 rows within 2 bit patterns, the worst at most 1. It
+>   also has the special values and a 600-pattern oddness sweep. A 180-mutant campaign
+>   on the merged tree then added 26 rows. They pin where each form switches (sinh's
+>   22 among them: moved down to 5 it gave 1.4e11 ulp at sinh(5.5), and the suite had
+>   stayed green), and how each kernel picks a branch. Comments corrected: the
+>   ACCURACY POLICY, the untrue "~1-2 ulp" banner, and asinh's regimes.
+> - **Also, in the same release.** `cosh` now computes on |x|, so it is even bit for
+>   bit. In 1.2.10, about one argument in six came back an ulp from its mirror.
+> - **Cost.** Band calls are about 20–25 ns slower (sinh(1e-3) 56 → ~80 ns). sinh and
+>   tanh at 1 ≤ |x| < 22 roughly double (55 → ~110 ns), which is the price of tanh's
+>   worst error there going from 2.4 to 0.8 ulp.
+
+**Status:** ✅ **RESOLVED in ganita 1.2.11** — found by abaco 2.4.9's project audit.
 **Placement:** unpinned.
 **Discovered:** 2026-09-30, abaco 2.4.9 project audit (finding `eval-functions-hyperbolic-cancellation`,
 and the aarch64 gap probe `gap-aarch64-cross-target-hyperbolic-cancellation`; both deferred to ganita.

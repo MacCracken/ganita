@@ -508,6 +508,13 @@ fn thread_is_done(t): i64 {
 # FUTEX_WAIT (= 0) wakes correctly, FUTEX_WAIT|FUTEX_PRIVATE_FLAG
 # (= 128) hangs.
 fn thread_join(t): i64 {
+    # 6.6.12 — cx: no thread can exist (thread_create returns 0 there), so there is nothing to
+    # join and no SYS_FUTEX may be issued (the _CX_NO_FUTEX note above). This was the one futex
+    # site 6.6.11 left unguarded: a nonzero handle made the loop below hand the host kernel a
+    # guest offset — a spin on Linux, SIGSYS on a Darwin host. CHANGELOG [6.6.12]
+    #ifdef CYRIUS_TARGET_CX
+    return 0 - 1;
+    #endif
     if (t == 0) { return 0 - 1; }
     # CLONE_CHILD_CLEARTID: kernel sets tid to 0 and does futex_wake on exit.
     #

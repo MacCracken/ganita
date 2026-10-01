@@ -583,6 +583,179 @@ fn sys_mknodat(dirfd, path, mode, dev): i64 {
     #endif
 }
 
+# ================================================================
+# Extended attributes, fchown, statx, getrlimit (6.6.12)
+# ================================================================
+# ⛔ WHY THESE EXIST. None had a name in either Linux peer, so consumers wrote numbers — and on
+# ELF-aarch64 NINE of the fourteen native numbers never reached the kernel as themselves: the
+# x86-compat rows in ESYSXLAT claim 5/6/7/9/10/11/12/16/55 as sources, so raw lgetxattr (9) ran
+# mmap, fgetxattr (10) mprotect, llistxattr (12) brk and fchown (55) getsockopt (measured under
+# `qemu-aarch64 -strace`). kriya returned -ENOSYS by hand for the four xattr calls it needed on
+# aarch64 and routed fchown through fchownat. The aarch64 peer spells the family through the
+# private alias band (1000 + native), renumbered at the tail of ESYSXLAT's ELF arm.
+# ⚠ DARWIN: fchown and getrlimit are pure renumbers (Darwin 123 / 194) and work on both Macs.
+# The xattr family and statx DECLINE with -78 (Darwin ENOSYS): Darwin's getxattr/setxattr take
+# two extra arguments (position, options), and Darwin has no statx — a bare renumber would pass
+# garbage in those slots. The PE and agnos peers decline all fifteen with -38. CHANGELOG [6.6.12]
+#
+# `name` is a NUL-terminated "namespace.attr" cstr ("user.foo", "security.selinux", …). Every
+# call returns -errno on failure; ENODATA is -61 (no such attribute) and EOPNOTSUPP -95 (the
+# filesystem stores no xattrs of that namespace).
+
+# Set attribute `name` on the file at `path` (following a final symlink) to `size` bytes at
+# `value`. `flags`: 0, XATTR_CREATE (1, fail if it exists) or XATTR_REPLACE (2, fail if absent).
+fn sys_setxattr(path, name, value, size, flags): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return syscall(SYS_SETXATTR, path, name, value, size, flags);
+    #endif
+}
+
+# sys_setxattr on the symlink ITSELF rather than its target.
+fn sys_lsetxattr(path, name, value, size, flags): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return syscall(SYS_LSETXATTR, path, name, value, size, flags);
+    #endif
+}
+
+# sys_setxattr on an open descriptor.
+fn sys_fsetxattr(fd, name, value, size, flags): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return syscall(SYS_FSETXATTR, fd, name, value, size, flags);
+    #endif
+}
+
+# Read attribute `name` of the file at `path` into `value` (capacity `size`). Returns the value
+# length. `size` 0 PROBES: returns the length without copying. -ERANGE (-34) when `size` is
+# too small.
+fn sys_getxattr(path, name, value, size): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return syscall(SYS_GETXATTR, path, name, value, size);
+    #endif
+}
+
+# sys_getxattr on the symlink ITSELF rather than its target.
+fn sys_lgetxattr(path, name, value, size): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return syscall(SYS_LGETXATTR, path, name, value, size);
+    #endif
+}
+
+# sys_getxattr on an open descriptor.
+fn sys_fgetxattr(fd, name, value, size): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return syscall(SYS_FGETXATTR, fd, name, value, size);
+    #endif
+}
+
+# List the attribute names of the file at `path` into `list` (capacity `size`) as consecutive
+# NUL-terminated names. Returns the byte length; `size` 0 probes for it.
+fn sys_listxattr(path, list, size): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return syscall(SYS_LISTXATTR, path, list, size);
+    #endif
+}
+
+# sys_listxattr on the symlink ITSELF rather than its target.
+fn sys_llistxattr(path, list, size): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return syscall(SYS_LLISTXATTR, path, list, size);
+    #endif
+}
+
+# sys_listxattr on an open descriptor.
+fn sys_flistxattr(fd, list, size): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return syscall(SYS_FLISTXATTR, fd, list, size);
+    #endif
+}
+
+# Remove attribute `name` from the file at `path`. -ENODATA (-61) when it is absent.
+fn sys_removexattr(path, name): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return syscall(SYS_REMOVEXATTR, path, name);
+    #endif
+}
+
+# sys_removexattr on the symlink ITSELF rather than its target.
+fn sys_lremovexattr(path, name): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return syscall(SYS_LREMOVEXATTR, path, name);
+    #endif
+}
+
+# sys_removexattr on an open descriptor.
+fn sys_fremovexattr(fd, name): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return syscall(SYS_FREMOVEXATTR, fd, name);
+    #endif
+}
+
+# Change the owner and group of an open descriptor. -1 for `uid` or `gid` leaves that one
+# unchanged, so `sys_fchown(fd, 0 - 1, 0 - 1)` is a permitted no-op for any caller. Real on
+# every POSIX target, both Macs included (Darwin fchown 123).
+fn sys_fchown(fd, uid, gid): i64 {
+    return syscall(SYS_FCHOWN, fd, uid, gid);
+}
+
+# Extended stat: fill the 256-byte struct statx at `buf` for `path` relative to `dirfd`
+# (AT_FDCWD = -100). `flags` takes AT_SYMLINK_NOFOLLOW (0x100) / AT_EMPTY_PATH (0x1000);
+# `mask` names the wanted fields (STATX_BASIC_STATS 0x7FF, STATX_BTIME 0x800). Layout, per
+# include/uapi/linux/stat.h: u32 stx_mask @0, u32 stx_blksize @4, u32 stx_nlink @16,
+# u32 stx_uid @20, u32 stx_gid @24, u16 stx_mode @28, u64 stx_ino @32, u64 stx_size @40.
+# Linux-only: declines with -78 on macOS (Darwin has no statx; use sys_stat).
+fn sys_statx(dirfd, path, flags, mask, buf): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    return syscall(SYS_STATX, dirfd, path, flags, mask, buf);
+    #endif
+}
+
+# Read resource limit `resource` into `rlim`, a 16-byte struct rlimit {u64 cur; u64 max}.
+# ⚠ THE RESOURCE NUMBERS ARE PER-OS: 0..4 (CPU, FSIZE, DATA, STACK, CORE) agree on Linux and
+# Darwin, but RLIMIT_NOFILE is 7 on Linux and 8 on Darwin, and RLIMIT_AS 9 vs 5. So is
+# "unlimited": RLIM_INFINITY is all-ones on Linux and 0x7FFFFFFFFFFFFFFF on Darwin.
+fn sys_getrlimit(resource, rlim): i64 {
+    return syscall(SYS_GETRLIMIT, resource, rlim);
+}
+
 # Flush all filesystem buffers to disk. Returns 0 (always).
 fn sys_sync(): i64 {
     syscall(SYS_SYNC);

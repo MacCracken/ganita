@@ -19,6 +19,14 @@
 >    sorting and wrong for comparison, where IEEE says the zeros are equal.
 >    That distinction is why these are four functions rather than an exported
 >    `_f32_key`, and it was caught by a failing assertion, not by inspection.
+>
+> ⚠ **Addendum (ganita 1.2.11):** §2's "`pow` and `atan2` inherit it by forwarding
+> through the same path" was half wrong. `atan2` calls no `exp`. Its f32 NaN for
+> `(±inf, ±inf)` came from `ganita_f64_atan2` forming `inf / inf`, a defect of its
+> own, which item 3 here could not reach. 1.2.11 closed it
+> ([`2026-09-30-f64-atan2-infinite-arguments`](2026-09-30-f64-atan2-infinite-arguments.md)).
+> `ganita_f32_atan2` now gives `0x3F490FDB` / `0xBF490FDB` / `0x4016CBE4` / `0xC016CBE4`,
+> and the signed-zero rows are right too: `atan2(-0, -1) = 0xC0490FDB`.
 
 
 **Filed by**: ganita's 1.2.3 P(-1) sweep (math-f32 lens)

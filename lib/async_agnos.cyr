@@ -84,7 +84,7 @@ fn async_spawn(rt, fp, arg): i64 {
 
 # One serial step (mirror async.cyr _async_step, v6.4.37). Runs every TASK_READY task
 # to completion, capturing its return into the result slot (@40); returns the count of
-# tasks not yet DONE. AGNOS has no epoll/parking, so there is no wait phase — the
+# tasks whose state is not DONE. AGNOS has no epoll/parking, so there is no wait phase — the
 # `ran == 0` guard returns 0 (a task never parks here).
 fn _async_step(rt): i64 {
     var active = 0;

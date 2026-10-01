@@ -166,6 +166,27 @@ enum SysNr {
     SYS_PROCESS_VM_READV = 310;
     SYS_PROCESS_VM_WRITEV = 311;
     SYS_MKNODAT = 259;
+    # 6.6.12 — LINUX numbers, this peer's convention. fchown (93) and getrlimit (97) are REAL:
+    # EMACHO_SYSXLAT routes them to Darwin 123 / 194. The xattr family and statx get NO _msx
+    # row: Darwin's xattr calls take two extra arguments (position, options) and Darwin has no
+    # statx, so the shared wrappers decline with -78 under #ifdef CYRIUS_TARGET_MACOS and the
+    # numbers are never emitted; the names exist so cross-platform source COMPILES.
+    # macho_route_parity.sh allow-lists them. CHANGELOG [6.6.12]
+    SYS_SETXATTR = 188;
+    SYS_LSETXATTR = 189;
+    SYS_FSETXATTR = 190;
+    SYS_GETXATTR = 191;
+    SYS_LGETXATTR = 192;
+    SYS_FGETXATTR = 193;
+    SYS_LISTXATTR = 194;
+    SYS_LLISTXATTR = 195;
+    SYS_FLISTXATTR = 196;
+    SYS_REMOVEXATTR = 197;
+    SYS_LREMOVEXATTR = 198;
+    SYS_FREMOVEXATTR = 199;
+    SYS_FCHOWN = 93;
+    SYS_STATX = 332;
+    SYS_GETRLIMIT = 97;
     # v6.1.3 — bare-name fs syscalls + POSIX *at() family (Linux numbers;
     # EMACHO_SYSXLAT maps the emitted ones to Darwin/BSD at emit time).
     SYS_LSTAT = 6;
@@ -201,17 +222,18 @@ enum SysNr {
     # and failed on Intel-Mac with "undefined variable". x86 Linux numbers, as everywhere in
     # this peer. What each one does HERE:
     #   SYS_FLOCK     routed (EMACHO_SYSXLAT 73 → BSD 131; lib/io.cyr's xflock issues 73).
-    #   SYS_DUP3      NOT routed — Darwin has no dup3; this peer's sys_dup2 issues SYS_DUP2 (33,
-    #                 routed), and only the arm peer, which has no dup2, spells it dup3(…, 0).
-    #   SYS_FACCESSAT NOT routed — this peer's sys_access issues SYS_ACCESS (21, routed); only
-    #                 the arm peer, which has no access(2), spells it faccessat.
+    #   SYS_DUP3      NOT routed on EITHER Mac — Darwin has no dup3, and a renumber to dup2
+    #                 would silently drop the flags (arm64-macOS did exactly that until 6.6.12).
+    #                 Both peers' sys_dup2 issue x86 dup2 33, routed to BSD 90.
+    #   SYS_FACCESSAT routed (EMACHO_SYSXLAT 269 → BSD 466 since 6.6.12, the arm64 row's twin).
+    #                 This peer's sys_access still issues SYS_ACCESS (21, routed).
     #   SYS_SYSINFO   NOT routed — Darwin has no sysinfo(2); lib/sys.cyr derives it from
     #                 sysctl + gettimeofday on both Macs.
     #   SYS_INOTIFY_* NOT routed — Darwin has no inotify; the sys_inotify_* wrappers below
     #                 decline with -78 and issue no number at all.
     # A raw syscall() of an unrouted name fails with SIGSYS (-78 when SIGSYS is ignored), the
     # same answer the arm64-macOS build gives for the same name. macho_route_parity.sh
-    # allow-lists each with its reason. CHANGELOG [6.6.10]
+    # allow-lists each unrouted one with its reason. CHANGELOG [6.6.10]
     SYS_FLOCK = 73;
     SYS_DUP3 = 292;
     SYS_FACCESSAT = 269;
