@@ -1,0 +1,190 @@
+# ganita_mat_svd returns -1 ("did not converge") for finite matrices that have an SVD,
+# whenever the Jacobi rotation for a column pair needs a very small angle: zeta^2
+# overflows (rows A1..A6), or one column's squared norm underflows to 0 and the
+# orthogonality threshold with it (rows B1, B2).
+#
+# Self-proving: the exit code is the number of rows below that come back wrong -- 0
+# when every row is right. A row is right when ganita_mat_svd returns 0, both
+# singular values are within 4 * 2^-52 * sigma_1 (+ one subnormal step) of the exact
+# ones, and U's columns (for a normal sigma) and Vt's rows are orthonormal to 2^-44.
+# The sigma test is normwise -- what a backward-stable SVD guarantees -- so it does
+# not ask for relative accuracy in a sigma_2 far below sigma_1; the orthonormality
+# test is what rejects returning 0 without converging (the unrotated columns of A1
+# have cosine 0.577). The exact values were computed with python3 Fraction / Decimal
+# (80 digits) from these bit patterns and rounded once to double.
+#
+# Filed with docs/development/issues/2026-10-03-mat-svd-no-convergence-on-tiny-columns.md.
+# Found by hisab 3.3.3 (its svd_truncated now maps this -1 onto
+# Err(HSB_ERR_NO_CONVERGENCE)), re-measured on ganita 1.2.11 as folded into cyrius 6.6.14.
+#
+# Build and run from the ganita repo root:
+#   cyrius build docs/development/issues/repros/2026-10-03-mat-svd-no-convergence-on-tiny-columns.cyr /tmp/svdtiny
+#   /tmp/svdtiny; echo "exit=$?"      # -> 6 on 1.2.4 .. 1.2.11 (A1, A4, A5, A6, B1, B2)
+#
+# The rows: A = [[1, t], [t, t], [t, -t]] for six t (A1..A6), two measured witnesses of
+# the underflow branch (B1, B2), and a well-conditioned control (C). A2 and A3 decompose
+# today and are controls too; A1 and A2 sit ON the boundary -- 2^-513 is the largest t
+# that fails and the next double up is the smallest that works.
+# After the zeta^2 fix sketched in the filing (tested), the exit code is 2: B1 and B2
+# need the second part of the repair.
+#
+# Includes src/ directly rather than lib/ganita.cyr so it exercises the working source.
+# To run it against a stdlib fold instead, drop the include lines and build from a
+# directory whose cyrius.cyml pins the toolchain and declares stdlib "ganita".
+
+include "lib/syscalls.cyr"
+include "lib/string.cyr"
+include "lib/alloc.cyr"
+include "lib/fmt.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/math.cyr"
+
+include "src/matrix.cyr"
+include "src/linalg.cyr"
+
+var _bad = 0;
+var _hexd = "0123456789abcdef";
+
+fn out(s) { syscall(1, 1, s, strlen(s)); return 0; }
+
+# 0x + 16 hex digits; local so the repro builds on every fold from cyrius 6.6.1.
+fn hex(v) {
+    var buf[18];
+    store8(&buf, 48);
+    store8(&buf + 1, 120);
+    var i = 0;
+    while (i < 16) {
+        store8(&buf + 2 + i, load8(_hexd + ((v >> ((15 - i) * 4)) & 15)));
+        i = i + 1;
+    }
+    syscall(1, 1, &buf, 18);
+    return 0;
+}
+
+# 1 when |got - want| <= 2^-50 * s1 + 2^-1073. NaN-safe: f64_le is 0 for a NaN.
+fn close(got, want, s1) {
+    var d = f64_abs(f64_sub(got, want));
+    var bound = f64_add(f64_mul(s1, 0x3CD0000000000000), 0x0000000000000002);
+    return f64_le(d, bound);
+}
+
+# 1 when |x - want| <= 2^-44. NaN-safe.
+fn near(x, want) { return f64_le(f64_abs(f64_sub(x, want)), 0x3D30000000000000); }
+
+# 1 when the columns of U (3x2) and the rows of Vt (2x2) are orthonormal to 2^-44.
+# A U column's LENGTH is checked only when its singular value is normal: below
+# DBL_MIN, U's column is w_j / |w_j| with |w_j| rounded to a few subnormal steps, and
+# it cannot be unit in any implementation.
+fn ortho(u, s, vt) {
+    var n0 = f64_ge(load64(s), 0x0010000000000000);
+    var n1 = f64_ge(load64(s + 8), 0x0010000000000000);
+    var d00 = 0;
+    var d11 = 0;
+    var d01 = 0;
+    var i = 0;
+    while (i < 3) {
+        var a = ganita_mat_get(u, i, 0);
+        var b = ganita_mat_get(u, i, 1);
+        d00 = f64_add(d00, f64_mul(a, a));
+        d11 = f64_add(d11, f64_mul(b, b));
+        d01 = f64_add(d01, f64_mul(a, b));
+        i = i + 1;
+    }
+    if (n0 == 1) { if (near(d00, 0x3FF0000000000000) == 0) { return 0; } }
+    if (n1 == 1) { if (near(d11, 0x3FF0000000000000) == 0) { return 0; } }
+    # Directions are checked whenever sigma_0 is normal: a subnormal sigma_1 leaves
+    # U's column 1 up to ~sqrt(2) long, hence 2^-42 rather than 2^-44.
+    if (n0 == 1) { if (f64_le(f64_abs(d01), 0x3D50000000000000) == 0) { return 0; } }
+    var v00 = f64_add(f64_mul(ganita_mat_get(vt, 0, 0), ganita_mat_get(vt, 0, 0)),
+      f64_mul(ganita_mat_get(vt, 0, 1), ganita_mat_get(vt, 0, 1)));
+    var v11 = f64_add(f64_mul(ganita_mat_get(vt, 1, 0), ganita_mat_get(vt, 1, 0)),
+      f64_mul(ganita_mat_get(vt, 1, 1), ganita_mat_get(vt, 1, 1)));
+    var v01 = f64_add(f64_mul(ganita_mat_get(vt, 0, 0), ganita_mat_get(vt, 1, 0)),
+      f64_mul(ganita_mat_get(vt, 0, 1), ganita_mat_get(vt, 1, 1)));
+    if (near(v00, 0x3FF0000000000000) == 0) { return 0; }
+    if (near(v11, 0x3FF0000000000000) == 0) { return 0; }
+    if (near(v01, 0) == 0) { return 0; }
+    return 1;
+}
+
+# A 3x2 matrix from six bit patterns, row-major.
+fn m32(a, b, c, d, e, f) {
+    var m = ganita_mat_new(3, 2);
+    ganita_mat_set(m, 0, 0, a);
+    ganita_mat_set(m, 0, 1, b);
+    ganita_mat_set(m, 1, 0, c);
+    ganita_mat_set(m, 1, 1, d);
+    ganita_mat_set(m, 2, 0, e);
+    ganita_mat_set(m, 2, 1, f);
+    return m;
+}
+
+# [[1, t], [t, t], [t, -t]]. -t is built by flipping the sign bit, so it means the
+# same thing on every toolchain.
+fn fam(t) { return m32(0x3FF0000000000000, t, t, t, t, t ^ 0x8000000000000000); }
+
+fn row(label, a, w1, w2) {
+    var s = alloc(16);
+    store64(s, 0x7FF4000000000BAD);
+    store64(s + 8, 0x7FF4000000000BAD);
+    var u = ganita_mat_new(3, 2);
+    var vt = ganita_mat_new(2, 2);
+    var rc = ganita_mat_svd(a, u, s, vt);
+    var ok = 0;
+    if (rc == 0) {
+        if (close(load64(s), w1, w1) == 1) {
+            if (close(load64(s + 8), w2, w1) == 1) { ok = ortho(u, s, vt); }
+        }
+    }
+    if (ok == 0) {
+        _bad = _bad + 1;
+        out("  WRONG ");
+    } else {
+        out("  ok    ");
+    }
+    out(label);
+    out("  rc ");
+    fmt_int(rc);
+    if (rc == 0) {
+        out("  S ");
+        hex(load64(s));
+        out(" ");
+        hex(load64(s + 8));
+    }
+    out("  want ");
+    hex(w1);
+    out(" ");
+    hex(w2);
+    out("\n");
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    out("A = [[1, t], [t, t], [t, -t]]: zeta = (beta - alpha) / (2 gamma) ~ -1/(2t)\n");
+    row("A1 t = 2^-513           ", fam(0x1FE0000000000000), 0x3FF0000000000000, 0x1FE6A09E667F3BCD);
+    row("A2 t = nextup(2^-513)   ", fam(0x1FE0000000000001), 0x3FF0000000000000, 0x1FE6A09E667F3BCE);
+    row("A3 t = 2^-512           ", fam(0x1FF0000000000000), 0x3FF0000000000000, 0x1FF6A09E667F3BCD);
+    row("A4 t = 1.72 * 2^-543    ", fam(0x1E0B8F2A4C1D3E57), 0x3FF0000000000000, 0x1E137CC152F76F67);
+    row("A5 t = 2^-1074          ", fam(0x0000000000000001), 0x3FF0000000000000, 0x0000000000000001);
+    row("A6 t = 1.6e-308 (subn.) ", fam(0x000B8F2A4C1D3E57), 0x3FF0000000000000, 0x001058E43F6FA300);
+    out("a column whose squared norm underflows: alpha * beta = 0, so the threshold is 0\n");
+    var b1 = m32(0xCB3326815FE2FA41, 0x6C7B1009E69DC636, 0x0000000000000000,
+      0x6FCB799CC80A713E, 0xC78D2DAD93DD5D23, 0x5B82A0E6E26B85A5);
+    row("B1                      ", b1, 0x6FCB799CC80A713E, 0x4B3326815FE2FA41);
+    var b2 = m32(0x89F0481668FD9259, 0xB5DAC74898CD0527, 0x03B8DFFBAEE26112,
+      0x29858E6E791CDEE9, 0x0C56594A23EF8276, 0x1CE65B0EE8C8430C);
+    row("B2                      ", b2, 0x35DAC74898CD0527, 0x0C56594A23EF8276);
+    out("control\n");
+    var c = m32(0x3FF4CCCCCCCCCCCD, 0x3FE6666666666666, 0x4000CCCCCCCCCCCD,
+      0xBFD999999999999A, 0x3FECCCCCCCCCCCCD, 0x3FF999999999999A);
+    row("C  well-conditioned     ", c, 0x4005D534C62740B5, 0x3FFA27692399E1D9);
+    out("rows wrong: ");
+    fmt_int(_bad);
+    out("\n");
+    return _bad;
+}
+
+var r = main();
+sys_exit_group(r);
