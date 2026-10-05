@@ -150,6 +150,33 @@ fn bench_rank(n, reps, handle): i64 {
     return 0;
 }
 
+# Time `reps` full SVDs (U, sigma and V^T) of an n x n matrix; with `zero_row` = 1
+# its row 3 is zeroed first, the rank-deficient square that 1.2.11 returned -1 for.
+fn bench_svd(n, zero_row, reps, handle): i64 {
+    var a = bench_sym_matrix(n);
+    if (a == 0) { return 0 - 1; }
+    if (zero_row == 1) {
+        var k = 0;
+        while (k < n) {
+            ganita_mat_set(a, 3, k, f64_from(0));
+            k = k + 1;
+        }
+    }
+    var u = ganita_mat_new(n, n);
+    var vt = ganita_mat_new(n, n);
+    var s = alloc(n * 8);
+    if (u == 0 || vt == 0 || s == 0) { return 0 - 1; }
+    bench_batch_start(handle);
+    var i = 0;
+    while (i < reps) {
+        ganita_mat_svd(a, u, s, vt);
+        i = i + 1;
+    }
+    bench_batch_stop(handle, reps);
+    bench_report(handle);
+    return 0;
+}
+
 # Time `reps` inversions of an n x n matrix.
 fn bench_inv(n, reps, handle): i64 {
     var a = bench_sym_matrix(n);
@@ -475,6 +502,18 @@ fn main(): i64 {
     bench_tan(0, bench_new("f64_tan (fdlibm k_tan)"));
     bench_tan(1, bench_new("f64_sin / f64_cos (1.2.10 baseline)"));
     bench_tan(2, bench_new("f32_tan (widened onto f64_tan)"));
+
+    # --- 1.2.12: the SVD is one-sided Jacobi on a pivoted QR ---
+    # The Jacobi now starts from R^T (for n >= 4 from a second QR's), which is far
+    # closer to orthogonal columns than A, so few sweeps remain. Against 1.2.11 on
+    # these rows, medians of three interleaved runs pinned to one core: 3x3 1.00x,
+    # 20x20 0.40x, 40x40 0.36x, and rank 40x40 above 0.41x. The zero-row 10x10 is the
+    # filing's branch 3: 1.2.11 spent 726us returning -1 for it, 1.2.12 70us on the
+    # answer. (3x3 values-only, not a row here, measured 1.15x in the svdh harness.)
+    bench_svd(3, 0, 20000, bench_new("mat_svd 3x3 (full)"));
+    bench_svd(20, 0, 20, bench_new("mat_svd 20x20 (full)"));
+    bench_svd(40, 0, 5, bench_new("mat_svd 40x40 (full)"));
+    bench_svd(10, 1, 200, bench_new("mat_svd 10x10, row 3 zero (1.2.11: -1)"));
     return 0;
 }
 

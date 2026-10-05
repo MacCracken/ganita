@@ -1,6 +1,33 @@
 # `ganita_mat_svd` returns −1 ("did not converge") for finite matrices that have an SVD — square matrices with a zero or repeated row, column pairs that need a very small rotation, and a rounding two-cycle
 
-**Status:** 🟡 **OPEN** — found by hisab 3.3.3; re-measured on ganita 1.2.11 as folded into cyrius 6.6.14.
+> ✅ **RESOLVED in ganita 1.2.12** (2026-10-04) by replacing the algorithm, not patching the four
+> branches: `ganita_mat_svd` is now **one-sided Jacobi on a column- and row-pivoted Householder
+> QR** (Drmač and Veselić's preconditioned Jacobi, LAPACK dgejsv/dgesvj), and non-convergence is
+> **−3**, no longer folded into −1. Why this design over a DGESVJ port and a patched 1.2.11 is
+> [ADR 0005](../../../adr/0005-svd-is-jacobi-on-a-pivoted-qr.md).
+>
+> - **Each branch.** (1) ζ is formed from per-column scaled sums and never squared above 2^27,
+>   where t = 1/(2ζ); past a 500-binade gap it is not formed (a projection), and a rotation that
+>   changes no bit is not progress. (2) Each column is scaled by the power of two of its own
+>   largest entry, so the test is a cosine at every magnitude, with an absolute floor near the
+>   subnormal range. (3) The pivoted QR puts a null column at the bottom of R, where its cosine
+>   with any other is at most 1/√2. (4) tol = √n·2^-52 with DGESVJ's second stopping test.
+> - **No finite input is known to reach −3.** The 20,622-matrix exact-oracle corpus built for
+>   this filing passes 20,622/20,622 (the 18 non-finite ones are −2) in at most 7 sweeps;
+>   3,809 adversarial matrices built against three candidate repairs pass, at most 10 sweeps;
+>   819,998 hunted matrices are all status 0. aarch64 is bit-identical on every set. rank,
+>   condition and pseudo_inv answer Z and [[1, 2, 3], [1, 2, 3], [4, 5, 6]]: 2, −1.0, a
+>   pseudo-inverse.
+> - **The repro exits 0** on x86_64 and on aarch64. It gained rows Z, R and W54 at 1.2.12 (see
+>   Reproduction), so it gives 9 on 1.2.11. It stays as the regression witness.
+> - **Suite.** "SVD: one-sided Jacobi on a pivoted QR — every finite input decomposes (1.2.12)",
+>   224 assertions on rows with exact σ, plus 60 on the new helpers. 22 of 25 SVD mutants fail it;
+>   the three survivors are equivalent.
+> - **Faster.** 40×40 0.36× 1.2.11's time, 20×20 0.40×, 3×3 1.00× (values-only 1.15×).
+> - **For callers.** Every SVD's bits change (signs included: diag(2, 3, 4) no longer gives
+>   U = I), and −1 now means allocation failure only.
+
+**Status:** ✅ **RESOLVED in ganita 1.2.12** — found by hisab 3.3.3.
 **Placement:** unpinned.
 **Discovered:** 2026-10-01, hisab 3.3.3 (a scale scan of `ganita_mat_svd` behind hisab's `svd_compute`
 and `svd_truncated`). Measured again for this filing on 2026-10-03.
@@ -143,9 +170,14 @@ The repro covers branches 1 and 2 only. Z, the repeated-row 3×3 and the 5×4 ar
 `row()` and `ortho()` are written for 3×2, and for Z the U column of the zero σ is not determined by
 A, so the orthonormality check needs a rule for it. Until then their bits are given above.
 
+*(1.2.12: they are rows now — Z, R and W54, checked by `rowg()` / `orthog()` for any shape, with
+ganita's rule for a σ that comes back exactly 0: its U column is all zero. A σ at rounding level
+must have a unit U column like any normal one. With them the repro gives **9** on 1.2.11 — every
+row −1 — 5 with only the branch-1 fix below, and **0** on 1.2.12.)*
+
 ```
 cyrius build docs/development/issues/repros/2026-10-03-mat-svd-no-convergence-on-tiny-columns.cyr /tmp/svdtiny
-/tmp/svdtiny; echo "exit=$?"      # -> 6 on 1.2.4 .. 1.2.11
+/tmp/svdtiny; echo "exit=$?"      # -> 6 on 1.2.4 .. 1.2.11 as filed; 9 with the 1.2.12 rows; 0 on 1.2.12
 ```
 
 ```

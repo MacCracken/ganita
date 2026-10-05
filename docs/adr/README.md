@@ -21,6 +21,8 @@ Decisions about ganita — what we chose, the context, and the consequences we a
 
 | ADR | Title | Status |
 |---|---|---|
-| [0001](0001-failure-vocabulary.md) | One failure vocabulary across the matrix and linalg surface | Accepted |
+| [0001](0001-failure-vocabulary.md) | One failure vocabulary across the matrix and linalg surface | Accepted (amended 1.2.12) |
 | [0002](0002-element-cap-is-policy.md) | `GANITA_MAT_MAX_ELEMS` is a policy limit, kept below the allocator's | Accepted |
 | [0003](0003-tan-uses-stdlib-rem-pio2.md) | `ganita_f64_tan` reduces through stdlib math's private `_f64_rem_pio2` | Accepted |
+| [0004](0004-non-finite-input.md) | NaN and infinite input: refuse where a function judges the matrix, propagate where it carries values | Accepted |
+| [0005](0005-svd-is-jacobi-on-a-pivoted-qr.md) | The SVD is one-sided Jacobi on a column- and row-pivoted QR | Accepted |

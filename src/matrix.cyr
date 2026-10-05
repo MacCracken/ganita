@@ -310,7 +310,9 @@ fn ganita_mat_dot(a, b, n): i64 {
     return sum;
 }
 
-# Print matrix to stdout
+# Print matrix to stdout, each entry as hundredths. A NaN or infinite entry is
+# printed as NaN, inf or -inf (1.2.12): through 1.2.11 the saturating f64_to turned
+# NaN into a plausible 0/100 and an infinity into a large finite-looking integer.
 fn ganita_mat_print(m): i64 {
     var rows = ganita_mat_rows(m);
     var cols = ganita_mat_cols(m);
@@ -320,8 +322,15 @@ fn ganita_mat_print(m): i64 {
         var j = 0;
         while (j < cols) {
             var v = ganita_mat_get(m, i, j);
-            fmt_int(f64_to(f64_mul(v, f64_from(100))));
-            syscall(1, 1, "/100 ", 5);
+            if ((v & 0x7FFFFFFFFFFFFFFF) > 0x7FF0000000000000) {
+                syscall(1, 1, "NaN ", 4);
+            }
+            if (v == 0x7FF0000000000000) { syscall(1, 1, "inf ", 4); }
+            if (v == 0xFFF0000000000000) { syscall(1, 1, "-inf ", 5); }
+            if ((v & 0x7FF0000000000000) != 0x7FF0000000000000) {
+                fmt_int(f64_to(f64_mul(v, f64_from(100))));
+                syscall(1, 1, "/100 ", 5);
+            }
             j = j + 1;
         }
         syscall(1, 1, "]\n", 2);

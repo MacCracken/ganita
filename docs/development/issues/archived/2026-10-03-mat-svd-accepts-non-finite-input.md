@@ -1,6 +1,26 @@
 # `ganita_mat_svd` accepts a NaN or infinite entry and reports success — an all-NaN matrix comes back with singular values (0, 0)
 
-**Status:** 🟡 **OPEN** — found by hisab 3.3.3; re-measured on ganita 1.2.11 as folded into cyrius 6.6.14.
+> ✅ **RESOLVED in ganita 1.2.12** (2026-10-04), as proposed below: one scan at the top of
+> `_linalg_svd_impl`, after the shape checks.
+>
+> - **How.** `_linalg_all_finite(m + 16, rows·cols)` refuses a NaN or infinite entry with −2
+>   before any work, so nothing is written to an out-param. It tests the exponent bits, not
+>   `f64_lt(|x|, +∞)`, so it does not lean on how a target compares a NaN. `rank` now passes the
+>   SVD's status through (−2 here; it mapped every failure to −1), `condition` maps it to NaN and
+>   `pseudo_inv` to null: each function refuses in its own ADR 0001 shape. The rule was then
+>   applied to the whole of linalg, recorded as [ADR 0004](../../../adr/0004-non-finite-input.md),
+>   with the companion filing [`2026-10-03-linalg-non-finite-input`](2026-10-03-linalg-non-finite-input.md).
+> - **The repro exits 0** on x86_64 and on aarch64 (was 18). It stays as the regression witness.
+> - **Suite.** "SVD family: a NaN or infinite entry is refused, not decomposed (1.2.12)", 19
+>   assertions: every input of the repro, the last-entry NaN, a negative and a signalling NaN, a
+>   tall 3×2 with −∞ last, sigma, U and Vᵀ checked untouched after the −2, and DBL_MAX and
+>   2^-1074 still decomposing.
+> - **Corpus.** The 18 non-finite matrices of the 20,622-matrix svdh corpus built for the two
+>   SVD filings are −2 from both the full and the values-only path, every out-param still
+>   holding its poison.
+> - **Cost.** One pass over m·n entries ahead of an O(m·n²) decomposition.
+
+**Status:** ✅ **RESOLVED in ganita 1.2.12** — found by hisab 3.3.3.
 **Placement:** unpinned.
 **Discovered:** 2026-10-01, hisab 3.3.3, while giving `svd_compute` and `svd_truncated` a contract.
 Measured again for this filing on 2026-10-03.

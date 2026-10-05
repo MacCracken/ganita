@@ -2,10 +2,32 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-10-01 (1.2.11 — the six 2026-09-30 filings closed, `tan` in
-> f64 and f32, toolchain 6.6.12).
+> Last refreshed: 2026-10-04 (1.2.12 — the SVD rewritten as Jacobi on a pivoted QR, NaN and
+> infinite input refused across linalg, toolchain 6.6.15).
 
 ## Version
+
+**1.2.12** — **the three 2026-10-03 filings closed: the SVD rewritten, and non-finite input
+refused.** Each repro now exits 0 on x86_64 and on aarch64:
+- `ganita_mat_svd` is one-sided Jacobi on a column- and row-pivoted QR (Drmač–Veselić, LAPACK
+  dgejsv), [ADR 0005](../adr/0005-svd-is-jacobi-on-a-pivoted-qr.md).
+  - Square matrices with a zero or repeated row, tiny rotations and the rounding two-cycle all
+    decompose.
+  - Non-convergence is −3 (was −1, the allocation code), and no finite input is known to reach
+    it.
+  - 20×20 to 40×40 take 0.36–0.41× 1.2.11's time.
+  - Every SVD's bits change.
+- Every linalg function that judges a matrix refuses a NaN or infinite entry in its own failure
+  shape, and the carriers propagate it ([ADR 0004](../adr/0004-non-finite-input.md)). rank passes
+  the SVD's status through, and eigen_sym's allocation failure is −1. cholesky and gaussian_elim
+  are listed as 1/0 exceptions (ADR 0001 amended).
+- For n ≥ 4, a U column whose column of X is all subnormal is re-orthonormalised. That case
+  arises for a σ near DBL_MIN when A's largest entry is near DBL_MAX, and the release's own
+  verification found it.
+
+Toolchain **6.6.12 → 6.6.15**, `lib/` re-vendored (**112** files). **1,235 assertions** (was 844).
+CI's word-boundary floor rose 89 → 91. One new filing, pre-existing:
+`2026-10-04-svd-derived-functions-at-the-range-ends`.
 
 **1.2.11** — **the six 2026-09-30 filings closed, and a tangent.** Fixes, each with its repro
 now exiting 0 on x86_64 and on aarch64:
@@ -166,20 +188,24 @@ initial carve out of cyrius stdlib (2026-06-10, cyrius v6.1.26).
 
 ## Toolchain
 
-- **Cyrius pin**: `6.6.12` (`cyrius.cyml [package].cyrius`, since 1.2.11).
-  `cyrius version` reports `manifest-pin: 6.6.12` with no drift line —
-  `cyrius lib sync --full` re-copied all 111 files from the 6.6.12 snapshot (22
-  changed against 6.6.11; `lib/math.cyr` is byte-identical between the two). The
-  published 6.6.12 tarball's compiler and `lib/` are byte-identical to the local
-  install; its `cyrius` wrapper binary differs, so the gate was re-run with the
-  tarball in an isolated `CYRIUS_HOME` (below).
+- **Cyrius pin**: `6.6.15` (`cyrius.cyml [package].cyrius`, since 1.2.12).
+  `cyrius version` reports `manifest-pin: 6.6.15` with no drift line. `cyrius lib sync --full`
+  re-copied all 112 files from the 6.6.15 snapshot: 16 changed against 6.6.12, and
+  `tls_hostid.cyr` is new. The published tarball was the source. On 2026-10-03 the local
+  `~/.cyrius/versions/6.6.15` was an in-flight build reporting the same version string, with a
+  different `cycc` and 6 different `lib/` files. By 2026-10-04 its `cycc` and `lib/` matched the
+  tarball. Every 1.2.12 gate ran from the tarball in an isolated `CYRIUS_HOME` (below).
+- **`f64_le` / `f64_ge` / `f64_trunc` are compiler builtins from cyrius 6.6.13**, no longer
+  `lib/math.cyr` functions. NaN still gives 0 for the two comparisons. ganita's nine `f64_le` /
+  `f64_ge` calls compile to them with every test bit unchanged; on an older stdlib they come
+  from `math.cyr` as before. `_f64_rem_pio2` (tan) is byte-identical at 6.6.15.
 - ⚠ **ganita now calls one stdlib-private symbol** (1.2.11): `_f64_rem_pio2`, from
   `ganita_f64_tan` (and so `f64_tan` and `ganita_f32_tan`). It exists in stdlib math from
   cyrius **6.6.9** on. On 6.6.0–6.6.8 the bundle still builds and every other function
   is bit-identical. x86_64 builds print `warning: undefined function '_f64_rem_pio2'`,
   and calling tan there is a compile-time error. A future pin that renames the symbol
   breaks the build at compile time. [ADR 0003](../adr/0003-tan-uses-stdlib-rem-pio2.md).
-- **`lib/` matches the pin exactly**: 111 files, 0 differ. Verify by comparing
+- **`lib/` matches the pin exactly**: 112 files, 0 differ. Verify by comparing
   the trees against `~/.cyrius/versions/<pin>/lib`, not by trusting
   `cyrius lib sync --full`'s exit code.
 - **The `f64_exp(±inf) = NaN` defect ganita filed was fixed upstream at 6.6.1.**
@@ -222,12 +248,12 @@ initial carve out of cyrius stdlib (2026-06-10, cyrius v6.1.26).
 ## Source
 
 Linear-algebra & advanced-math modules carved from cyrius stdlib, public
-functions prefixed `ganita_`. Regenerated from the tree 2026-10-01 (1.2.11):
+functions prefixed `ganita_`. Regenerated from the tree 2026-10-04 (1.2.12):
 
 **Allocation-failure contract (1.2.2).** Every internal `ganita_mat_new` / `alloc`
 is checked, and each function reports in its own return vocabulary: **null** for
-the matrix- and array-returning fns, **-1** for the status ones (**-2** for
-`eigen_sym`, whose `-1` means max-iterations), **-1** for `rank`, and **NaN** for
+the matrix- and array-returning fns, **-1** for the status ones (`eigen_sym` included
+since 1.2.12, when its `-2` was corrected to match its doc and ADR 0001), and **NaN** for
 `det` and `condition` — `0.0` and `-1.0` are answers those two already give about
 the *matrix* and must not be overloaded to mean the run failed. Failures are
 reachable with inputs well inside the cap whenever the working factor is derived
@@ -238,8 +264,8 @@ operands whose product is not.
 
 | Module | Lines | Public fns | Canonical prefix |
 |--------|-------|-----------|------------------|
-| `src/linalg.cyr`        | 1656 | 26 | `ganita_mat_*` (extends matrix) |
-| `src/matrix.cyr`        | 331 | 14 | `ganita_mat_*` |
+| `src/linalg.cyr`        | 2786 | 26 | `ganita_mat_*` (extends matrix) |
+| `src/matrix.cyr`        | 340 | 14 | `ganita_mat_*` |
 | `src/math_advanced.cyr` | 1419 | 15 | `ganita_f64_*` / `ganita_fibonacci` / `ganita_binomial` |
 | `src/math_f32.cyr`      | 321 | 32 | `ganita_f32_*` |
 
@@ -251,13 +277,24 @@ operands whose product is not.
   `_gn_exp_half` is e^a/2 past exp's overflow (FreeBSD `k_exp.c`'s scaling, k = 2043),
   `_gn_k_tan` is fdlibm's `__kernel_tan`, and `_gn_gcd` is binomial's divide-first step.
   All are plain f64 arithmetic: bit-identical across targets.
+- **linalg's private SVD helpers (1.2.12):**
+  - the pivoted Householder QR: `_linalg_svd_house`, `_reflect`, `_qrcp`, `_apply_q`, `_rt`;
+  - the Jacobi: `_linalg_svd_sweep`, `_rot`, `_cf`;
+  - pairwise sums: `_linalg_svd_ssq`, `_dot`, `_nrm`;
+  - exact power-of-two scaling, with ldexp's single rounding: `_linalg_svd_pow2`, `_expo`,
+    `_ldexp`;
+  - V completion for n ≤ 3: `_linalg_svd_complete`, `_cross`, `_unit`;
+  - U re-orthonormalisation for n ≥ 4: `_linalg_svd_reorth`.
+
+  `_linalg_all_finite` and `_linalg_tol_ok` are the non-finite predicates. All of it is plain f64
+  arithmetic, bit-identical across targets.
 - **One open-coded 2-D walk.** `_ganita_mat_mul_into` (matrix.cyr) is the only loop
   that strides rows and columns by raw pointer instead of indexing through
   `ganita_mat_get`/`_set` (flat whole-matrix loops aside). `ganita_mat_mul` and
   `ganita_mat_pseudo_inv`, in its transposed form, both go through it.
   Single-pass order: matrix → linalg → math_advanced → math_f32 → `_compat`
   last, since its aliases reference every `ganita_*` symbol.
-- `dist/ganita.cyr` — regenerated via `cyrius distlib` at 1.2.11 on 6.6.12 (3863 lines). This is the artifact folded into `cyrius/lib/ganita.cyr`. Regeneration
+- `dist/ganita.cyr` — regenerated via `cyrius distlib` at 1.2.12 on 6.6.15 (5002 lines; 3863 at 1.2.11). This is the artifact folded into `cyrius/lib/ganita.cyr`. Regeneration
   is idempotent.
 - `dist/ganita.deps` — 10 stdlib leaves: `syscalls string alloc fmt vec str math
   io assert bench`. Verified sufficient by `scripts/consumer-check.sh` (`str` is
@@ -276,8 +313,24 @@ operands whose product is not.
   within 1 ulp and the C99 special values** (1.2.7–1.2.8) + **every alias against its
   twin** (1.2.8) + **f32 sin/cos past 2^63** (1.2.9) + **the 1.2.11 groups: binomial up to
   i64_MAX (a Pascal sweep of every n ≤ 70), atan2's whole C99 table, the cancellation
-  band, the overflow band, and tan in f64 and f32** (37 + 65 + 58 + 13 + 73 assertions).
-  **844 assertions, green** on 6.6.12, x86_64 and aarch64 (qemu).
+  band, the overflow band, and tan in f64 and f32** (37 + 65 + 58 + 13 + 73 assertions) +
+  **the 1.2.12 groups: non-finite input in the SVD family and the rest of linalg, the SVD against
+  exact σ, and its building blocks called directly** (19 + 87 + 225 + 60 assertions).
+  **1,235 assertions, green** on 6.6.15, x86_64 and aarch64 (qemu), output byte-identical.
+
+  **The 1.2.12 SVD is measured by `scripts/svdh/`, its evaluation harness** (README there).
+  The claims in `ganita_mat_svd`'s comment rest on the sets it rebuilds deterministically:
+  - a 20,622-matrix corpus, every σ certified correctly rounded by Python `Fraction` and mpmath;
+  - 3,809 adversarial matrices built against three candidate repairs (`adv/`);
+  - 819,998 hunted matrices (`adv/hunt_all.sh`) and the exact-oracle hunt families (`hunts/`).
+
+  It needs Python with mpmath and numpy (`scripts/svdh/requirements.txt`), so it is a manual
+  tool, not a CI step; its README lists the reference checksums and scores of 1.2.12 (and of
+  1.2.11, via `tree-at.sh`), so a change to the SVD can be measured against them. Generated data
+  goes to `build/svdh/`. The suite's SVD rows are taken from those sets, with the exact σ, under
+  bounds about twice the measurement. Mutation: 22 of 25 SVD mutants fail the suite, 27 of 29 non-finite guard mutants,
+  and 4 of 5 mutants of the U re-orthonormalisation. Every survivor is equivalent or bounded (see
+  the CHANGELOG).
 
   **The 1.2.11 additions were verified twice.** First, each fix unit was verified by an
   independent adversarial agent: its own mpmath sweeps on both architectures and its own
@@ -354,27 +407,31 @@ Since then the tool changed twice, and the gate followed it up, never down: cyri
 and 6.6.11 excludes the entry point `main`. At the 6.6.11 pin (1.2.10) the tool reports
 **139/139 (100 %)** and CI gates `--min 100`; the word-boundary gate is `88`. At 1.2.11
 (6.6.12) the tool reports **142/142** and the word-boundary count **152/170 (89 %)**, so
-that gate rose to `89`.
+that gate rose to `89`. At 1.2.12 (6.6.15) the tool reports **142/142** and the word-boundary
+count **173/190 (91 %)**: the twenty new private helpers each have direct rows. That gate rose
+to `91`.
 
 The honest count is the one to plan against. The tool's is kept as a ratchet
 because it sees things a regex does not — but it is not the only gate, because it
 is a number a comment can move.
 
-Per module, honest count at 1.2.11 (the denominator includes private helpers; 1.2.6
+Per module, honest count at 1.2.12 (the denominator includes private helpers; 1.2.11
 figures in brackets):
 
 | Module | Referenced |
 |---|---|
-| `math_f32.cyr`      | 32/35 (31/35) |
-| `linalg.cyr`        | 26/31 (26/31) |
-| `matrix.cyr`        | 15/16 (13/16) |
-| `math_advanced.cyr` | 22/31 (14/20) |
-| `_compat.cyr`       | **55/55** (6/54) |
+| `math_f32.cyr`      | 32/35 (32/35) |
+| `linalg.cyr`        | 47/51 (26/31) |
+| `matrix.cyr`        | 15/16 (15/16) |
+| `math_advanced.cyr` | 22/31 (22/31) |
+| `_compat.cyr`       | **55/55** (55/55) |
 
 Every public function and every `_compat` alias is now called by name. The aliases
 have been checked against their twins since 1.2.8, and `asin` / `atan2` have direct
 rows since 1.2.8 and 1.2.11. What stays dark is private helpers that are reached only
-through their callers: `_f64_is_inf` / `_f64_is_nan_pat`, and the pow core's pieces.
+through their callers: `_f64_is_inf` / `_f64_is_nan_pat`, the pow core's pieces, and four
+older linalg helpers (`_linalg_mat_scale`, `_linalg_norm2`, `_linalg_is_nan`,
+`_linalg_row_max_col`).
 The 1.2.11 kernels (`_gn_expm1`, `_gn_log1p`, `_gn_exp_half`, `_gn_k_tan`, `_gn_gcd`)
 each have direct rows. History: `_compat.cyr` was published as 40/53 at 1.2.2 and was
 really 5/53, so the substring counter credited aliases nobody called.
@@ -405,7 +462,7 @@ sweep. Three properties worth remembering when editing it:
 Gates (20 steps as of 1.2.3): pin-drift · version consistency · `lib/` vs
 snapshot · format (src, tests **and examples**) · lint · vet · build with 0
 warnings · smoke exits 42 · test · fuzz · bench · `coverage --min 100` (since 1.2.10) ·
-**`coverage-honest.sh 89`** (ratcheted from 56 at 1.2.6, 88 at 1.2.10, 89 at 1.2.11) · `distlib --all --check` ·
+**`coverage-honest.sh 91`** (ratcheted from 56 at 1.2.6, 88 at 1.2.10, 89 at 1.2.11, 91 at 1.2.12) · `distlib --all --check` ·
 regeneration leaves no tree diff · consumer-check · **examples build and run**.
 
 Two of those are new at 1.2.3 and both exist because a gate was measuring the
@@ -419,8 +476,22 @@ wrong thing:
 
 ## Open filings
 
-**None.** 1.2.11 closed the six filed on 2026-09-30, and all are in `issues/archived/`
-with resolution banners:
+**One**, pre-existing and of low severity:
+
+| Severity | Filing | State |
+|---|---|---|
+| LOW | [`svd-derived-functions-at-the-range-ends`](issues/2026-10-04-svd-derived-functions-at-the-range-ends.md) (1.2.12 verification) | pseudo_inv gives NaN entries for a kept σ below 2^-1024. When σ₁ overflows, condition returns −1.0 and pseudo_inv zeros. Repro exits 5 on 1.2.11 and 1.2.12. A fix is proposed (work in the SVD's working scale), not prototyped. |
+
+1.2.12 closed the three filed on 2026-10-03, and all are in `issues/archived/` with resolution
+banners:
+
+| Severity | Filing | Resolution |
+|---|---|---|
+| HIGH | [`mat-svd-no-convergence-on-tiny-columns`](issues/archived/2026-10-03-mat-svd-no-convergence-on-tiny-columns.md) (hisab) | The SVD is Jacobi on a pivoted QR ([ADR 0005](../adr/0005-svd-is-jacobi-on-a-pivoted-qr.md)); non-convergence is −3, none known. Repro 9 → 0 (6 as filed; rows Z, R and W54 added). |
+| MEDIUM | [`mat-svd-accepts-non-finite-input`](issues/archived/2026-10-03-mat-svd-accepts-non-finite-input.md) (hisab) | One exponent-bit scan returns −2, and rank passes it through. Repro 18 → 0. |
+| MEDIUM | [`linalg-non-finite-input`](issues/archived/2026-10-03-linalg-non-finite-input.md) (1.2.12 audit) | Every judging function refuses, every carrier propagates ([ADR 0004](../adr/0004-non-finite-input.md)). Repro 22 → 0. |
+
+1.2.11 closed the six filed on 2026-09-30:
 
 | Severity | Filing | Resolution |
 |---|---|---|
@@ -440,8 +511,8 @@ with resolution banners:
 
 Closed earlier and kept as history: the four other 1.2.3 filings (1.2.4), the
 `ganita_mat_least_squares` null write and `fmt_float`'s dropped carry (1.2.2), and
-the `f64_pow` domain (1.1.4). Eight repros stay as regression witnesses, all exiting 0:
-the six 2026-09-30 ones (from 1.2.11),
+the `f64_pow` domain (1.1.4). Eleven repros stay as regression witnesses, all exiting 0:
+the three 2026-10-03 ones (from 1.2.12), the six 2026-09-30 ones (from 1.2.11),
 `repros/2026-08-23-least-squares-unchecked-q-alloc.cyr` (exit 139 on 1.1.4 … 1.2.1,
 0 from 1.2.2) and `repros/2026-09-16-f64-cbrt-missing.cyr` (exit 2 with the pow
 workaround as its candidate, 0 from 1.2.6). Two older banners were found to overclaim
@@ -469,17 +540,36 @@ and carry 1.2.11 addenda: `2026-09-07-f64-transcendental-accuracy` and
    same symbols as `src/`: a last-definition-wins hazard waiting for someone to
    include it. Deleting it is not durable (`--full` re-adds it on every bump);
    the durable fix is upstream, a `lib sync` self-exclusion. bayan carries the
-   identical gap. At the 6.6.12 pin it holds ganita **1.2.9**, two releases behind
+   identical gap. At the 6.6.15 pin it holds ganita **1.2.11**, one release behind
    `src/`, so it is stale as well as redundant.
-5. **`asinh(-0)` is +0 on stdlibs before 6.6.8** (pre-existing). Its tiny branch
-   returns `|x|` re-signed with `f64_neg`, and `f64_neg(+0)` is +0 before 6.6.8. sinh,
-   tanh and atanh return `x` and are sign-exact on every toolchain. This matters only
-   to `dist/` consumers on old pins.
 4. **`ganita_f64_cbrt` spends most of its ~105 ns in two exact comparisons.** It is
    1.1–1.15× the pow form it replaced, which is fine for tanmatra's use. If cube
    roots ever become a hotspot, a floating-point residual filter could certify the
    common case and leave the limb comparison to the rare close calls. The rounding
    would stay exact; only the cost would move.
+5. **`asinh(-0)` is +0 on stdlibs before 6.6.8** (pre-existing). Its tiny branch
+   returns `|x|` re-signed with `f64_neg`, and `f64_neg(+0)` is +0 before 6.6.8. sinh,
+   tanh and atanh return `x` and are sign-exact on every toolchain. This matters only
+   to `dist/` consumers on old pins.
+6. **The SVD's two range limits** (1.2.12, inherent).
+   - σ₁ within a few ulps of DBL_MAX can round to +∞: 7 of 563 matrices built for it do, and
+     1.2.11 kept 4 of those finite.
+   - The single power-of-two scaling holds about 2,050 binades. A σ further than that below σ₁ is
+     normwise right but not relatively accurate.
+
+   Both are documented at `ganita_mat_svd`.
+7. **Some SVD figures are not reproduced by `scripts/svdh`.** It rebuilds the corpus, the
+   adversarial sets, the hunts and the d1hunt families with every status, PASS count and metric,
+   but the sweep and branch counts in `ganita_mat_svd`'s comment came from temporary counters in
+   `src/`, and the 181-matrix row-graded study and the 2^20×5 run were one-off scripts.
+8. **`scripts/consumer-check.sh` cannot see a missing leaf on a machine with `~/.cyrius`**
+   (found 2026-10-04). On a missing `lib/` include, cycc falls back to
+   `$HOME/.cyrius/versions/<v>/lib` and ignores `CYRIUS_HOME`, so `--no-deps` quietly takes the
+   file from there, and CI's runner has that install. Built with `HOME` set to an empty
+   directory, a consumer of the 1.2.12 bundle needs only the ten sidecar leaves plus six files
+   those leaves include themselves (atomic, fnptr, result and three syscalls files), none of them
+   for ganita, so the sidecar is right today. cyrius's 6.6.16 roadmap makes the fallback honour
+   `CYRIUS_HOME`; until then the check proves less than its header says.
 
 ## Dependencies
 
@@ -495,14 +585,14 @@ toolchain and the hash of every vendored `lib/` file (re-locked at each pin bump
 
 ## Consumers
 
-- **cyrius** — folds `dist/ganita.cyr` → `lib/ganita.cyr`. The 6.6.12 snapshot carries
-  ganita **1.2.9**. The next refold brings in the 1.2.11 fixes and `f64_tan`, which is how
-  abaco and hisab reach them.
+- **cyrius** — folds `dist/ganita.cyr` → `lib/ganita.cyr`. The 6.6.15 snapshot carries
+  ganita **1.2.11**. 1.2.12 is built and gated on 6.6.15 for the next refold. cyrius's `docs/stdlib-reference.md` still calls `mat_svd` "SVD via
+  eigendecomposition", which has been stale since 1.2.4, and lists no status codes.
 - **abaco** (expression evaluator) — filed four of the six 1.2.11 filings and the
   overflow band. Its 2.4.9 `abaco_binomial` and 2.4.10 `_eval_k_tan` can go once cyrius
   refolds.
-- **hisab** (complex numbers) — filed the atan2 signed-zero rows through
-  `cx_arg(cx_conj(z))`.
+- **hisab** (complex numbers, linear algebra) — filed the atan2 signed-zero rows through
+  `cx_arg(cx_conj(z))`, and both 1.2.12 SVD filings.
 - **tanmatra** (atomic and nuclear physics, Rust → Cyrius port) — drove the 1.2.6
   cube root. Its nuclear radius, Bethe–Weizsäcker and Thomas–Fermi terms all take
   `A^(1/3)` and are asserted against golden values from Rust's `libm::cbrt`.

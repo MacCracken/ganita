@@ -1,6 +1,6 @@
 # ADR 0001 — One failure vocabulary across the matrix and linalg surface
 
-**Status**: Accepted
+**Status**: Accepted (amended at 1.2.12, see the end)
 **Date**: 2026-09-07
 **Version**: 1.2.3
 
@@ -41,7 +41,7 @@ Both are real answers about the matrix. Overloading either to also mean "the run
 failed" would report a perfectly invertible matrix as singular — a wrong answer
 dressed as a right one.
 
-**`ganita_mat_lu` is the one exception.** Its successful returns are the
+**`ganita_mat_lu` is the one exception** (one of three — see the 1.2.12 amendment). Its successful returns are the
 permutation sign `+1` and `-1`, so it has no negative to spend. It folds a
 contract violation into its existing `0` ("cannot decompose"), which is what a
 caller already tests for.
@@ -78,3 +78,30 @@ meaningful count (`rank`, `eigen_sym`'s rotations), so positive values are taken
   `==`, because NaN compares false against everything including itself. That is a
   real cost, and it is the reason `_linalg_is_nan` is now a shared helper rather
   than something each caller reinvents.
+
+## Amendment — 1.2.12 (2026-10-04)
+
+Three corrections, found by the 1.2.12 non-finite audit and the SVD filing. The decision above
+stands; these make the code and this record agree with it.
+
+**Three exceptions, not one.** `ganita_mat_cholesky` and `ganita_mat_gaussian_elim` return `1` on
+success and `0` on any failure. They predate the vocabulary, and this ADR missed them, so a caller
+following the universal `< 0` test read every refusal of theirs as success. They **stay 1/0**. A
+caller's `== 0` test keeps working, while moving them to negative codes would turn every existing
+`if (ganita_mat_cholesky(...) == 0)` into a test that never fires. The rule is now: `< 0` on every
+status function except `lu`, `cholesky` and `gaussian_elim`, and `== 0` on those three. The module
+header of `src/linalg.cyr` says the same.
+
+**The SVD family follows the vocabulary.**
+- Through 1.2.11 `ganita_mat_svd` folded non-convergence into `-1`, the allocation code, contrary
+  to this ADR. It is now `-3`
+  ([`2026-10-03-mat-svd-no-convergence-on-tiny-columns`](../development/issues/archived/2026-10-03-mat-svd-no-convergence-on-tiny-columns.md),
+  [ADR 0005](0005-svd-is-jacobi-on-a-pivoted-qr.md)).
+- `ganita_mat_rank` passes the SVD's status through (`-2`, `-3`), where it mapped every failure to
+  `-1`. `condition` maps every SVD failure to NaN and `pseudo_inv` to null, as before.
+- `ganita_mat_eigen_sym` returned `-2` when its working copy could not be allocated, against its
+  own doc and this ADR. It is now `-1`.
+
+**A NaN or infinite input is a contract violation**, `-2` in a status function and each function's
+own failure shape elsewhere, in every function that judges a matrix. Where that line falls, and
+why the carriers propagate instead, is [ADR 0004](0004-non-finite-input.md).

@@ -39,24 +39,32 @@ different one:
 |---|---|---|
 | a matrix (`copy`, `inv`, `transpose`, `mul`, `pseudo_inv`, …) | pointer | `0` |
 | a flat array (`row`, `col`) | pointer | `0` |
-| a status (`lu_solve`, `cholesky_solve`, `qr`, `least_squares`, `svd`) | `0` | `-1` allocation · `-2` contract violation |
+| a status (`lu_solve`, `cholesky_solve`, `qr`, `least_squares`) | `0` | `-1` allocation · `-2` contract violation |
+| `svd` | `0` | `-1` allocation · `-2` contract · `-3` no convergence (1.2.12; no finite input is known to reach it) |
 | `eigen_sym` | rotation count ≥ 0 | `-1` allocation · `-2` contract · `-3` max iterations |
-| `rank` | count ≥ 0 | `-1` allocation · `-2` contract |
+| `rank` | count ≥ 0 | `-1` allocation · `-2` contract · `-3` the SVD's, passed through (1.2.12) |
 | `det` | the determinant, `0.0` if singular | **NaN** |
 | `condition` | the ratio, `-1.0` if singular | **NaN** |
-| `lu` | permutation sign ±1 | `0` if singular |
-| `cholesky` | `1` | `0` if not positive-definite |
-| `gaussian_elim` | `1` | `0` if singular |
+| `lu` | permutation sign ±1 | `0` on any failure (singular, a bad shape, a NaN or infinity) |
+| `cholesky` | `1` | `0` on any failure (not positive-definite, …) |
+| `gaussian_elim` | `1` | `0` on any failure (singular, …) |
 
 `det` and `condition` return NaN rather than `0.0` / `-1.0` because those two values
 are real answers *about the matrix*. Overloading either to also mean "the run failed"
 would report a perfectly invertible matrix as singular.
 
 The negative codes are uniform across every status function, so `< 0` is a
-universal failure test — see [ADR 0001](../adr/0001-failure-vocabulary.md).
-`ganita_mat_lu` is the single exception: its successful returns are the
-permutation signs `+1` and `-1`, leaving no negative to spend, so it folds a
-contract violation into the `0` that already means "cannot decompose".
+universal failure test — see [ADR 0001](../adr/0001-failure-vocabulary.md) — with
+**three exceptions that fail with `0`**: `ganita_mat_lu`, whose successful returns
+are the permutation signs `+1` and `-1`, leaving no negative to spend, and
+`ganita_mat_cholesky` and `ganita_mat_gaussian_elim`, which return `1` on success.
+Test those three with `== 0`.
+
+**A NaN or an infinity in the input is refused**, in the function's own failure
+shape, by every function that judges a matrix (the decompositions, the solvers,
+`det`, `rank`, `condition`, `eq`, `is_symmetric`). The ones that only carry values
+(`add`, `mul`, `transpose`, `frobenius`, `max_norm`, …) propagate it as IEEE
+arithmetic does. See [ADR 0004](../adr/0004-non-finite-input.md).
 
 ## Contracts the examples rely on
 

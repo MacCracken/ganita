@@ -11,7 +11,7 @@
 >     which is the reducer `f64_sin` / `f64_cos` use. That symbol is private, and
 >     stdlib has carried it only since **cyrius 6.6.9**. The decision and its cost on
 >     older pins (a compile error if tan is called, a warning otherwise on x86_64)
->     are recorded in [ADR 0003](../../adr/0003-tan-uses-stdlib-rem-pio2.md).
+>     are recorded in [ADR 0003](../../../adr/0003-tan-uses-stdlib-rem-pio2.md).
 >   - `ganita_f32_tan` widens onto it.
 > - **Measured** against mpmath:
 >   - Within 1 ulp everywhere measured. The worst found is 0.940 ulp, at

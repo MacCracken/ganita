@@ -2253,6 +2253,1332 @@ assert_eq(ganita_f32_tan(0x5FFD33A4), 0x3FD06C8C,
 assert_eq(ganita_f32_tan(0x408174DD), 0x3FA29B31,
   "f32 tan(4.04551554) is correctly rounded (its double tan is 2 ulp below an f32 midpoint)");
 
+test_group("SVD family: a NaN or infinite entry is refused, not decomposed (1.2.12)");
+# hisab 3.3.3 found that ganita_mat_svd had no finite check. An all-NaN 2x2 came back
+# as status 0 with sigma (0, 0), and [[NaN, 0], [0, 2]] as status 0 with the FINITE
+# sigma (2, 0): the scale and the column norm are ordered maxima that a NaN never
+# wins, and a NaN gamma fails the orthogonality test, so the pair counted as
+# converged. rank, condition and pseudo_inv inherited it (rank 0 or 1, condition
+# -1.0 "singular", a pseudo-inverse of zeros). Each must now refuse in its own shape.
+fn t_nf_poison(p, n): i64 {
+    var i = 0;
+    while (i < n) { store64(p + i * 8, 0x7FF4000000000BAD); i = i + 1; }
+    return 0;
+}
+# 1 when every one of the n words at p still holds t_nf_poison's pattern.
+fn t_nf_untouched(p, n): i64 {
+    var i = 0;
+    while (i < n) {
+        if (load64(p + i * 8) != 0x7FF4000000000BAD) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+# How many of the four SVD-family functions refuse `a` in their own shape: svd -2
+# with sigma, U and V^T left untouched; rank -2; condition NaN; pseudo_inv null.
+fn t_nf_refusals(a): i64 {
+    var rows = ganita_mat_rows(a);
+    var cols = ganita_mat_cols(a);
+    var u = ganita_mat_new(rows, cols);
+    var vt = ganita_mat_new(cols, cols);
+    var s = alloc(cols * 8);
+    t_nf_poison(s, cols);
+    t_nf_poison(u + 16, rows * cols);
+    t_nf_poison(vt + 16, cols * cols);
+    var n = 0;
+    if (ganita_mat_svd(a, u, s, vt) == 0 - 2) {
+        n = n + (t_nf_untouched(s, cols) & t_nf_untouched(u + 16, rows * cols) & t_nf_untouched(vt + 16, cols * cols));
+    }
+    if (ganita_mat_rank(a, t_tol()) == 0 - 2) { n = n + 1; }
+    if (t_f64_is_nan(ganita_mat_condition(a)) == 1) { n = n + 1; }
+    if (ganita_mat_pseudo_inv(a) == 0) { n = n + 1; }
+    return n;
+}
+var NF_PINF = 0x7FF0000000000000;
+var NF_NINF = 0xFFF0000000000000;
+# The all-NaN fixture from the 1.2.3 group, function by function.
+var NF_S = alloc(16);
+assert_eq(ganita_mat_svd(NANM, ganita_mat_new(2, 2), NF_S, ganita_mat_new(2, 2)), 0 - 2,
+  "svd -> -2 for an all-NaN 2x2 (was 0 with sigma (0, 0))");
+assert_eq(ganita_mat_rank(NANM, t_tol()), 0 - 2, "rank -> -2 for an all-NaN 2x2 (was 0)");
+assert_eq(t_f64_is_nan(ganita_mat_condition(NANM)), 1, "condition -> NaN for an all-NaN 2x2 (was -1.0)");
+assert_eq(ganita_mat_pseudo_inv(NANM), 0, "pseudo_inv -> null for an all-NaN 2x2 (was a matrix of zeros)");
+assert_eq(t_nf_refusals(t_m2(NANV, t_d(0), t_d(0), t_d(2))), 4,
+  "[[NaN, 0], [0, 2]]: all four refuse (svd was 0 with the finite sigma (2, 0))");
+assert_eq(t_nf_refusals(t_m2(NF_PINF, t_d(0), t_d(0), t_d(2))), 4, "[[+inf, 0], [0, 2]]: all four refuse");
+assert_eq(t_nf_refusals(t_m2(NF_NINF, t_d(0), t_d(0), t_d(2))), 4, "[[-inf, 0], [0, 2]]: all four refuse");
+assert_eq(t_nf_refusals(t_m2(t_d(3), NANV, t_d(0), t_d(2))), 4, "[[3, NaN], [0, 2]]: all four refuse");
+assert_eq(t_nf_refusals(t_m2(t_d(1), t_d(2), t_d(3), NF_PINF)), 4, "[[1, 2], [3, +inf]]: all four refuse");
+# The LAST entry, which a scan of rows, cols or rows * cols - 1 entries misses.
+assert_eq(t_nf_refusals(t_m2(t_d(3), t_d(0), t_d(0), NANV)), 4,
+  "[[3, 0], [0, NaN]]: all four refuse (was sigma (3, 0), rank 1, pseudo_inv [0][0] = 1/3)");
+var NF32 = ganita_mat_new(3, 2);
+ganita_mat_set(NF32, 0, 0, t_d(1)); ganita_mat_set(NF32, 0, 1, t_d(2));
+ganita_mat_set(NF32, 1, 0, t_d(3)); ganita_mat_set(NF32, 1, 1, t_d(4));
+ganita_mat_set(NF32, 2, 0, t_d(5)); ganita_mat_set(NF32, 2, 1, NF_NINF);
+assert_eq(t_nf_refusals(NF32), 4, "a tall 3x2 with -inf in its last entry: all four refuse");
+# Every NaN, not just the default one: a negative quiet NaN and a signalling payload.
+assert_eq(t_nf_refusals(t_m2(t_d(1), 0xFFF8000000000000, t_d(0), t_d(1))), 4, "a negative NaN is refused");
+assert_eq(t_nf_refusals(t_m2(t_d(1), t_d(0), 0x7FF0000000000001, t_d(1))), 4, "a signalling NaN is refused");
+# The scan is on the exponent, so the extremes of the FINITE range still decompose.
+var NF_BIG = t_m2(0x7FEFFFFFFFFFFFFF, t_d(0), t_d(0), t_d(1));
+var NF_BS = alloc(16);
+assert_eq(ganita_mat_svd(NF_BIG, ganita_mat_new(2, 2), NF_BS, ganita_mat_new(2, 2)), 0,
+  "svd still decomposes [[DBL_MAX, 0], [0, 1]]");
+assert_eq(load64(NF_BS), 0x7FEFFFFFFFFFFFFF, "  ... and sigma0 is DBL_MAX exactly");
+assert_eq(t_dclose(load64(NF_BS + 8), t_d(1)), 1, "  ... and sigma1 is 1");
+var NF_TINY = t_m2(0x0000000000000001, t_d(0), t_d(0), 0x0000000000000001);
+var NF_TS = alloc(16);
+assert_eq(ganita_mat_svd(NF_TINY, ganita_mat_new(2, 2), NF_TS, ganita_mat_new(2, 2)), 0,
+  "svd still decomposes 2^-1074 * I");
+assert_eq(load64(NF_TS) == 1 && load64(NF_TS + 8) == 1, 1, "  ... and both sigma are 2^-1074 exactly");
+assert_eq(ganita_mat_rank(t_m2(t_d(3), t_d(0), t_d(0), t_d(2)), t_tol()), 2,
+  "the finite control diag(3, 2) has rank 2");
+
+test_group("linalg: every function that judges a matrix refuses a NaN or infinity (1.2.12)");
+# The audit that followed the SVD fix found the rest of linalg had no finite check.
+# Two mechanisms turned bad input into success: an infinity became the matrix scale,
+# so every relative threshold was +inf and every "anything left to do?" test failed
+# at once; and an ordered comparison dropped a NaN. Each row below was a status of
+# success with every output finite, or a finite f64, through 1.2.11
+# (docs/development/issues/2026-10-03-linalg-non-finite-input.md). Out-params are
+# poisoned first, so "nothing written" is checked too.
+var LNF_NAN = 0x7FF8000000000000;
+var LNF_PINF = 0x7FF0000000000000;
+var LNF_NINF = 0xFFF0000000000000;
+var LNF_POISON = 0x7FF4000000000BAD;
+# Fill n words at p with LNF_POISON.
+fn t_lnf_poison(p, n): i64 {
+    var i = 0;
+    while (i < n) { store64(p + i * 8, LNF_POISON); i = i + 1; }
+    return 0;
+}
+# 1 when the n words at p all still hold LNF_POISON.
+fn t_lnf_untouched(p, n): i64 {
+    var i = 0;
+    while (i < n) {
+        if (load64(p + i * 8) != LNF_POISON) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+# Build a 3x2 matrix from its six entries, row-major.
+fn t_lnf_m32(a, b, c, d, e, f): i64 {
+    var m = ganita_mat_new(3, 2);
+    ganita_mat_set(m, 0, 0, a); ganita_mat_set(m, 0, 1, b);
+    ganita_mat_set(m, 1, 0, c); ganita_mat_set(m, 1, 1, d);
+    ganita_mat_set(m, 2, 0, e); ganita_mat_set(m, 2, 1, f);
+    return m;
+}
+# eigen_sym on an n x n input: 1 when it returns -2 and writes neither out-param.
+fn t_lnf_eig_refuses(a): i64 {
+    var n = ganita_mat_rows(a);
+    var vals = alloc(n * 8);
+    var vecs = ganita_mat_new(n, n);
+    t_lnf_poison(vals, n);
+    t_lnf_poison(vecs + 16, n * n);
+    if (ganita_mat_eigen_sym(a, vals, vecs) != 0 - 2) { return 0; }
+    return t_lnf_untouched(vals, n) & t_lnf_untouched(vecs + 16, n * n);
+}
+# qr: 1 when it returns -2 and writes neither Q nor R.
+fn t_lnf_qr_refuses(a): i64 {
+    var r = ganita_mat_rows(a);
+    var c = ganita_mat_cols(a);
+    var q = ganita_mat_new(r, r);
+    var rr = ganita_mat_new(r, c);
+    t_lnf_poison(q + 16, r * r);
+    t_lnf_poison(rr + 16, r * c);
+    if (ganita_mat_qr(a, q, rr) != 0 - 2) { return 0; }
+    return t_lnf_untouched(q + 16, r * r) & t_lnf_untouched(rr + 16, r * c);
+}
+# least_squares: 1 when it returns -2 and leaves x unwritten.
+fn t_lnf_ls_refuses(a, b): i64 {
+    var c = ganita_mat_cols(a);
+    var x = alloc(c * 8);
+    t_lnf_poison(x, c);
+    if (ganita_mat_least_squares(a, b, x) != 0 - 2) { return 0; }
+    return t_lnf_untouched(x, c);
+}
+
+# eigen_sym. The infinite off-diagonal made eig_tol +inf: 0 rotations, the raw diagonal.
+assert_eq(t_lnf_eig_refuses(t_m2(t_d(2), LNF_PINF, LNF_PINF, t_d(3))), 1,
+  "eigen_sym -> -2 for [[2, +inf], [+inf, 3]] (was 0 with the raw diagonal (2, 3))");
+# A NaN at (0, 1) became row 0's recorded max and hid the finite 5 at (0, 2).
+assert_eq(t_lnf_eig_refuses(t_m3(t_d(1), LNF_NAN, t_d(5), LNF_NAN, t_d(2), t_d(0), t_d(5), t_d(0), t_d(3))), 1,
+  "eigen_sym -> -2 for [[1, NaN, 5], [NaN, 2, 0], [5, 0, 3]] (was 0 with (1, 2, 3))");
+assert_eq(t_lnf_eig_refuses(t_m2(t_d(2), LNF_NAN, LNF_NAN, t_d(3))), 1, "eigen_sym -> -2 for a NaN pair");
+assert_eq(t_lnf_eig_refuses(t_m3(t_d(4), t_d(1), t_d(0), t_d(1), t_d(3), t_d(0), t_d(0), t_d(0), LNF_NINF)), 1,
+  "eigen_sym -> -2 for -inf in the LAST entry");
+# A lower-triangle-only NaN: the rotations read both triangles, so the scan must too.
+assert_eq(t_lnf_eig_refuses(t_m3(t_d(4), t_d(1), t_d(1), t_d(1), t_d(3), t_d(1), LNF_NAN, t_d(1), t_d(2))), 1,
+  "eigen_sym -> -2 for a NaN in the lower triangle only");
+var LNF_EV = alloc(16);
+assert_eq(ganita_mat_eigen_sym(t_m2(t_d(2), t_d(1), t_d(1), t_d(3)), LNF_EV, ganita_mat_new(2, 2)) >= 0, 1,
+  "eigen_sym still decomposes the finite [[2, 1], [1, 3]]");
+
+# qr. Inf made qr_tol +inf: no reflector passed, Q = I and R = A, not triangular.
+assert_eq(t_lnf_qr_refuses(t_lnf_m32(t_d(1), t_d(2), t_d(3), t_d(4), t_d(5), LNF_PINF)), 1,
+  "qr -> -2 for +inf in the LAST entry of a 3x2 (was 0 with Q = I, R = A)");
+assert_eq(t_lnf_qr_refuses(t_lnf_m32(t_d(1), t_d(2), t_d(3), t_d(4), LNF_NAN, t_d(6))), 1,
+  "qr -> -2 for a NaN below the diagonal (its reflector was skipped)");
+assert_eq(t_lnf_qr_refuses(t_m2(LNF_NAN, t_d(2), t_d(3), t_d(4))), 1, "qr -> -2 for a NaN in the first entry");
+
+# least_squares. Inf solved the unreduced top triangle against b[0..n-1].
+var LNF_B = t_arr3(t_d(1), t_d(2), t_d(2));
+assert_eq(t_lnf_ls_refuses(t_lnf_m32(t_d(1), t_d(1), t_d(1), t_d(2), t_d(1), LNF_PINF), LNF_B), 1,
+  "least_squares -> -2 for +inf in A's last entry (was 0 with x = (0, 1))");
+assert_eq(t_lnf_ls_refuses(t_lnf_m32(t_d(1), t_d(1), LNF_NAN, t_d(2), t_d(1), t_d(3)), LNF_B), 1,
+  "least_squares -> -2 for a NaN below A's diagonal");
+var LNF_A31 = ganita_mat_new(3, 1);
+ganita_mat_set(LNF_A31, 0, 0, t_d(2)); ganita_mat_set(LNF_A31, 1, 0, LNF_NAN); ganita_mat_set(LNF_A31, 2, 0, t_d(1));
+assert_eq(t_lnf_ls_refuses(LNF_A31, t_arr3(t_d(4), t_d(1), t_d(1))), 1,
+  "least_squares -> -2 for a one-column A holding a NaN (was x = b0 / a00 = 2)");
+var LNF_A32 = t_lnf_m32(t_d(1), t_d(1), t_d(1), t_d(2), t_d(1), t_d(3));
+assert_eq(t_lnf_ls_refuses(LNF_A32, t_arr3(t_d(1), t_d(2), LNF_NAN)), 1,
+  "least_squares -> -2 for a NaN in b's last entry");
+assert_eq(t_lnf_ls_refuses(LNF_A32, t_arr3(LNF_NINF, t_d(2), t_d(2))), 1, "least_squares -> -2 for -inf in b");
+var LNF_X = alloc(16);
+assert_eq(ganita_mat_least_squares(LNF_A32, LNF_B, LNF_X), 0, "least_squares still fits the finite 3x2");
+
+# det: 0.0 is "singular", so a non-finite matrix must not get it.
+assert_eq(t_f64_is_nan(ganita_mat_det(t_m2(LNF_NAN, t_d(0), t_d(0), t_d(2)))), 1,
+  "det([[NaN, 0], [0, 2]]) is NaN (was 0.0, 'singular')");
+assert_eq(t_f64_is_nan(ganita_mat_det(t_m2(t_d(1), t_d(1), t_d(1), LNF_PINF))), 1,
+  "det is NaN for +inf in the last entry");
+assert_eq(ganita_mat_det(t_m2(t_d(1), t_d(2), t_d(2), t_d(4))), t_d(0),
+  "det of the finite singular [[1, 2], [2, 4]] is still 0.0");
+
+# lu / inv refused an infinity only while LINALG_EPS > 0; the scan makes it explicit.
+var LNF_LU = ganita_mat_new(2, 2);
+var LNF_PIV = alloc(16);
+t_lnf_poison(LNF_LU + 16, 4);
+t_lnf_poison(LNF_PIV, 2);
+assert_eq(ganita_mat_lu(t_m2(t_d(4), t_d(3), t_d(6), LNF_NAN), LNF_LU, LNF_PIV), 0,
+  "lu -> 0 for a NaN in the last entry");
+assert_eq(t_lnf_untouched(LNF_LU + 16, 4) & t_lnf_untouched(LNF_PIV, 2), 1,
+  "  ... and writes neither out_lu nor out_piv");
+var LNF_EPS_SAVED = LINALG_EPS;
+LINALG_EPS = 0;
+var LNF_LU0 = ganita_mat_lu(t_m2(LNF_PINF, t_d(1), t_d(1), t_d(1)), ganita_mat_new(2, 2), alloc(16));
+var LNF_INV0 = ganita_mat_inv(t_m2(LNF_PINF, t_d(1), t_d(1), t_d(1)));
+LINALG_EPS = LNF_EPS_SAVED;
+assert_eq(LNF_LU0, 0, "lu -> 0 for +inf even with LINALG_EPS = 0 (was 1)");
+assert_eq(LNF_INV0, 0, "inv -> null for +inf even with LINALG_EPS = 0 (was the finite [[0, -0], [0, 1]])");
+
+# lu_solve checks the factors it is handed.
+var LNF_A2 = t_m2(t_d(4), t_d(3), t_d(6), t_d(3));
+var LNF_F = ganita_mat_new(2, 2);
+var LNF_FP = alloc(16);
+ganita_mat_lu(LNF_A2, LNF_F, LNF_FP);
+var LNF_B2 = t_arr2(t_d(1), t_d(2));
+var LNF_X2 = alloc(16);
+assert_eq(ganita_mat_lu_solve(LNF_F, LNF_FP, LNF_B2, LNF_X2), 0, "lu_solve still solves from real factors");
+var LNF_FI = ganita_mat_copy(LNF_F);
+ganita_mat_set(LNF_FI, 1, 1, LNF_PINF);
+t_lnf_poison(LNF_X2, 2);
+assert_eq(ganita_mat_lu_solve(LNF_FI, LNF_FP, LNF_B2, LNF_X2), 0 - 2,
+  "lu_solve -> -2 for +inf on U's diagonal (was 0, x finite)");
+assert_eq(t_lnf_untouched(LNF_X2, 2), 1, "  ... and leaves x unwritten");
+var LNF_FZ = ganita_mat_copy(LNF_F);
+ganita_mat_set(LNF_FZ, 1, 1, t_d(0));
+assert_eq(ganita_mat_lu_solve(LNF_FZ, LNF_FP, LNF_B2, LNF_X2), 0 - 2,
+  "lu_solve -> -2 for a zero on U's diagonal (was a NaN x)");
+var LNF_FN = ganita_mat_copy(LNF_F);
+ganita_mat_set(LNF_FN, 1, 0, LNF_NAN);
+assert_eq(ganita_mat_lu_solve(LNF_FN, LNF_FP, LNF_B2, LNF_X2), 0 - 2, "lu_solve -> -2 for a NaN in L");
+assert_eq(ganita_mat_lu_solve(LNF_F, LNF_FP, t_arr2(t_d(1), LNF_NAN), LNF_X2), 0 - 2, "lu_solve -> -2 for a NaN in b");
+assert_eq(ganita_mat_lu_solve(LNF_F, t_arr2(0, 2), LNF_B2, LNF_X2), 0 - 2,
+  "lu_solve -> -2 for a pivot index outside [0, n) (was an out-of-bounds read of b)");
+assert_eq(ganita_mat_lu_solve(LNF_F, t_arr2(0, 0 - 1), LNF_B2, LNF_X2), 0 - 2,
+  "lu_solve -> -2 for a negative pivot index");
+# Non-square with a non-zero diagonal, so only the shape check can refuse it: n comes
+# from the rows, and a 2x3 lu would be indexed with the wrong row stride.
+var LNF_W23 = ganita_mat_new(2, 3);
+ganita_mat_set(LNF_W23, 0, 0, t_d(1)); ganita_mat_set(LNF_W23, 1, 1, t_d(1));
+assert_eq(ganita_mat_lu_solve(LNF_W23, LNF_FP, LNF_B2, LNF_X2), 0 - 2, "lu_solve -> -2 for a non-square lu");
+
+# cholesky: an infinite pivot was "positive" and zeroed its column of L.
+assert_eq(ganita_mat_cholesky(t_m2(LNF_PINF, t_d(2), t_d(2), t_d(3)), ganita_mat_new(2, 2)), 0,
+  "cholesky -> 0 for [[+inf, 2], [2, 3]] (was 1, 'positive definite')");
+assert_eq(ganita_mat_cholesky(t_m2(t_d(4), LNF_NAN, t_d(2), t_d(3)), ganita_mat_new(2, 2)), 0,
+  "cholesky -> 0 for a NaN in the never-read upper triangle");
+assert_eq(ganita_mat_cholesky(t_m3(t_d(4), t_d(2), t_d(2), t_d(2), t_d(5), t_d(3), t_d(2), t_d(3), LNF_PINF),
+    ganita_mat_new(3, 3)), 0, "cholesky -> 0 for +inf in the last entry");
+assert_eq(ganita_mat_cholesky(t_m2(t_d(4), t_d(2), t_d(2), t_d(3)), ganita_mat_new(2, 2)), 1,
+  "cholesky still factors the finite [[4, 2], [2, 3]]");
+
+# cholesky_solve: an infinite diagonal divided to 0 and decoupled x.
+var LNF_L = t_m2(t_d(2), t_d(0), t_d(1), LNF_PINF);
+var LNF_X3 = alloc(16);
+t_lnf_poison(LNF_X3, 2);
+var LNF_U0 = alloc_used();
+assert_eq(ganita_mat_cholesky_solve(LNF_L, LNF_B2, LNF_X3), 0 - 2,
+  "cholesky_solve -> -2 for +inf on L's diagonal (was 0, x finite)");
+assert_eq(t_lnf_untouched(LNF_X3, 2), 1, "  ... and leaves x unwritten");
+assert_eq(alloc_used() - LNF_U0, 0, "  ... and takes no scratch (the checks run before the allocation)");
+var LNF_LOK = t_m2(t_d(2), t_d(0), t_d(1), t_d(1));
+assert_eq(ganita_mat_cholesky_solve(LNF_LOK, t_arr2(t_d(1), LNF_PINF), LNF_X3), 0 - 2,
+  "cholesky_solve -> -2 for +inf in b");
+assert_eq(ganita_mat_cholesky_solve(t_m2(t_d(2), t_d(0), LNF_NAN, t_d(1)), LNF_B2, LNF_X3), 0 - 2,
+  "cholesky_solve -> -2 for a NaN below L's diagonal");
+assert_eq(ganita_mat_cholesky_solve(LNF_W23, LNF_B2, LNF_X3), 0 - 2, "cholesky_solve -> -2 for a non-square l");
+assert_eq(ganita_mat_cholesky_solve(LNF_LOK, LNF_B2, LNF_X3), 0, "cholesky_solve still solves with a finite L");
+
+# gaussian_elim: a NaN in the right-hand side returned 1; now it refuses like an infinity.
+var LNF_AUG = ganita_mat_new(2, 3);
+ganita_mat_set(LNF_AUG, 0, 0, t_d(2)); ganita_mat_set(LNF_AUG, 0, 1, t_d(1)); ganita_mat_set(LNF_AUG, 0, 2, LNF_NAN);
+ganita_mat_set(LNF_AUG, 1, 0, t_d(1)); ganita_mat_set(LNF_AUG, 1, 1, t_d(3)); ganita_mat_set(LNF_AUG, 1, 2, t_d(4));
+var LNF_AUGC = ganita_mat_copy(LNF_AUG);
+assert_eq(ganita_mat_gaussian_elim(LNF_AUG), 0, "gaussian_elim -> 0 for a NaN in the right-hand side (was 1)");
+assert_eq(load64(LNF_AUG + 16) == load64(LNF_AUGC + 16) && load64(LNF_AUG + 48) == load64(LNF_AUGC + 48), 1,
+  "  ... and leaves aug untouched");
+var LNF_AUGN = ganita_mat_copy(LNF_AUGC);
+ganita_mat_set(LNF_AUGN, 0, 2, t_d(5));
+ganita_mat_set(LNF_AUGN, 1, 1, LNF_NAN);
+assert_eq(ganita_mat_gaussian_elim(LNF_AUGN), 0, "gaussian_elim -> 0 for a NaN in A");
+assert_eq(ganita_mat_get(LNF_AUGN, 1, 2), t_d(4), "  ... without half-eliminating aug first");
+ganita_mat_set(LNF_AUGC, 0, 2, t_d(5));
+assert_eq(ganita_mat_gaussian_elim(LNF_AUGC), 1, "gaussian_elim still solves the finite system");
+
+# max_norm dropped a NaN row.
+assert_eq(t_f64_is_nan(ganita_mat_max_norm(t_m2(LNF_NAN, t_d(1), t_d(2), t_d(3)))), 1,
+  "max_norm([[NaN, 1], [2, 3]]) is NaN (was 5)");
+var LNF_ONE = ganita_mat_new(1, 1);
+ganita_mat_set(LNF_ONE, 0, 0, LNF_NAN);
+assert_eq(t_f64_is_nan(ganita_mat_max_norm(LNF_ONE)), 1, "max_norm([[NaN]]) is NaN (was 0.0)");
+assert_eq(ganita_mat_max_norm(t_m2(t_d(1), t_d(2), t_d(3), LNF_NINF)), LNF_PINF,
+  "max_norm with -inf is +inf, the norm");
+assert_eq(ganita_mat_max_norm(t_m2(t_d(1), t_d(0) - t_d(2), t_d(3), t_d(4))), t_d(7),
+  "max_norm of a finite 2x2 is unchanged");
+
+# frobenius: finite input that overflowed or underflowed when squared.
+assert_eq(ganita_mat_frobenius(t_m2(0x6974E718D7D7625A, 0x6974E718D7D7625A, t_d(0), t_d(0))), 0x697D8F9811335B57,
+  "frobenius of [[1e200, 1e200], [0, 0]] is 1e200 * sqrt(2) (was +inf)");
+assert_eq(ganita_mat_frobenius(t_m2(0x16687E92154EF7AC, 0x16687E92154EF7AC, t_d(0), t_d(0))), 0x167151F68876F410,
+  "frobenius of [[1e-200, 1e-200], [0, 0]] is 1e-200 * sqrt(2) (was 0)");
+assert_eq(ganita_mat_frobenius(t_m2(t_d(1), t_d(2), t_d(3), t_d(4))), 0x4015E8ADD236A58F,
+  "frobenius of [[1, 2], [3, 4]] is sqrt(30), the same bits as the plain sum");
+assert_eq(ganita_mat_frobenius(t_m2(t_d(1), t_d(2), t_d(3), LNF_PINF)), LNF_PINF, "frobenius with an infinity is +inf");
+assert_eq(t_f64_is_nan(ganita_mat_frobenius(t_m2(t_d(1), LNF_NAN, t_d(3), t_d(4)))), 1, "frobenius with a NaN is NaN");
+assert_eq(ganita_mat_frobenius(ganita_mat_new(2, 2)), t_d(0), "frobenius of the zero matrix is 0");
+
+# eq / is_symmetric: a NaN or +inf tolerance accepted anything.
+var LNF_P = t_m2(t_d(1), t_d(2), t_d(3), t_d(4));
+var LNF_Q = t_m2(t_d(5), t_d(0), t_d(6), t_d(1));
+assert_eq(ganita_mat_eq(LNF_P, LNF_Q, LNF_NAN), 0, "eq -> 0 under a NaN tolerance (was 1 for any two matrices)");
+assert_eq(ganita_mat_eq(LNF_P, LNF_Q, LNF_PINF), 0, "eq -> 0 under a +inf tolerance");
+assert_eq(ganita_mat_eq(LNF_P, LNF_P, f64_neg(t_d(1))), 0, "eq -> 0 under a negative tolerance");
+assert_eq(ganita_mat_eq(LNF_P, LNF_P, 0x8000000000000000), 1, "eq(A, A, -0.0) is 1: -0.0 is a zero tolerance");
+var LNF_PI = t_m2(LNF_PINF, t_d(2), t_d(3), t_d(4));
+assert_eq(ganita_mat_eq(LNF_PI, LNF_Q, f64_mul(LINALG_EPS, ganita_mat_frobenius(LNF_PI))), 0,
+  "eq -> 0 with tol = LINALG_EPS * frobenius of a matrix holding +inf (was 1)");
+assert_eq(ganita_mat_eq(LNF_PI, LNF_PI, t_tol()), 0,
+  "eq -> 0 for an infinity, even against itself (fails closed like NaN)");
+var LNF_BIG = t_m2(0x6974E718D7D7625A, t_d(1), t_d(2), t_d(3));
+var LNF_BIGTOL = f64_mul(LINALG_EPS, ganita_mat_frobenius(LNF_BIG));
+assert_eq(ganita_mat_eq(LNF_BIG, t_m2(f64_neg(t_d(1)), t_d(1), t_d(2), t_d(3)), LNF_BIGTOL), 0,
+  "eq -> 0 for [[1e200, ...]] vs [[-1, ...]] under LINALG_EPS * frobenius (the norm overflowed to +inf)");
+assert_eq(ganita_mat_is_symmetric(LNF_P, LNF_NAN), 0, "is_symmetric -> 0 under a NaN tolerance (was 1)");
+assert_eq(ganita_mat_is_symmetric(LNF_P, LNF_PINF), 0, "is_symmetric -> 0 under a +inf tolerance");
+assert_eq(ganita_mat_is_symmetric(t_m2(LNF_NAN, t_d(1), t_d(1), t_d(2)), t_tol()), 0,
+  "is_symmetric -> 0 for a NaN on the diagonal (its doc always said so)");
+var LNF_ASYM = t_m2(LNF_NAN, t_d(1), t_d(4), t_d(2));
+assert_eq(ganita_mat_is_symmetric(LNF_ASYM, f64_mul(LINALG_EPS, ganita_mat_frobenius(LNF_ASYM))), 0,
+  "is_symmetric -> 0 for the ASYMMETRIC [[NaN, 1], [4, 2]] under LINALG_EPS * frobenius (was 1)");
+assert_eq(ganita_mat_is_symmetric(t_m2(t_d(1), LNF_PINF, LNF_PINF, t_d(3)), t_tol()), 0,
+  "is_symmetric -> 0 for mirrored infinities (they passed only because |inf - inf| is NaN)");
+# A 1x1 has no pair to compare, so only the tolerance check can refuse it.
+var LNF_11 = ganita_mat_new(1, 1);
+ganita_mat_set(LNF_11, 0, 0, t_d(5));
+assert_eq(ganita_mat_is_symmetric(LNF_11, f64_neg(t_d(1))), 0, "is_symmetric([[5]], tol = -1) is 0 (was 1)");
+assert_eq(ganita_mat_is_symmetric(LNF_11, t_tol()), 1, "is_symmetric([[5]], 1e-9) is 1");
+assert_eq(ganita_mat_is_symmetric(t_m2(t_d(1), t_d(2), t_d(2), t_d(1)), 0x8000000000000000), 1,
+  "is_symmetric of a symmetric 2x2 at tol -0.0 is 1");
+# The two predicates every guard above goes through, called directly. _linalg_all_finite reads the
+# exponent bits: a NaN of any sign or kind, or an infinity, among the n words refuses; 0, -0.0, a
+# subnormal and +-DBL_MAX are finite, and so are no words at all. _linalg_tol_ok takes a tolerance that
+# is finite and not negative, -0.0 included.
+var LNF_FW = alloc(48);
+store64(LNF_FW, t_d(1));
+store64(LNF_FW + 8, 0x8000000000000000);
+store64(LNF_FW + 16, 1);
+store64(LNF_FW + 24, 0x7FEFFFFFFFFFFFFF);
+store64(LNF_FW + 32, 0xFFEFFFFFFFFFFFFF);
+store64(LNF_FW + 40, 0);
+assert_eq(_linalg_all_finite(LNF_FW, 6), 1, "_linalg_all_finite: 1, -0.0, a subnormal, +-DBL_MAX and 0 are finite");
+assert_eq(_linalg_all_finite(LNF_FW, 0), 1, "_linalg_all_finite: no words at all is finite");
+store64(LNF_FW + 40, 0x7FF0000000000001);
+assert_eq(_linalg_all_finite(LNF_FW, 6), 0, "_linalg_all_finite: a signalling NaN in the last word refuses");
+assert_eq(_linalg_all_finite(LNF_FW, 5), 1, "  ... and n stops the scan before it");
+store64(LNF_FW + 40, 0xFFF8000000000000);
+assert_eq(_linalg_all_finite(LNF_FW, 6), 0, "_linalg_all_finite: a negative NaN refuses");
+store64(LNF_FW + 40, LNF_NINF);
+assert_eq(_linalg_all_finite(LNF_FW, 6), 0, "_linalg_all_finite: -inf refuses");
+store64(LNF_FW, LNF_PINF);
+assert_eq(_linalg_all_finite(LNF_FW, 1), 0, "_linalg_all_finite: +inf in the first word refuses");
+assert_eq(_linalg_tol_ok(0), 1, "_linalg_tol_ok: 0 is a tolerance");
+assert_eq(_linalg_tol_ok(0x8000000000000000), 1, "_linalg_tol_ok: -0.0 is a tolerance (it is 0)");
+assert_eq(_linalg_tol_ok(1), 1, "_linalg_tol_ok: the smallest subnormal is a tolerance");
+assert_eq(_linalg_tol_ok(0x7FEFFFFFFFFFFFFF), 1, "_linalg_tol_ok: DBL_MAX is a tolerance");
+assert_eq(_linalg_tol_ok(0x8000000000000001), 0, "_linalg_tol_ok: the smallest negative is not");
+assert_eq(_linalg_tol_ok(LNF_PINF), 0, "_linalg_tol_ok: +inf is not");
+assert_eq(_linalg_tol_ok(LNF_NAN), 0, "_linalg_tol_ok: NaN is not");
+assert_eq(_linalg_tol_ok(0xFFF8000000000000), 0, "_linalg_tol_ok: -NaN is not");
+
+test_group("SVD: one-sided Jacobi on a pivoted QR — every finite input decomposes (1.2.12)");
+# hisab 3.3.3 found ganita_mat_svd returning -1, "did not converge", for finite matrices that have an
+# SVD: square matrices with a zero or repeated row, column pairs that needed a very small rotation,
+# and a rounding-level two-cycle (docs/development/issues/2026-10-03-mat-svd-no-convergence-on-tiny-
+# columns.md). 1.2.12 runs the Jacobi on R^T from a Householder QR with column AND row pivoting (a
+# second QR first for n >= 4); see ganita_mat_svd.
+#
+# Every row runs ganita_mat_svd and the values-only path _linalg_svd_impl(A, 0, s, 0, 0), all
+# out-params poisoned first, and checks the result against the EXACT singular values — computed from
+# the bits of A with Python Fractions and mpmath, certified, and rounded once (the oracle of
+# scripts/svdh) — under the row's bounds, in u = 2^-52:
+#   - status 0, and the values-only path gives the same status and the same sigma bits;
+#   - sigma descending and never negative, each within the bound of the exact one, in u·sigma_1;
+#   - U's columns for a non-zero sigma (a subnormal one's too), and V^T's rows, orthonormal to the
+#     bound;
+#   - U·diag(sigma)·V^T = A to the bound, in u·sigma_1.
+# Graded rows assert RELATIVE accuracy as well, where the pivoting is there to give it. A bound is
+# about twice what 1.2.12 measures, rounded up to a power of two and at least 1 u; a failing bound
+# prints the measurement as "got" (999999999 for NaN or an infinity). The measures use error-free
+# transformations — TwoSum, Dekker's TwoProduct — so they report the SVD's error, not the test's
+# own: a plain 512-term dot product can be off by 256 u.
+#
+# -3 (the sweeps did not converge) is NOT tested: no finite input is known to reach it (see
+# ganita_mat_svd for what was measured), and a test that forced it would test the forcing. rank and
+# condition pass the SVD's status through; that is pinned below for -2.
+var SV12_ST = 0;
+var SV12_S = 0;
+var SV12_U = 0;
+var SV12_VT = 0;
+var SV12_VO = 0;
+var SV12_DESC = 0;
+var SV12_U0 = 0;
+var SV12_ES = 0;
+var SV12_EU = 0;
+var SV12_EV = 0;
+var SV12_ER = 0;
+var SV12_AS = 0;
+var SV12_AC = 0;
+var SV12_LCG = 0;
+var SV12_NAN = 0x7FF8000000000000;
+var SV12_EPS = 0x3CB0000000000000;
+# An array of n words, rounded up to whole groups of four so t_sv12_put4 can fill it.
+fn t_sv12_arr(n): i64 { return alloc(((n + 3) / 4) * 32); }
+# Store the words a, b, c, d at p[k], p[k+1], p[k+2], p[k+3] (a matrix's row-major data is at m + 16).
+fn t_sv12_put4(p, k, a, b, c, d): i64 {
+    store64(p + k * 8, a);
+    store64(p + k * 8 + 8, b);
+    store64(p + k * 8 + 16, c);
+    store64(p + k * 8 + 24, d);
+    return 0;
+}
+# The double nearest n/d: IEEE division rounds once, as Python's literal 1.3 does.
+fn t_sv12_q(n, d): i64 { return f64_div(f64_from(n), f64_from(d)); }
+# 2^e as its bit pattern, for -1022 <= e <= 1023.
+fn t_sv12_p2(e): i64 { return (e + 1023) << 52; }
+# The next entry from the test generator, a 64-bit LCG (Knuth's MMIX constants): k, the 20 bits under
+# its top 4, gives k/2^18 - 2, exact and in [-2, 2). The oracle side generates the same entries.
+fn t_sv12_next(): i64 {
+    SV12_LCG = SV12_LCG * 0x5851F42D4C957F2D + 0x14057B7EF767814F;
+    return t_sv12_q(((SV12_LCG >> 40) & 0xFFFFF) - 524288, 262144);
+}
+# An m×n matrix of t_sv12_next entries from seed s, filled row by row.
+fn t_sv12_gen(s, m, n): i64 {
+    SV12_LCG = s;
+    var a = ganita_mat_new(m, n);
+    var i = 0;
+    while (i < m * n) {
+        store64(a + 16 + i * 8, t_sv12_next());
+        i = i + 1;
+    }
+    return a;
+}
+# t_sv12_gen(s, m, n) with row i multiplied by 2^-g, g = floor(span·((7·i) mod m) / (m - 1)): the
+# rows are graded over `span` binades in a shuffled order (exactly: every entry stays normal).
+fn t_sv12_rowgrad(s, m, n, span): i64 {
+    var a = t_sv12_gen(s, m, n);
+    var i = 0;
+    while (i < m) {
+        var g = (span * ((7 * i) % m)) / (m - 1);
+        var j = 0;
+        while (j < n) {
+            ganita_mat_set(a, i, j, f64_mul(ganita_mat_get(a, i, j), t_sv12_p2(0 - g)));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return a;
+}
+# The filing's family A(t) = [[1, t], [t, t], [t, -t]]; -t flips the sign bit.
+fn t_sv12_fam(t): i64 {
+    return t_lnf_m32(0x3FF0000000000000, t, t, t, t, t ^ 0x8000000000000000);
+}
+# Start the compensated sum at x.
+fn t_sv12_acc0(x): i64 {
+    SV12_AS = x;
+    SV12_AC = 0;
+    return 0;
+}
+# Add x to the compensated sum: Knuth's TwoSum puts the addition's exact rounding error in SV12_AC.
+fn t_sv12_acc(x): i64 {
+    var s = f64_add(SV12_AS, x);
+    var bb = f64_sub(s, SV12_AS);
+    var e = f64_add(f64_sub(SV12_AS, f64_sub(s, bb)), f64_sub(x, bb));
+    SV12_AS = s;
+    SV12_AC = f64_add(SV12_AC, e);
+    return 0;
+}
+# The exact rounding error of fl(a·b), by Dekker's TwoProduct on Veltkamp's split at 2^27 + 1; the
+# operands here are at most a few units, far from over- and underflow.
+fn t_sv12_perr(a, b): i64 {
+    var p = f64_mul(a, b);
+    var ca = f64_mul(0x41A0000002000000, a);
+    var ah = f64_sub(ca, f64_sub(ca, a));
+    var al = f64_sub(a, ah);
+    var cb = f64_mul(0x41A0000002000000, b);
+    var bh = f64_sub(cb, f64_sub(cb, b));
+    var bl = f64_sub(b, bh);
+    return f64_add(f64_add(f64_add(f64_sub(f64_mul(ah, bh), p), f64_mul(ah, bl)), f64_mul(al, bh)), f64_mul(al, bl));
+}
+# Add a·b to the compensated sum, the product's rounding error included.
+fn t_sv12_accp(a, b): i64 {
+    t_sv12_acc(f64_mul(a, b));
+    SV12_AC = f64_add(SV12_AC, t_sv12_perr(a, b));
+    return 0;
+}
+# The larger of two measures; a NaN on either side wins, so a NaN result can never pass.
+fn t_sv12_max(a, b): i64 {
+    if ((t_f64_is_nan(a) == 1) || (t_f64_is_nan(b) == 1)) { return SV12_NAN; }
+    if (f64_gt(b, a) == 1) { return b; }
+    return a;
+}
+# Run ganita_mat_svd and the values-only path on a, every out-param poisoned first, and measure the
+# result against `want` (the exact sigma, rounded once): fills SV12_*. Everything is first scaled by
+# 2^-e, e the exponent of the exact sigma_1 — exact — so the measures stay far from over- and
+# underflow whatever A's magnitude.
+fn t_sv12_run(a, want): i64 {
+    var m = ganita_mat_rows(a);
+    var n = ganita_mat_cols(a);
+    var u = ganita_mat_new(m, n);
+    var vt = ganita_mat_new(n, n);
+    var s = alloc(n * 8);
+    var s2 = alloc(n * 8);
+    t_nf_poison(u + 16, m * n);
+    t_nf_poison(vt + 16, n * n);
+    t_nf_poison(s, n);
+    t_nf_poison(s2, n);
+    SV12_ST = ganita_mat_svd(a, u, s, vt);
+    SV12_S = s;
+    SV12_U = u;
+    SV12_VT = vt;
+    SV12_VO = 0;
+    if (_linalg_svd_impl(a, 0, s2, 0, 0) == SV12_ST) { SV12_VO = memeq(s, s2, n * 8); }
+    SV12_ES = SV12_NAN;
+    SV12_EU = SV12_NAN;
+    SV12_EV = SV12_NAN;
+    SV12_ER = SV12_NAN;
+    SV12_DESC = 0;
+    SV12_U0 = 0;
+    if (SV12_ST != 0) { return SV12_ST; }
+    var e = ((load64(want) >> 52) & 0x7FF) - 1023;
+    if (e > 1022) { e = 1022; }
+    var g = t_sv12_p2(0 - e);
+    var den = f64_mul(f64_mul(load64(want), g), SV12_EPS);
+    var mx = 0;
+    var i = 0;
+    var j = 0;
+    var k = 0;
+    SV12_DESC = 1;
+    while (i < n) {
+        var si = load64(s + i * 8);
+        if (f64_ge(si, 0) == 0) { SV12_DESC = 0; }
+        if (i > 0) {
+            if (f64_ge(load64(s + (i - 1) * 8), si) == 0) { SV12_DESC = 0; }
+        }
+        mx = t_sv12_max(mx, f64_abs(f64_sub(f64_mul(si, g), f64_mul(load64(want + i * 8), g))));
+        i = i + 1;
+    }
+    SV12_ES = f64_div(mx, den);
+    # U: every column whose sigma is not 0, a subnormal sigma's included (1.2.12; see _linalg_svd_reorth).
+    mx = 0;
+    i = 0;
+    while (i < n) {
+        j = i;
+        while (j < n) {
+            if (((load64(s + i * 8) & 0x7FFFFFFFFFFFFFFF) != 0) && ((load64(s + j * 8) & 0x7FFFFFFFFFFFFFFF) != 0)) {
+                t_sv12_acc0(0);
+                if (i == j) { t_sv12_acc0(0xBFF0000000000000); }
+                k = 0;
+                while (k < m) {
+                    t_sv12_accp(ganita_mat_get(u, k, i), ganita_mat_get(u, k, j));
+                    k = k + 1;
+                }
+                mx = t_sv12_max(mx, f64_abs(f64_add(SV12_AS, SV12_AC)));
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    SV12_EU = f64_div(mx, SV12_EPS);
+    mx = 0;
+    i = 0;
+    while (i < n) {
+        j = i;
+        while (j < n) {
+            t_sv12_acc0(0);
+            if (i == j) { t_sv12_acc0(0xBFF0000000000000); }
+            k = 0;
+            while (k < n) {
+                t_sv12_accp(ganita_mat_get(vt, i, k), ganita_mat_get(vt, j, k));
+                k = k + 1;
+            }
+            mx = t_sv12_max(mx, f64_abs(f64_add(SV12_AS, SV12_AC)));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    SV12_EV = f64_div(mx, SV12_EPS);
+    SV12_U0 = 1;
+    j = 0;
+    while (j < n) {
+        if ((load64(s + j * 8) & 0x7FFFFFFFFFFFFFFF) == 0) {
+            k = 0;
+            while (k < m) {
+                if ((ganita_mat_get(u, k, j) & 0x7FFFFFFFFFFFFFFF) != 0) { SV12_U0 = 0; }
+                k = k + 1;
+            }
+        }
+        j = j + 1;
+    }
+    # A - U·diag(sigma)·V^T, entry by entry: each term U_ik·sigma_k·V^T_kj with both products'
+    # rounding errors carried.
+    mx = 0;
+    i = 0;
+    while (i < m) {
+        j = 0;
+        while (j < n) {
+            t_sv12_acc0(f64_neg(f64_mul(ganita_mat_get(a, i, j), g)));
+            k = 0;
+            while (k < n) {
+                var uik = ganita_mat_get(u, i, k);
+                var sk = f64_mul(load64(s + k * 8), g);
+                var vkj = ganita_mat_get(vt, k, j);
+                t_sv12_accp(f64_mul(uik, sk), vkj);
+                SV12_AC = f64_add(SV12_AC, f64_mul(t_sv12_perr(uik, sk), vkj));
+                k = k + 1;
+            }
+            mx = t_sv12_max(mx, f64_abs(f64_add(SV12_AS, SV12_AC)));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    SV12_ER = f64_div(mx, den);
+    return 0;
+}
+# The largest relative error |sigma_i - exact_i| / exact_i of the last run over lo <= i < hi, in u;
+# an exact_i of 0 asks for sigma_i to be 0 exactly.
+fn t_sv12_rel(want, lo, hi): i64 {
+    var mx = 0;
+    var i = lo;
+    while (i < hi) {
+        var w = load64(want + i * 8);
+        var d = f64_abs(f64_sub(load64(SV12_S + i * 8), w));
+        if (w == 0) {
+            if ((d & 0x7FFFFFFFFFFFFFFF) != 0) { mx = SV12_NAN; }
+        }
+        if (w != 0) { mx = t_sv12_max(mx, f64_div(f64_div(d, w), SV12_EPS)); }
+        i = i + 1;
+    }
+    return mx;
+}
+# How many of the last run's n sigma differ from `want` in any bit.
+fn t_sv12_diff(want, n): i64 {
+    var c = 0;
+    var i = 0;
+    while (i < n) {
+        if (load64(SV12_S + i * 8) != load64(want + i * 8)) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+# 0 when the measure x (an f64 in u) is within b u; otherwise x rounded up, which assert_eq prints as
+# "got", or 999999999 for NaN or an infinity.
+fn t_sv12_over(x, b): i64 {
+    if (f64_le(x, f64_from(b)) == 1) { return 0; }
+    if (f64_lt(x, 0x43E0000000000000) == 1) { return f64_to(x) + 1; }
+    return 999999999;
+}
+# label followed by text, as a new C string.
+fn t_sv12_msg(label, text): i64 {
+    var a = strlen(label);
+    var b = strlen(text);
+    var p = alloc(a + b + 1);
+    memcpy(p, label, a);
+    memcpy(p + a, text, b);
+    store8(p + a + b, 0);
+    return p;
+}
+# Run a through t_sv12_run and assert what every row asserts, under the row's bounds in u: bs for
+# sigma and br for U·diag(sigma)·V^T, both relative to sigma_1; bu for U, bv for V^T.
+fn t_sv12_row(label, a, want, bs, bu, bv, br): i64 {
+    t_sv12_run(a, want);
+    assert_eq(SV12_ST, 0, t_sv12_msg(label, ": ganita_mat_svd returns 0"));
+    assert_eq(SV12_VO, 1, t_sv12_msg(label, ": the values-only path returns the same status and sigma bits"));
+    assert_eq(SV12_DESC, 1, t_sv12_msg(label, ": sigma is descending and never negative"));
+    assert_eq(t_sv12_over(SV12_ES, bs), 0, t_sv12_msg(label, ": sigma within its bound of exact (got: u*sigma_1)"));
+    assert_eq(t_sv12_over(SV12_EU, bu), 0, t_sv12_msg(label, ": U's columns for non-zero sigma orthonormal (got: u)"));
+    assert_eq(t_sv12_over(SV12_EV, bv), 0, t_sv12_msg(label, ": V^T orthonormal (got: u)"));
+    assert_eq(t_sv12_over(SV12_ER, br), 0, t_sv12_msg(label, ": U * diag(sigma) * V^T = A (got: u*sigma_1)"));
+    return 0;
+}
+
+# The filing's family A(t) = [[1, t], [t, t], [t, -t]]: zeta^2 overflowed and t became 0 (branch 1).
+# sigma_2 is about sqrt(2)·t, so the rows also ask for it relatively: each sigma within 4 u of the
+# exact one, which for A5's 2^-1074 means exactly. 1.2.11: -1 for all four.
+var SV12_W = t_sv12_arr(2);
+t_sv12_put4(SV12_W, 0, 0x3FF0000000000000, 0x1FE6A09E667F3BCD, 0, 0);
+t_sv12_row("A1 = A(2^-513)", t_sv12_fam(0x1FE0000000000000), SV12_W, 1, 2, 1, 1);
+assert_eq(t_sv12_over(t_sv12_rel(SV12_W, 0, 2), 4), 0, "A1: both sigma within 4 u of exact, relatively");
+SV12_W = t_sv12_arr(2);
+t_sv12_put4(SV12_W, 0, 0x3FF0000000000000, 0x1E137CC152F76F67, 0, 0);
+t_sv12_row("A4 = A(1.72 * 2^-543)", t_sv12_fam(0x1E0B8F2A4C1D3E57), SV12_W, 1, 2, 1, 1);
+assert_eq(t_sv12_over(t_sv12_rel(SV12_W, 0, 2), 4), 0, "A4: both sigma within 4 u of exact, relatively");
+SV12_W = t_sv12_arr(2);
+t_sv12_put4(SV12_W, 0, 0x3FF0000000000000, 0x0000000000000001, 0, 0);
+t_sv12_row("A5 = A(2^-1074)", t_sv12_fam(0x0000000000000001), SV12_W, 1, 1, 1, 1);
+assert_eq(t_sv12_over(t_sv12_rel(SV12_W, 0, 2), 4), 0, "A5: both sigma within 4 u of exact, relatively");
+SV12_W = t_sv12_arr(2);
+t_sv12_put4(SV12_W, 0, 0x3FF0000000000000, 0x001058E43F6FA300, 0, 0);
+t_sv12_row("A6 = A(1.6e-308)", t_sv12_fam(0x000B8F2A4C1D3E57), SV12_W, 1, 1, 1, 1);
+assert_eq(t_sv12_over(t_sv12_rel(SV12_W, 0, 2), 4), 0, "A6: both sigma within 4 u of exact, relatively");
+
+# B1 and B2, the measured witnesses of branch 2: a column's squared norm underflowed and the
+# orthogonality threshold with it. 1.2.11: -1.
+SV12_W = t_sv12_arr(2);
+t_sv12_put4(SV12_W, 0, 0x6FCB799CC80A713E, 0x4B3326815FE2FA41, 0, 0);
+t_sv12_row("B1", t_lnf_m32(0xCB3326815FE2FA41, 0x6C7B1009E69DC636, 0, 0x6FCB799CC80A713E, 0xC78D2DAD93DD5D23,
+    0x5B82A0E6E26B85A5), SV12_W, 1, 1, 1, 1);
+assert_eq(t_sv12_over(t_sv12_rel(SV12_W, 0, 2), 4), 0, "B1: both sigma within 4 u of exact, relatively");
+SV12_W = t_sv12_arr(2);
+t_sv12_put4(SV12_W, 0, 0x35DAC74898CD0527, 0x0C56594A23EF8276, 0, 0);
+t_sv12_row("B2", t_lnf_m32(0x89F0481668FD9259, 0xB5DAC74898CD0527, 0x03B8DFFBAEE26112, 0x29858E6E791CDEE9,
+    0x0C56594A23EF8276, 0x1CE65B0EE8C8430C), SV12_W, 1, 1, 1, 1);
+assert_eq(t_sv12_over(t_sv12_rel(SV12_W, 0, 2), 4), 0, "B2: both sigma within 4 u of exact, relatively");
+
+# Branch 3, a null column that the rotations wore down but kept nearly parallel to its partner: the
+# filing's zero-row Z and the repeated-row R. sigma_3 is exactly 0, so its U column must be all zero
+# (ganita's convention) and V's third column comes from _linalg_svd_complete. 1.2.11: -1, and rank -1,
+# condition NaN, pseudo_inv null.
+var SV12_Z = t_m3(t_sv12_q(13, 10), t_sv12_q(27, 10), t_sv12_q(4, 10), t_d(0), t_d(0), t_d(0),
+  t_sv12_q(9, 10), t_sv12_q(11, 10), t_sv12_q(23, 10));
+SV12_W = t_sv12_arr(3);
+t_sv12_put4(SV12_W, 0, 0x400D3FB1257408C4, 0x3FFC17E03945F102, 0, 0);
+t_sv12_row("Z = [[1.3, 2.7, 0.4], [0, 0, 0], [0.9, 1.1, 2.3]]", SV12_Z, SV12_W, 2, 2, 2, 1);
+assert_eq(load64(SV12_S + 16), 0, "Z: sigma_3 is exactly 0");
+assert_eq(SV12_U0, 1, "Z: the U column of the zero sigma is all zero");
+var SV12_R = t_m3(t_d(1), t_d(2), t_d(3), t_d(1), t_d(2), t_d(3), t_d(4), t_d(5), t_d(6));
+SV12_W = t_sv12_arr(3);
+t_sv12_put4(SV12_W, 0, 0x4024646BB0023E7B, 0x3FF04ECE4EBDCE2C, 0, 0);
+t_sv12_row("R = [[1, 2, 3], [1, 2, 3], [4, 5, 6]]", SV12_R, SV12_W, 2, 1, 4, 1);
+assert_eq(load64(SV12_S + 16), 0, "R: sigma_3 is exactly 0");
+assert_eq(SV12_U0, 1, "R: the U column of the zero sigma is all zero");
+
+# Branch 4, the full-rank 5×4 whose gamma flipped sign at a fixed magnitude just above the 2^-52
+# threshold: a rounding-level two-cycle. Also at 2^-827, where every entry and sigma is the same
+# mantissa: a power-of-two scaling must scale sigma exactly. 1.2.11: -1 at both scales.
+var SV12_W54 = ganita_mat_new(5, 4);
+t_sv12_put4(SV12_W54 + 16, 0, 0xBFC2CACD2BBA2BFC, 0x3FF436F97395FC68, 0xC00807F8A62BF805, 0x3FF337DF0357C8C9);
+t_sv12_put4(SV12_W54 + 16, 4, 0x3FEFD315ACC77FE7, 0xBFA1614B40EA6CC2, 0xC0295CEBBFDDBB61, 0xBFC32AF6F3470282);
+t_sv12_put4(SV12_W54 + 16, 8, 0xBFD6269DC8658203, 0xC025B46BF0A392B4, 0x3FC03FF652EED9BF, 0);
+t_sv12_put4(SV12_W54 + 16, 12, 0x3FDF9160669D391A, 0x3FCC98B730A0D724, 0xBFBC46376FF5E5C4, 0x3FC92A56372A02BB);
+t_sv12_put4(SV12_W54 + 16, 16, 0xC02551ACEC11860F, 0x400130C3519E4F30, 0x3FC6D251F22A1E9B, 0x3FE9E1EFC1AEB952);
+SV12_W = t_sv12_arr(4);
+t_sv12_put4(SV12_W, 0, 0x402A55180C7066EC, 0x402793D5C3F35250, 0x4023BC5D726B72E5, 0x3FF2F035DF06D48A);
+t_sv12_row("W54", SV12_W54, SV12_W, 4, 2, 16, 8);
+var SV12_S54 = SV12_S;
+var SV12_W54S = ganita_mat_new(5, 4);
+var sv12i = 0;
+while (sv12i < 20) {
+    store64(SV12_W54S + 16 + sv12i * 8, f64_mul(load64(SV12_W54 + 16 + sv12i * 8), t_sv12_p2(0 - 827)));
+    sv12i = sv12i + 1;
+}
+SV12_W = t_sv12_arr(4);
+t_sv12_put4(SV12_W, 0, 0x0C7A55180C7066EC, 0x0C7793D5C3F35250, 0x0C73BC5D726B72E5, 0x0C42F035DF06D48A);
+t_sv12_row("W54 * 2^-827", SV12_W54S, SV12_W, 4, 2, 16, 8);
+sv12i = 0;
+var sv12same = 0;
+while (sv12i < 4) {
+    if (load64(SV12_S + sv12i * 8) == f64_mul(load64(SV12_S54 + sv12i * 8), t_sv12_p2(0 - 827))) {
+        sv12same = sv12same + 1;
+    }
+    sv12i = sv12i + 1;
+}
+assert_eq(sv12same, 4, "W54 * 2^-827: every sigma is W54's times 2^-827, bit for bit");
+
+# Graded 5×4 from the harness corpus (id 18924, rows spread over 593 binades). 1.2.11 returned 0 for
+# it with two U columns at cosine 0.99999999 (4.5e15 u from orthogonal) and sigma_4 10^4 times too
+# large: the dot products of graded columns underflowed. 1.2.12 gets every sigma to 1 u, relatively.
+var SV12_G5 = ganita_mat_new(5, 4);
+t_sv12_put4(SV12_G5 + 16, 0, 0xBFB41ACB5FB3A786, 0xBFD519B23B7E72F7, 0x3FCB1CD76D2792D2, 0x3FBDE9A797312740);
+t_sv12_put4(SV12_G5 + 16, 4, 0xA372CABCAA7E01C1, 0x2354BCAC8B19D828, 0x2366C9489175EA54, 0xA37580166DA16365);
+t_sv12_put4(SV12_G5 + 16, 8, 0x9C46FC5EAECA5240, 0x9C17DBC502F63608, 0x1C109B4AED3CB856, 0x1C309B77A2BDC1AB);
+t_sv12_put4(SV12_G5 + 16, 12, 0x1ACAAC057D260C8F, 0x9AE727B76A763AD7, 0x1ABB512EF486433B, 0x1AB258D1EEEC1510);
+t_sv12_put4(SV12_G5 + 16, 16, 0x1AB5224165320F7C, 0x9AB4ADF6A1DFA2A0, 0x1AD51956AB0F6953, 0x9AA01444269B84BE);
+SV12_W = t_sv12_arr(4);
+t_sv12_put4(SV12_W, 0, 0x3FDAA638DFB5A258, 0x237F2B0258119399, 0x1C44D51BF78DE570, 0x1AD5659B26AB195C);
+t_sv12_row("graded 5x4 (corpus 18924)", SV12_G5, SV12_W, 1, 2, 8, 2);
+assert_eq(t_sv12_over(t_sv12_rel(SV12_W, 0, 4), 2), 0,
+  "graded 5x4: every sigma relatively accurate (1.2.11: sigma_4 off by 4e19 ulps)");
+
+# The square zero-row and repeated-row class, random entries in [-2, 2): 1.2.11 failed 500 of 500 at
+# 6×6 and 10×10. ZR10's zero sigma is exactly 0 with an all-zero U column; RR6's comes out at rounding
+# level, as a backward-stable SVD may return it.
+var SV12_ZR = t_sv12_gen(1, 10, 10);
+sv12i = 0;
+while (sv12i < 10) {
+    ganita_mat_set(SV12_ZR, 3, sv12i, 0);
+    sv12i = sv12i + 1;
+}
+SV12_W = t_sv12_arr(10);
+t_sv12_put4(SV12_W, 0, 0x4017D56C9ACC6DB4, 0x40124925DF288048, 0x40117D4745DA5E25, 0x401040A7744CE6B8);
+t_sv12_put4(SV12_W, 4, 0x400C4D07C32A8BCD, 0x4007BB09635064E6, 0x3FF7875FE66615C0, 0x3FF2C131C565D04F);
+t_sv12_put4(SV12_W, 8, 0x3FCA912806B1B509, 0, 0, 0);
+t_sv12_row("10x10 with row 3 zero", SV12_ZR, SV12_W, 8, 4, 16, 8);
+assert_eq(load64(SV12_S + 72), 0, "10x10 zero row: sigma_10 is exactly 0");
+assert_eq(SV12_U0, 1, "10x10 zero row: the U column of the zero sigma is all zero");
+var SV12_RR = t_sv12_gen(2, 6, 6);
+sv12i = 0;
+while (sv12i < 6) {
+    ganita_mat_set(SV12_RR, 5, sv12i, ganita_mat_get(SV12_RR, 0, sv12i));
+    sv12i = sv12i + 1;
+}
+SV12_W = t_sv12_arr(6);
+t_sv12_put4(SV12_W, 0, 0x4014312DE1CD2B8E, 0x400D4DA91344F1DD, 0x4001DD3BCA6D3E35, 0x3FF9D74EE6179F41);
+t_sv12_put4(SV12_W, 4, 0x3FEE8DB4B257BB34, 0, 0, 0);
+t_sv12_row("6x6 with row 6 = row 1", SV12_RR, SV12_W, 2, 4, 8, 4);
+
+# The adversarial sets built against the 1.2.12 candidates. adv2 #0, a 3×3 whose first row is 2^1048
+# above the other two: candidate B, plain Jacobi with scaled columns, returned -3. sigma_2 and sigma_3
+# are 2^-1047 of sigma_1, invisible normwise, so they are asked for relatively (candidate A zeroed
+# sigma_3).
+SV12_W = t_sv12_arr(3);
+t_sv12_put4(SV12_W, 0, 0x5BABEA32092262B6, 0x1A3392EAAD658024, 0x1A21E0C6043F9E7E, 0);
+t_sv12_row("adv2 #0 (3x3, rows 2^1048 apart)", t_m3(0xDB940400280C8DDB, 0xDB96C286A0074337, 0x5BA7716E193B4D95,
+    0x1A1C558550000000, 0x1A11FFA9B0000000, 0x1A37511650000000, 0x9A150C4570000000, 0x1A1D7A3B90000000,
+    0x99D2B47700000000), SV12_W, 2, 2, 2, 1);
+assert_eq(t_sv12_over(t_sv12_rel(SV12_W, 1, 3), 16777216), 0, "adv2 #0: sigma_2 and sigma_3 relatively accurate");
+# adv #805: a 2×2 whose second column is 2^-520 times a near-copy of the first. sigma_2 = 1.4e-163 must
+# come back, relatively accurate (cond of the column-scaled matrix is 7.4e6): candidate B zeroed it,
+# 1.2.11 returned -1.
+SV12_W = t_sv12_arr(2);
+t_sv12_put4(SV12_W, 0, 0x3FFCAAC172F287EC, 0x1E205172838EFD6A, 0, 0);
+t_sv12_row("adv #805 (2x2, sigma_2 = 1.4e-163)", t_m2(0xBFFAAD39BBEAD4BA, 0x9F7AAD38DFC655C6, 0xBFE4FDA4F3D090ED,
+    0x9F64FDA32E05DA07), SV12_W, 1, 1, 1, 1);
+assert_eq(t_sv12_over(t_sv12_rel(SV12_W, 1, 2), 4194304), 0,
+  "adv #805: sigma_2 = 1.4e-163 is not flushed, and is relatively accurate (to 2^-30)");
+# adv #3666: a 4×4 built against candidate B, entries from 2^934 down to 2^-977, sigma from 2^934
+# to 2^-526. 1.2.11: -1; candidate B: U 6e12 u from orthogonal with sigma_4 = 0. Every sigma is
+# asked for relatively, which is what QR's column pivoting gives here.
+var SV12_C4 = ganita_mat_new(4, 4);
+t_sv12_put4(SV12_C4 + 16, 0, 0x5254A36F5FDF36C7, 0x2E5273CCECDF70AF, 0x7A510A74DBC94CD3, 0xB7201165A2DD5CFA);
+t_sv12_put4(SV12_C4 + 16, 4, 0xB772579516D3B4E7, 0x9F162D9CF7E900A2, 0x82E598B29E10907A, 0xB16E342A1C93CC0A);
+t_sv12_put4(SV12_C4 + 16, 8, 0x4FC3F310328B6DDD, 0, 0x3D448CD9CF68F28D, 0x65C5C9F99A90F836);
+t_sv12_put4(SV12_C4 + 16, 12, 0xB144DC48AEC5DE59, 0x8FDFB42328248804, 0xDF9D1FD23EE94FAC, 0);
+SV12_W = t_sv12_arr(4);
+t_sv12_put4(SV12_W, 0, 0x7A510A74DBC94CD3, 0x65C5C9F99A90F836, 0x37A1C8EB64AEAEC3, 0x1F15FE3C5F06B548);
+t_sv12_row("adv #3666 (4x4)", SV12_C4, SV12_W, 1, 2, 1, 1);
+assert_eq(t_sv12_over(t_sv12_rel(SV12_W, 0, 4), 1), 0, "adv #3666: every sigma relatively accurate");
+
+# Row-graded D·B, 30×30, rows spread over 300 binades. Plain Jacobi needs many sweeps here: candidate A
+# took 29, candidate B 76 with two restarts; 1.2.11 returned -1. 1.2.12 takes 2 sweeps. Row-graded input is
+# what the row pivoting is for, so sigma is asked for relatively too.
+SV12_W = t_sv12_arr(30);
+t_sv12_put4(SV12_W, 0, 0x4018180D537C96C2, 0x3F758FFE01E2A8E9, 0x3ED6E4E3387F5235, 0x3E24D99457633DC4);
+t_sv12_put4(SV12_W, 4, 0x3D86571F17E8BEEC, 0x3CE862BD021E9357, 0x3C377A36D270CEDC, 0x3B9646D8746B6E28);
+t_sv12_put4(SV12_W, 8, 0x3AF87DDC48C9856D, 0x3A47DB283F080E27, 0x39A4DE05D909D367, 0x39035D808CD8B576);
+t_sv12_put4(SV12_W, 12, 0x38566D4DF92F7E9F, 0x37B84C76571DA7DD, 0x37125ACA893C5557, 0x365D0A0FFD11CBA0);
+t_sv12_put4(SV12_W, 16, 0x35C38A98D1C4FE83, 0x3524417ECC864DC3, 0x346DA23A2C062D81, 0x33CC2F591ABC1EC9);
+t_sv12_put4(SV12_W, 20, 0x332A1F0C501BB8C4, 0x32798A49245DE58D, 0x31DCF21170271F87, 0x3137C78B67A9C6DD);
+t_sv12_put4(SV12_W, 24, 0x3085783F6BEBFFBD, 0x2FE6DE24AF4B96AC, 0x2F3FF61EF1B3AE49, 0x2E97DAEA7E784B77);
+t_sv12_put4(SV12_W, 28, 0x2DE38645E2FE309F, 0x2D141BA0B1A6D6A4, 0, 0);
+t_sv12_row("row-graded 30x30 over 300 binades", t_sv12_rowgrad(11, 30, 30, 300), SV12_W, 2, 4, 16, 2);
+assert_eq(t_sv12_over(t_sv12_rel(SV12_W, 0, 30), 16), 0, "row-graded 30x30: every sigma relatively accurate");
+
+# 512 equal rows (1, 2): rank 1, sigma = (sqrt(2560), 0). Every sum over the 512 rows is pairwise; a
+# plain running sum (the first 1.2.12 draft) gave sigma 11 u·sigma_1 off and U 46 u from orthogonal
+# here, and 104 u and 565 u at 4096 rows. 1.2.11 was exact on it.
+var SV12_T = ganita_mat_new(512, 2);
+sv12i = 0;
+while (sv12i < 512) {
+    ganita_mat_set(SV12_T, sv12i, 0, t_d(1));
+    ganita_mat_set(SV12_T, sv12i, 1, t_d(2));
+    sv12i = sv12i + 1;
+}
+SV12_W = t_sv12_arr(2);
+t_sv12_put4(SV12_W, 0, 0x40494C583ADA5B53, 0, 0, 0);
+t_sv12_row("512x2, every row (1, 2)", SV12_T, SV12_W, 2, 16, 2, 8);
+
+# The special branches end to end, each on an input that needs it.
+# Regime B: [[1, 1], [0, 2^-1060]]. Its columns of R^T are 1060 binades apart, past the 500 where
+# zeta is not formed, and the small one is projected off the large one. sigma_2 = 2^-1060/sqrt(2)
+# rounded, a subnormal; with no regime B it came back 0.
+SV12_W = t_sv12_arr(2);
+t_sv12_put4(SV12_W, 0, 0x3FF6A09E667F3BCD, 0x0000000000002D41, 0, 0);
+t_sv12_row("[[1, 1], [0, 2^-1060]]", t_m2(t_d(1), t_d(1), t_d(0), 0x0000000000004000), SV12_W, 1, 1, 2,
+  1);
+assert_eq(t_sv12_diff(SV12_W, 2), 0, "[[1, 1], [0, 2^-1060]]: both sigma are the exact ones, bit for bit");
+assert_eq(((ganita_mat_get(SV12_U, 0, 0) & 0x7FFFFFFFFFFFFFFF) == 0x3FF0000000000000)
+  && (ganita_mat_get(SV12_U, 0, 1) == 0) && (ganita_mat_get(SV12_U, 1, 0) == 0)
+  && ((ganita_mat_get(SV12_U, 1, 1) & 0x7FFFFFFFFFFFFFFF) == 0x3FF0000000000000), 1,
+  "[[1, 1], [0, 2^-1060]]: U is diag(+-1, +-1) exactly");
+# The subnormal floor: adv #3634, a 5×4 whose first column is near 2^1000 and the other three between
+# 2^-1047 and 2^-1040. Two all-subnormal columns of X cannot be made orthogonal beyond their absolute
+# rounding; without the floor this returns -3. With it every sigma is the exact one, and the three
+# subnormal sigma's U columns are orthonormal too (_linalg_svd_reorth; 114 u without it).
+var SV12_F = ganita_mat_new(5, 4);
+t_sv12_put4(SV12_F + 16, 0, 0x7E7C729EFC636324, 0x800000000A060B0A, 0x80000002358ECC8C, 0x80000000176C505A);
+t_sv12_put4(SV12_F + 16, 4, 0x7E701367C136C564, 0x000000000CDD0A88, 0x000000022187C376, 0x0000000016EC629C);
+t_sv12_put4(SV12_F + 16, 8, 0x7E732AE69CC7EBC0, 0x800000000B3DED7E, 0x00000002DE2D775E, 0x000000001A82A088);
+t_sv12_put4(SV12_F + 16, 12, 0x7E7BA16448ECAB1E, 0x80000000088103E0, 0x8000000383077FDE, 0x8000000014A2064C);
+t_sv12_put4(SV12_F + 16, 16, 0xFE70A9615D91134E, 0x000000000AA18B22, 0x80000002C7E54FE6, 0x800000001621CE84);
+SV12_W = t_sv12_arr(4);
+t_sv12_put4(SV12_W, 0, 0x7E88E167011CF90C, 0x000000061FF1DDAC, 0x0000000013FB710E, 0x00000000097CD05A);
+t_sv12_row("adv #3634 (5x4, 2^1000 over 2^-1040 and below)", SV12_F, SV12_W, 1, 4, 4, 1);
+assert_eq(t_sv12_diff(SV12_W, 4), 0, "adv #3634: all four sigma are the exact ones, bit for bit");
+# The t = 1/(2 zeta) branch, past where zeta^2 overflows: adv #582, a 3×3 whose rows each hold three
+# nearly equal entries, near 2^-600, 2^-1 and 2^-475. Taking sqrt(1 + zeta^2) there instead
+# overflows: status 0 with sigma (3.4e-187, -2.7e-307, -2.7e-307), wrong and negative, and V NaN.
+SV12_W = t_sv12_arr(3);
+t_sv12_put4(SV12_W, 0, 0x3FF167AC2565E485, 0x2125D13C597599A4, 0x19375BD8A651DFBE, 0);
+t_sv12_row("adv #582 (3x3, |zeta| > 2^512)", t_m3(0x9A7AE57DAB386363, 0x9A7AE57F14CDE7FF, 0x9A7AE57CC6CA106A,
+    0x3FE418F5FE91F19A, 0x3FE418F94BB24A7C, 0x3FE418F7A6C62845, 0x224A3DA3865F6E13, 0x224A3DA02424CA0A,
+    0x224A3DA250F05AC6), SV12_W, 1, 1, 2, 1);
+# A column of X whose entries are all subnormal is not a V column for n <= 3 (_linalg_svd_impl): it
+# is completed, like a zero one. adv #3452, a 2×2 with rows 2^1000 and 2^-1060: kept, V was 2.7e5 u
+# from orthogonal.
+SV12_W = t_sv12_arr(2);
+t_sv12_put4(SV12_W, 0, 0x7E81078E5878C2AE, 0x0000000000000904, 0, 0);
+t_sv12_row("adv #3452 (2x2, rows 2^1000 and 2^-1060)", t_m2(0xFE7BA5392AA533EE, 0xFE73E4B90A333606,
+    0x000000000000700E, 0x0000000000005BBE), SV12_W, 2, 1, 4, 1);
+# Pairs with 2^-52 < |cos| <= tol are rotated, though they are not progress: adv #724, a row-graded
+# 8×6 over 1000 binades whose U comes out orthonormal to 0.001 u. Without those rotations it stops
+# with a cosine near tol = sqrt(6)·2^-52 left: U 2.4 u from orthogonal.
+var SV12_D8 = ganita_mat_new(8, 6);
+t_sv12_put4(SV12_D8 + 16, 0, 0x105E987D6F2CFE65, 0x105E987C9FE20B9A, 0x105E987F59351BA5, 0x105E987CB0FB75BF);
+t_sv12_put4(SV12_D8 + 16, 4, 0x105E987E507E47AA, 0x105E987BDF125D7D, 0x0A5E1E3CA8AD4FB8, 0x0A5E1E3DE136578F);
+t_sv12_put4(SV12_D8 + 16, 8, 0x0A5E1E3D73266CEA, 0x0A5E1E3D6EA93A08, 0x0A5E1E3C09C0EF96, 0x0A5E1E3AE75F3DE4);
+t_sv12_put4(SV12_D8 + 16, 12, 0x23E145FC1579250D, 0x23E145FE20284163, 0x23E145FE0B49571B, 0x23E145FD3064B654);
+t_sv12_put4(SV12_D8 + 16, 16, 0x23E145F8D294D3B4, 0x23E145FA4837910F, 0xB1747EB3E5C803FA, 0xB1747EB262AD69F9);
+t_sv12_put4(SV12_D8 + 16, 20, 0xB1747EB53D33E6F4, 0xB1747EB2957346FF, 0xB1747EB05C76A360, 0xB1747EB588701AE7);
+t_sv12_put4(SV12_D8 + 16, 24, 0x0172828D516D1C1D, 0x0172828B9CB0EFFF, 0x0172828E26B3D43F, 0x0172828B670AAAC5);
+t_sv12_put4(SV12_D8 + 16, 28, 0x0172828E41A3ED3C, 0x0172828E3ACA8416, 0x1369A06C97983CEE, 0x1369A06E5EDEE7E4);
+t_sv12_put4(SV12_D8 + 16, 32, 0x1369A06E09F82478, 0x1369A06A9085B1AC, 0x1369A06AEFF37A88, 0x1369A06AC22175C5);
+t_sv12_put4(SV12_D8 + 16, 36, 0x3FF70F5EFEF3B687, 0x3FF70F5D5BDA5C36, 0x3FF70F5E3892E8B1, 0x3FF70F5E35405D89);
+t_sv12_put4(SV12_D8 + 16, 40, 0x3FF70F606947C11D, 0x3FF70F60E47AFA73, 0xBD4944A7ECA3814A, 0xBD4944A8E52FE1EE);
+t_sv12_put4(SV12_D8 + 16, 44, 0xBD4944A9566892E5, 0xBD4944A6DCA3C4E9, 0xBD4944A9D7ECE947, 0xBD4944A6D71D81EF);
+SV12_W = t_sv12_arr(6);
+t_sv12_put4(SV12_W, 0, 0x400C3E1FA05D984F, 0x3C22DDF2AE054F32, 0x3053E0F24F08295F, 0x22B6D4D2D3C34E5E);
+t_sv12_put4(SV12_W, 4, 0x1225A12D16B4A584, 0x0F0E18C58A1B0D2E, 0, 0);
+t_sv12_row("adv #724 (8x6, rows over 1000 binades)", SV12_D8, SV12_W, 1, 1, 8, 4);
+# For n >= 4 a column of X whose entries are all subnormal becomes a U column, made orthonormal to the
+# others by _linalg_svd_reorth. Both matrices here have their largest entry near DBL_MAX and three
+# sigma just above 2^-1022, so the working copy is scaled DOWN — by 2^6 at 8×4, 2^10 at 4096×4 (rows 4
+# on are zero) — and those three columns of X are all subnormal. Without it U came out 261 u and 529 u
+# from orthonormal; 1.2.11 returned status 0 with sigma_2..4 = 0 for both.
+var SV12_D1 = ganita_mat_new(8, 4);
+t_sv12_put4(SV12_D1 + 16, 0, 0x7FECB17FF9C83740, 0, 0, 0);
+t_sv12_put4(SV12_D1 + 16, 4, 0, 0x003DA139F0ACD1C2, 0x003D14D4191BC8B6, 0x803B6E96422B7D31);
+t_sv12_put4(SV12_D1 + 16, 8, 0, 0x002530A09FC0595A, 0x00355BC260171C96, 0x8024DB7FFEA418CD);
+t_sv12_put4(SV12_D1 + 16, 12, 0, 0x002BC15346BFFB10, 0x00218ADB2D4108E4, 0x8038EA5AEB16E869);
+SV12_W = t_sv12_arr(4);
+t_sv12_put4(SV12_W, 0, 0x7FECB17FF9C83740, 0x004EF2C46F14D752, 0x002B99E648E21F6E, 0x0012C43774E46778);
+t_sv12_row("8x4, 2^1023 over three sigma near 2^-1021", SV12_D1, SV12_W, 1, 2, 2, 1);
+var SV12_D2 = ganita_mat_new(4096, 4);
+t_sv12_put4(SV12_D2 + 16, 0, 0xFFEB48FA5984EEB2, 0, 0, 0);
+t_sv12_put4(SV12_D2 + 16, 4, 0, 0x8017789B7DCDD8F5, 0x001FB7D4F0C9FF6F, 0x803EC31BDC5AF0A6);
+t_sv12_put4(SV12_D2 + 16, 8, 0, 0x803BD3814D9B3D56, 0x8022117147DD9AB0, 0x801FD295E67AA39B);
+t_sv12_put4(SV12_D2 + 16, 12, 0, 0x802022B6686679A3, 0x003951A996F537DB, 0x801AA987CEF51C47);
+SV12_W = t_sv12_arr(4);
+t_sv12_put4(SV12_W, 0, 0x7FEB48FA5984EEB2, 0x00438AFAF12946ED, 0x003C9EBBAE658F9C, 0x0033257CEB208171);
+t_sv12_row("4096x4, -2^1023 over three sigma near 2^-1021", SV12_D2, SV12_W, 1, 2, 16, 1);
+
+# rank, condition and pseudo_inv on the filing's two textbook singular matrices. Through 1.2.11 they
+# inherited the SVD's -1: rank -1 ("allocation failed"), condition NaN, pseudo_inv null.
+var SV12_RTOL = t_sv12_q(1, 1000000000000);
+assert_eq(ganita_mat_rank(SV12_Z, SV12_RTOL), 2, "rank(Z) = 2 at tol 1e-12 (1.2.11: -1)");
+assert_eq(ganita_mat_condition(SV12_Z), 0xBFF0000000000000, "condition(Z) = -1.0, singular (1.2.11: NaN)");
+var SV12_ZP = ganita_mat_pseudo_inv(SV12_Z);
+assert_eq(SV12_ZP != 0, 1, "pseudo_inv(Z) exists (1.2.11: null)");
+assert_eq(ganita_mat_eq(ganita_mat_mul(ganita_mat_mul(SV12_Z, SV12_ZP), SV12_Z), SV12_Z, t_tol()), 1, "Z Z+ Z = Z");
+assert_eq(ganita_mat_eq(ganita_mat_mul(ganita_mat_mul(SV12_ZP, SV12_Z), SV12_ZP), SV12_ZP, t_tol()), 1,
+  "Z+ Z Z+ = Z+");
+assert_eq(ganita_mat_rank(SV12_R, SV12_RTOL), 2, "rank([[1, 2, 3], [1, 2, 3], [4, 5, 6]]) = 2 (1.2.11: -1)");
+assert_eq(ganita_mat_condition(SV12_R), 0xBFF0000000000000, "condition([[1, 2, 3], [1, 2, 3], [4, 5, 6]]) = -1.0");
+var SV12_RP = ganita_mat_pseudo_inv(SV12_R);
+assert_eq(SV12_RP != 0, 1, "pseudo_inv([[1, 2, 3], [1, 2, 3], [4, 5, 6]]) exists (1.2.11: null)");
+assert_eq(ganita_mat_eq(ganita_mat_mul(ganita_mat_mul(SV12_R, SV12_RP), SV12_R), SV12_R, t_tol()), 1, "R R+ R = R");
+assert_eq(ganita_mat_eq(ganita_mat_mul(ganita_mat_mul(SV12_RP, SV12_R), SV12_RP), SV12_RP, t_tol()), 1,
+  "R+ R R+ = R+");
+# rank passes the SVD's status through rather than reading it as an allocation failure: -2 here (also
+# in the non-finite group above). -3 would pass the same way; no finite input reaches it.
+assert_eq(ganita_mat_rank(t_m3(t_d(1), t_d(2), t_d(3), t_d(1), t_d(2), t_d(3), t_d(4), t_d(5), LNF_NAN), SV12_RTOL),
+  0 - 2, "rank passes the SVD's -2 through for a NaN entry");
+
+# Two guards no input in the corpus or the adversarial sets reaches, tested on the helpers directly.
+# "A rotation that changed no bit of X is not progress": columns (2, 2) and (1, -1) with a fake
+# gamma' of 2^-80 give a rotation by about 2^-82, which rounds back to the same bits. It must report
+# 0 and touch neither Z nor the stopping rule's largest |sin|; counted as progress, the same pair
+# would come back every sweep (the filing's branch 1 was that loop).
+var SV12_X = alloc(32);
+var SV12_ZZ = alloc(32);
+var SV12_CE = alloc(16);
+var SV12_ST2 = alloc(16);
+t_sv12_put4(SV12_X, 0, t_d(2), t_d(2), t_d(1), t_d(0 - 1));
+t_sv12_put4(SV12_ZZ, 0, t_d(1), 0, 0, t_d(1));
+store64(SV12_CE, _linalg_svd_cf(t_d(2)));
+store64(SV12_CE + 8, _linalg_svd_cf(t_d(1)));
+store64(SV12_ST2, 0);
+store64(SV12_ST2 + 8, 0);
+assert_eq(_linalg_svd_rot(SV12_X, 2, SV12_ZZ, SV12_CE, 0, 1, t_d(2), t_d(2), 0x3AF0000000000000, SV12_ST2), 0,
+  "_linalg_svd_rot: a rotation that changes no bit of X returns 0 (no progress)");
+assert_eq((load64(SV12_X) == t_d(2)) && (load64(SV12_X + 8) == t_d(2)) && (load64(SV12_X + 16) == t_d(1))
+  && (load64(SV12_X + 24) == t_d(0 - 1)), 1, "  ... X is unchanged");
+assert_eq((load64(SV12_ZZ) == t_d(1)) && (load64(SV12_ZZ + 8) == 0) && (load64(SV12_ZZ + 16) == 0)
+  && (load64(SV12_ZZ + 24) == t_d(1)), 1, "  ... and the rotation is not applied to Z");
+assert_eq(load64(SV12_ST2 + 8), 0, "  ... and the largest |sin| the stopping rule reads is not raised");
+# The same guard in regime B: columns (2^400, 2^400) and (2^-200, 2^-200), 600 binades apart, with a
+# fake gamma' so small that the projection rounds away.
+t_sv12_put4(SV12_X, 0, t_sv12_p2(400), t_sv12_p2(400), t_sv12_p2(0 - 200), t_sv12_p2(0 - 200));
+store64(SV12_CE, _linalg_svd_cf(t_sv12_p2(400)));
+store64(SV12_CE + 8, _linalg_svd_cf(t_sv12_p2(0 - 200)));
+store64(SV12_ST2 + 8, 0);
+assert_eq(_linalg_svd_rot(SV12_X, 2, 0, SV12_CE, 0, 1, t_d(2), t_d(2), 0x3AF0000000000000, SV12_ST2), 0,
+  "_linalg_svd_rot: a regime-B projection that changes no bit returns 0");
+assert_eq((load64(SV12_X + 16) == t_sv12_p2(0 - 200)) && (load64(SV12_X + 24) == t_sv12_p2(0 - 200)), 1,
+  "  ... the small column is unchanged");
+assert_eq(load64(SV12_ST2 + 8), 0, "  ... and the largest |sin| is not raised");
+# Regime B through a whole sweep: columns (2^400, 2^400) and (2^-200, 0). The small one loses its
+# component along the large one, exactly (2^-201, -2^-201); the projection enters the stopping rule as
+# |sin| = 2^-1022, as dgsvj0's Gram-Schmidt step does; and the next sweep finds nothing to do.
+t_sv12_put4(SV12_X, 0, t_sv12_p2(400), t_sv12_p2(400), t_sv12_p2(0 - 200), 0);
+var SV12_TOL2 = f64_mul(f64_sqrt(t_d(2)), SV12_EPS);
+assert_eq(_linalg_svd_sweep(SV12_X, 2, 0, SV12_CE, SV12_TOL2, SV12_ST2), 1, "_linalg_svd_sweep: regime B is progress");
+assert_eq((load64(SV12_X + 16) == 0x3360000000000000) && (load64(SV12_X + 24) == 0xB360000000000000), 1,
+  "  ... the small column becomes (2^-201, -2^-201), exactly");
+assert_eq(load64(SV12_ST2 + 8), 0x0010000000000000, "  ... it counts as |sin| = 2^-1022 for the stopping rule");
+assert_eq(_linalg_svd_sweep(SV12_X, 2, 0, SV12_CE, SV12_TOL2, SV12_ST2), 0, "  ... and the next sweep has no work");
+# The subnormal floor stays FINITE for n >= 5. It is n·2^-1074·(fp·sqrt(beta') + fq·sqrt(alpha')),
+# and fp·sqrt(beta') alone overflows when a factor is 2^1022 (an all-subnormal column) and the other
+# column's alpha' reaches 16. The first 1.2.12 draft formed it in that order: the floor was +inf and
+# the pair counted as orthogonal. Here x_0 = 1.9375·2^-1000·(1, 1, 1, 1, 1), so alpha' = 18.8, and
+# x_1 = 2^-1060·(1, 1, 0, 0, 0), all subnormal, at cosine 0.63: the pair must be rotated.
+var SV12_X5 = alloc(200);
+var SV12_CE5 = alloc(40);
+sv12i = 0;
+while (sv12i < 25) {
+    store64(SV12_X5 + sv12i * 8, 0);
+    sv12i = sv12i + 1;
+}
+sv12i = 0;
+while (sv12i < 5) {
+    store64(SV12_X5 + sv12i * 8, f64_mul(t_sv12_q(31, 16), t_sv12_p2(0 - 1000)));
+    store64(SV12_CE5 + sv12i * 8, 0);
+    sv12i = sv12i + 1;
+}
+store64(SV12_X5 + 40, 0x0000000000004000);
+store64(SV12_X5 + 48, 0x0000000000004000);
+store64(SV12_CE5, _linalg_svd_cf(load64(SV12_X5)));
+store64(SV12_CE5 + 8, _linalg_svd_cf(0x0000000000004000));
+assert_eq(_linalg_svd_sweep(SV12_X5, 5, 0, SV12_CE5, f64_mul(f64_sqrt(t_d(5)), SV12_EPS), SV12_ST2), 1,
+  "_linalg_svd_sweep, n = 5: a subnormal column at cosine 0.63 to a 2^-1000 one is rotated (finite floor)");
+# _linalg_svd_reorth on the column-major 4×3 y = [c0 | c1 | y2], c0 = (0.6, 0.8, 0, 0) and c1 = (-0.8,
+# 0.6, 0, 0) final (state 1). y2 = (1, 1, 1, 1)/2 loses its components along both and becomes (0, 0, 1,
+# 1)/sqrt(2) to rounding: orthogonal to both and unit, to 1 u.
+var SV12_Y = alloc(96);
+var SV12_YS = alloc(24);
+t_sv12_put4(SV12_Y, 0, 0x3FE3333333333333, 0x3FE999999999999A, 0, 0);
+t_sv12_put4(SV12_Y, 4, 0xBFE999999999999A, 0x3FE3333333333333, 0, 0);
+t_sv12_put4(SV12_Y, 8, 0x3FE0000000000000, 0x3FE0000000000000, 0x3FE0000000000000, 0x3FE0000000000000);
+store64(SV12_YS, 1);
+store64(SV12_YS + 8, 1);
+store64(SV12_YS + 16, 2);
+_linalg_svd_reorth(SV12_Y, 4, 3, 2, SV12_YS);
+var sv12d0 = 0;
+var sv12d1 = 0;
+var sv12nn = f64_neg(t_d(1));
+sv12i = 0;
+while (sv12i < 4) {
+    var sv12y = load64(SV12_Y + 64 + sv12i * 8);
+    sv12d0 = f64_add(sv12d0, f64_mul(sv12y, load64(SV12_Y + sv12i * 8)));
+    sv12d1 = f64_add(sv12d1, f64_mul(sv12y, load64(SV12_Y + 32 + sv12i * 8)));
+    sv12nn = f64_add(sv12nn, f64_mul(sv12y, sv12y));
+    sv12i = sv12i + 1;
+}
+assert_eq(f64_le(f64_abs(sv12d0), SV12_EPS) && f64_le(f64_abs(sv12d1), SV12_EPS), 1,
+  "_linalg_svd_reorth: the column is orthogonal to both final columns, to 1 u");
+assert_eq(f64_le(f64_abs(sv12nn), SV12_EPS), 1, "  ... and unit, to 1 u");
+assert_eq(f64_lt(f64_abs(f64_sub(load64(SV12_Y + 80), 0x3FE6A09E667F3BCD)), 0x3CC0000000000000), 1,
+  "  ... it is (0, 0, 1, 1)/sqrt(2): what is left of y2's own direction");
+# The restart: a y2 in the span of the final columns (c0 itself) keeps nothing after the two passes, so
+# it starts again from the axis they cover least — rows 2 and 3 tie at 0, the first wins — and comes
+# back exactly e_2. No input of the corpus, the adversarial sets or the hunts reaches this.
+t_sv12_put4(SV12_Y, 8, 0x3FE3333333333333, 0x3FE999999999999A, 0, 0);
+_linalg_svd_reorth(SV12_Y, 4, 3, 2, SV12_YS);
+assert_eq((load64(SV12_Y + 64) == 0) && (load64(SV12_Y + 72) == 0) && (load64(SV12_Y + 80) == t_d(1))
+  && (load64(SV12_Y + 88) == 0), 1, "_linalg_svd_reorth: a column in the span of the others restarts from e_2");
+# The restart is decided by length, not by exact cancellation: y2 = c0 + 2^-60·e_3 keeps exactly
+# 2^-60·e_3, far below half its length, so it restarts too (normalising that remnant would give e_3).
+t_sv12_put4(SV12_Y, 8, 0x3FE3333333333333, 0x3FE999999999999A, 0, 0x3C30000000000000);
+_linalg_svd_reorth(SV12_Y, 4, 3, 2, SV12_YS);
+assert_eq((load64(SV12_Y + 64) == 0) && (load64(SV12_Y + 72) == 0) && (load64(SV12_Y + 80) == t_d(1))
+  && (load64(SV12_Y + 88) == 0), 1, "_linalg_svd_reorth: a column left with under half its length restarts");
+# Only state-1 columns are projected out: with c1 marked 2 (pending), y2 = (-0.8, 0.6, 1, 0) keeps its
+# component along c1 — it would become e_2 without it — and comes back (-0.8, 0.6, 1, 0)/sqrt(2).
+store64(SV12_YS + 8, 2);
+t_sv12_put4(SV12_Y, 8, 0xBFE999999999999A, 0x3FE3333333333333, t_d(1), 0);
+_linalg_svd_reorth(SV12_Y, 4, 3, 2, SV12_YS);
+assert_eq((load64(SV12_Y + 64) == 0xBFE21A1851FF630A) && (load64(SV12_Y + 72) == 0x3FDB27247AFF148E)
+  && (load64(SV12_Y + 80) == 0x3FE6A09E667F3BCC) && (load64(SV12_Y + 88) == 0), 1,
+  "_linalg_svd_reorth: a pending (state 2) column is not projected out");
+
+test_group("SVD building blocks, called directly (1.2.12)");
+# Every private helper of the 1.2.12 SVD on input whose answer is known exactly, so each is pinned on its
+# own and not only through whole decompositions. Expected bits come from Python, by the same operations
+# where rounding matters (math.ldexp rounds once).
+#
+# _linalg_svd_pow2: 2^j as its bits, subnormal below -1022. _linalg_svd_expo: floor(log2 |x|), the sign
+# ignored and held at -1022, so 2^-e is representable.
+assert_eq(_linalg_svd_pow2(0), 0x3FF0000000000000, "_linalg_svd_pow2(0) = 1");
+assert_eq(_linalg_svd_pow2(1023), 0x7FE0000000000000, "_linalg_svd_pow2(1023)");
+assert_eq(_linalg_svd_pow2(0 - 1022), 0x0010000000000000, "_linalg_svd_pow2(-1022) = DBL_MIN");
+assert_eq(_linalg_svd_pow2(0 - 1023), 0x0008000000000000, "_linalg_svd_pow2(-1023), a subnormal");
+assert_eq(_linalg_svd_pow2(0 - 1074), 1, "_linalg_svd_pow2(-1074), the smallest subnormal");
+assert_eq(_linalg_svd_expo(t_d(1)), 0, "_linalg_svd_expo(1) = 0");
+assert_eq(_linalg_svd_expo(0xC008000000000000), 1, "_linalg_svd_expo(-3) = 1: the sign is ignored");
+assert_eq(_linalg_svd_expo(0x3FEFFFFFFFFFFFFF), 0 - 1, "_linalg_svd_expo(1 - 2^-53) = -1");
+assert_eq(_linalg_svd_expo(0x7FEFFFFFFFFFFFFF), 1023, "_linalg_svd_expo(DBL_MAX) = 1023");
+assert_eq(_linalg_svd_expo(0x0010000000000000), 0 - 1022, "_linalg_svd_expo(DBL_MIN) = -1022");
+assert_eq(_linalg_svd_expo(1), 0 - 1022, "_linalg_svd_expo of a subnormal is held at -1022");
+
+# _linalg_svd_ldexp: x·2^e rounded ONCE, ties to even; a signed infinity past the range and a signed 0
+# far below it.
+assert_eq(_linalg_svd_ldexp(t_d(1), 3), 0x4020000000000000, "_linalg_svd_ldexp(1, 3) = 8");
+assert_eq(_linalg_svd_ldexp(0xBFF8000000000000, 0 - 1), 0xBFE8000000000000, "_linalg_svd_ldexp(-1.5, -1) = -0.75");
+assert_eq(_linalg_svd_ldexp(t_d(1), 1024), 0x7FF0000000000000, "_linalg_svd_ldexp(1, 1024) = +inf");
+assert_eq(_linalg_svd_ldexp(f64_neg(t_d(1)), 1024), 0xFFF0000000000000, "_linalg_svd_ldexp(-1, 1024) = -inf");
+assert_eq(_linalg_svd_ldexp(0x3FFFFFFFFFFFFFFF, 0 - 1022), 0x001FFFFFFFFFFFFF,
+  "_linalg_svd_ldexp(2 - 2^-52, -1022): still normal, exact");
+assert_eq(_linalg_svd_ldexp(0x3FFFFFFFFFFFFFFF, 0 - 1023), 0x0010000000000000,
+  "_linalg_svd_ldexp(2 - 2^-52, -1023): half a step below DBL_MIN, a tie, to even: DBL_MIN");
+assert_eq(_linalg_svd_ldexp(t_d(1), 0 - 1074), 1, "_linalg_svd_ldexp(1, -1074) = 2^-1074, exact");
+assert_eq(_linalg_svd_ldexp(0x3FF4000000000000, 0 - 1074), 1, "_linalg_svd_ldexp(1.25, -1074) rounds to 1 step");
+assert_eq(_linalg_svd_ldexp(0x3FF8000000000000, 0 - 1074), 2, "_linalg_svd_ldexp(1.5, -1074): a tie, to even, 2");
+assert_eq(_linalg_svd_ldexp(0x3FFC000000000000, 0 - 1074), 2, "_linalg_svd_ldexp(1.75, -1074) rounds to 2 steps");
+assert_eq(_linalg_svd_ldexp(t_d(1), 0 - 1075), 0, "_linalg_svd_ldexp(1, -1075): half a step, a tie, to even, 0");
+assert_eq(_linalg_svd_ldexp(0x3FF8000000000000, 0 - 1075), 1, "_linalg_svd_ldexp(1.5, -1075) rounds to 1 step");
+assert_eq(_linalg_svd_ldexp(t_d(1), 0 - 1076), 0, "_linalg_svd_ldexp(1, -1076) = 0");
+assert_eq(_linalg_svd_ldexp(f64_neg(t_d(1)), 0 - 1080), 0x8000000000000000, "_linalg_svd_ldexp(-1, -1080) = -0.0");
+assert_eq(_linalg_svd_ldexp(0x8000000000000000, 5), 0x8000000000000000, "_linalg_svd_ldexp(-0.0, 5) = -0.0");
+
+# _linalg_svd_nrm: |x| with the largest entry's power of two scaled out exactly, so (3, 4)·2^1000 and
+# (3, 4)·2^-1074 give 5·2^1000 and 5·2^-1074 exactly, where the plain sum of squares is +inf and 0.
+var SVB_V = alloc(16);
+store64(SVB_V, t_d(3));
+store64(SVB_V + 8, t_d(4));
+assert_eq(_linalg_svd_nrm(SVB_V, 2), t_d(5), "_linalg_svd_nrm(3, 4) = 5");
+store64(SVB_V, f64_mul(t_d(3), t_sv12_p2(1000)));
+store64(SVB_V + 8, f64_mul(t_d(4), t_sv12_p2(1000)));
+assert_eq(_linalg_svd_nrm(SVB_V, 2), f64_mul(t_d(5), t_sv12_p2(1000)), "_linalg_svd_nrm((3, 4)*2^1000) = 5*2^1000");
+store64(SVB_V, 3);
+store64(SVB_V + 8, 4);
+assert_eq(_linalg_svd_nrm(SVB_V, 2), 5, "_linalg_svd_nrm((3, 4)*2^-1074) = 5*2^-1074");
+store64(SVB_V, 0);
+store64(SVB_V + 8, 0x8000000000000000);
+assert_eq(_linalg_svd_nrm(SVB_V, 2), 0, "_linalg_svd_nrm(0, -0) = 0");
+
+# _linalg_svd_ssq and _linalg_svd_dot sum PAIRWISE, halving until 16 terms are left. Over 1 followed by
+# 32 copies of 2^-27 (squares 2^-54): a running sum rounds each 2^-54 away and gives 1 — as the first 16
+# terms do here — while the 17 of the second half are summed among themselves first, giving 1 + 2^-50
+# (the exact sum is 1 + 2^-49).
+var SVB_W = alloc(264);
+store64(SVB_W, t_d(1));
+var svbi = 1;
+while (svbi < 33) {
+    store64(SVB_W + svbi * 8, t_sv12_p2(0 - 27));
+    svbi = svbi + 1;
+}
+assert_eq(_linalg_svd_ssq(SVB_W, 16, t_d(1), 0), t_d(1), "_linalg_svd_ssq: 16 terms are the plain loop, 1");
+assert_eq(_linalg_svd_ssq(SVB_W, 33, t_d(1), 0), 0x3FF0000000000004, "_linalg_svd_ssq: 33 terms pairwise, 1 + 2^-50");
+assert_eq(_linalg_svd_dot(SVB_W, SVB_W, 33), 0x3FF0000000000004, "_linalg_svd_dot: the same split, the same bits");
+assert_eq(_linalg_svd_ssq(SVB_W, 33, t_d(2), 1), 0x4010000000000004, "_linalg_svd_ssq with f = 2: 4·(1 + 2^-50)");
+assert_eq((load64(SVB_W) == t_d(2)) && (load64(SVB_W + 256) == t_sv12_p2(0 - 26)), 1,
+  "  ... and put = 1 stores each 2·x_i back");
+
+# _linalg_svd_house: (3, 4) becomes the unit v = (2, 1)/sqrt(5) of H = I - 2·v·v^T and returns r = -5,
+# opposite in sign to x_0; _linalg_svd_reflect then maps (3, 4) to (-5, 0), here exactly. The same x at
+# 2^-1074 gives the same v, so H stays orthogonal at every magnitude, and r = -5·2^-1074 exactly.
+store64(SVB_V, t_d(3));
+store64(SVB_V + 8, t_d(4));
+assert_eq(_linalg_svd_house(SVB_V, 2, t_d(4)), 0xC014000000000000, "_linalg_svd_house(3, 4) returns -5");
+assert_eq((load64(SVB_V) == 0x3FEC9F25C5BFEDD9) && (load64(SVB_V + 8) == 0x3FDC9F25C5BFEDD9), 1,
+  "  ... and leaves v = (2, 1)/sqrt(5)");
+var SVB_Y = alloc(16);
+store64(SVB_Y, t_d(3));
+store64(SVB_Y + 8, t_d(4));
+_linalg_svd_reflect(SVB_V, SVB_Y, 2);
+assert_eq((load64(SVB_Y) == 0xC014000000000000) && (load64(SVB_Y + 8) == 0), 1,
+  "_linalg_svd_reflect: H (3, 4) = (-5, 0)");
+store64(SVB_V, 3);
+store64(SVB_V + 8, 4);
+assert_eq(_linalg_svd_house(SVB_V, 2, 4), 0x8000000000000005, "_linalg_svd_house((3, 4)*2^-1074) returns -5*2^-1074");
+assert_eq((load64(SVB_V) == 0x3FEC9F25C5BFEDD9) && (load64(SVB_V + 8) == 0x3FDC9F25C5BFEDD9), 1,
+  "  ... and the same v");
+store64(SVB_V, t_d(7));
+assert_eq(_linalg_svd_house(SVB_V, 1, t_d(7)), t_d(7), "_linalg_svd_house of one entry: r = x_0 and H = I ...");
+assert_eq(load64(SVB_V), 0, "  ... v = 0");
+store64(SVB_V, 0);
+store64(SVB_V + 8, 0);
+assert_eq(_linalg_svd_house(SVB_V, 2, 0), 0, "_linalg_svd_house of a zero x: r = 0, v stays 0");
+store64(SVB_Y, t_d(3));
+store64(SVB_Y + 8, t_d(4));
+_linalg_svd_reflect(SVB_V, SVB_Y, 2);
+assert_eq((load64(SVB_Y) == t_d(3)) && (load64(SVB_Y + 8) == t_d(4)), 1,
+  "_linalg_svd_reflect: a zero v is the identity, skipped");
+
+# _linalg_svd_qrcp, _linalg_svd_apply_q and _linalg_svd_rt on a 3×2 whose factorisation is exact: A =
+# [[1, 0], [0, 2], [0, 0]], column-major. Column pivoting takes the larger column first, row pivoting
+# swaps rows 0 and 1 to bring its 2 to the diagonal, and both reflectors are sign flips: R = [[-2, 0], [0,
+# -1]], piv = (1, 0), rp = (1, 1). Q·[R; 0] is then A·P bit for bit, and R^T's column scalings are 2^-1
+# and 1 (_linalg_svd_cf).
+var SVB_QA = alloc(48);
+t_sv12_put4(SVB_QA, 0, t_d(1), 0, 0, 0);
+store64(SVB_QA + 32, t_d(2));
+store64(SVB_QA + 40, 0);
+var SVB_RD = alloc(16);
+var SVB_PV = alloc(16);
+var SVB_RP = alloc(16);
+var SVB_N1 = alloc(16);
+var SVB_N2 = alloc(16);
+_linalg_svd_qrcp(SVB_QA, 3, 2, SVB_RD, SVB_PV, SVB_RP, SVB_N1, SVB_N2);
+assert_eq((load64(SVB_PV) == 1) && (load64(SVB_PV + 8) == 0), 1, "_linalg_svd_qrcp: the larger column goes first");
+assert_eq((load64(SVB_RP) == 1) && (load64(SVB_RP + 8) == 1), 1, "  ... its largest entry is swapped to the diagonal");
+assert_eq((load64(SVB_RD) == 0xC000000000000000) && (load64(SVB_RD + 8) == 0xBFF0000000000000)
+  && (load64(SVB_QA + 24) == 0), 1, "  ... and R = [[-2, 0], [0, -1]]");
+var SVB_QY = alloc(48);
+t_sv12_put4(SVB_QY, 0, 0xC000000000000000, 0, 0, load64(SVB_QA + 24));
+store64(SVB_QY + 32, 0xBFF0000000000000);
+store64(SVB_QY + 40, 0);
+_linalg_svd_apply_q(SVB_QA, 3, 2, SVB_RP, SVB_QY, 2);
+assert_eq((load64(SVB_QY) == 0) && (load64(SVB_QY + 8) == t_d(2)) && (load64(SVB_QY + 16) == 0)
+  && (load64(SVB_QY + 24) == t_d(1)) && (load64(SVB_QY + 32) == 0) && (load64(SVB_QY + 40) == 0), 1,
+  "_linalg_svd_apply_q: Q [R; 0] = A P, bit for bit");
+var SVB_RT = alloc(32);
+var SVB_CF = alloc(16);
+_linalg_svd_rt(SVB_QA, 3, SVB_RD, 2, SVB_RT, SVB_CF);
+assert_eq((load64(SVB_RT) == 0xC000000000000000) && (load64(SVB_RT + 8) == 0) && (load64(SVB_RT + 16) == 0)
+  && (load64(SVB_RT + 24) == 0xBFF0000000000000), 1, "_linalg_svd_rt: R^T, column j = row j of R");
+assert_eq((load64(SVB_CF) == 0x3FE0000000000000) && (load64(SVB_CF + 8) == 0x3FF0000000000000), 1,
+  "  ... with each column's scaling, 2^-e for its largest entry");
+# The same three on a generic 5×3 (the test generator's entries, in [-2, 2)): piv is a permutation, the
+# pivoting keeps |R_kk| >= |R_kj| for j > k, and A·P = Q·[R; 0] to 8 u.
+var SVB_G = t_sv12_gen(7, 5, 3);
+var SVB_GA = alloc(120);
+var SVB_GY = alloc(120);
+var svbj = 0;
+svbi = 0;
+while (svbi < 15) {
+    store64(SVB_GA + ((svbi % 3) * 5 + svbi / 3) * 8, load64(SVB_G + 16 + svbi * 8));
+    store64(SVB_GY + svbi * 8, 0);
+    svbi = svbi + 1;
+}
+var SVB_GRD = alloc(24);
+var SVB_GPV = alloc(24);
+var SVB_GRP = alloc(24);
+_linalg_svd_qrcp(SVB_GA, 5, 3, SVB_GRD, SVB_GPV, SVB_GRP, alloc(24), alloc(24));
+var svbp0 = load64(SVB_GPV);
+var svbp1 = load64(SVB_GPV + 8);
+var svbp2 = load64(SVB_GPV + 16);
+assert_eq(((svbp0 + svbp1 + svbp2) == 3) && (svbp0 != svbp1) && (svbp0 != svbp2) && (svbp1 != svbp2), 1,
+  "_linalg_svd_qrcp on a 5x3: piv is a permutation of (0, 1, 2)");
+var svbok = 1;
+svbi = 0;
+while (svbi < 3) {
+    store64(SVB_GY + (svbi * 5 + svbi) * 8, load64(SVB_GRD + svbi * 8));
+    svbj = svbi + 1;
+    while (svbj < 3) {
+        var svbr = load64(SVB_GA + (svbj * 5 + svbi) * 8);
+        store64(SVB_GY + (svbj * 5 + svbi) * 8, svbr);
+        if (f64_lt(f64_abs(load64(SVB_GRD + svbi * 8)), f64_abs(svbr)) == 1) { svbok = 0; }
+        svbj = svbj + 1;
+    }
+    svbi = svbi + 1;
+}
+assert_eq(svbok, 1, "  ... and |R_kk| >= |R_kj| for every j > k");
+_linalg_svd_apply_q(SVB_GA, 5, 3, SVB_GRP, SVB_GY, 3);
+var svbmx = 0;
+svbi = 0;
+while (svbi < 5) {
+    svbj = 0;
+    while (svbj < 3) {
+        var svbpj = load64(SVB_GPV + svbj * 8);
+        var svbd = f64_sub(load64(SVB_GY + (svbj * 5 + svbi) * 8), ganita_mat_get(SVB_G, svbi, svbpj));
+        svbmx = t_sv12_max(svbmx, f64_abs(svbd));
+        svbj = svbj + 1;
+    }
+    svbi = svbi + 1;
+}
+assert_eq(f64_le(svbmx, f64_mul(t_d(16), SV12_EPS)), 1, "  ... and Q [R; 0] = A P to 8 u of A's largest entry (2)");
+
+# _linalg_svd_unit: (3, 4) -> (0.6, 0.8), the doubles nearest. _linalg_svd_cross: e_0 × e_1 = e_2, and
+# (0.6, 0.8, 0) × e_2 = (0.8, -0.6, 0), normalised.
+store64(SVB_V, t_d(3));
+store64(SVB_V + 8, t_d(4));
+_linalg_svd_unit(SVB_V, 2);
+assert_eq((load64(SVB_V) == 0x3FE3333333333333) && (load64(SVB_V + 8) == 0x3FE999999999999A), 1,
+  "_linalg_svd_unit(3, 4) = (0.6, 0.8)");
+var SVB_X = t_sv12_arr(9);
+t_sv12_put4(SVB_X, 0, t_d(1), 0, 0, 0);
+t_sv12_put4(SVB_X, 4, t_d(1), 0, 0, 0);
+_linalg_svd_cross(SVB_X, SVB_X + 24, SVB_X + 48);
+assert_eq((load64(SVB_X + 48) == 0) && (load64(SVB_X + 56) == 0) && (load64(SVB_X + 64) == t_d(1)), 1,
+  "_linalg_svd_cross: e_0 x e_1 = e_2");
+t_sv12_put4(SVB_X, 0, 0x3FE3333333333333, 0x3FE999999999999A, 0, 0);
+store64(SVB_X + 32, 0);
+store64(SVB_X + 40, t_d(1));
+_linalg_svd_cross(SVB_X, SVB_X + 24, SVB_X + 48);
+assert_eq((load64(SVB_X + 48) == 0x3FE999999999999A) && (load64(SVB_X + 56) == 0xBFE3333333333333)
+  && (load64(SVB_X + 64) == 0), 1, "_linalg_svd_cross: (0.6, 0.8, 0) x e_2 = (0.8, -0.6, 0)");
+
+# _linalg_svd_complete fills each zero column (ce = 0) of the n×n x into an orthonormal basis: for n = 2
+# the other column turned by 90 degrees; for n = 3 the cross product of the other two; with two zero
+# columns the axis the remaining one is least aligned with, made orthogonal to it, then the cross product.
+var SVB_CE = alloc(24);
+t_sv12_put4(SVB_X, 0, 0x3FE3333333333333, 0x3FE999999999999A, 0, 0);
+store64(SVB_CE, t_d(1));
+store64(SVB_CE + 8, 0);
+_linalg_svd_complete(SVB_X, 2, SVB_CE);
+assert_eq((load64(SVB_X + 16) == 0xBFE999999999999A) && (load64(SVB_X + 24) == 0x3FE3333333333333), 1,
+  "_linalg_svd_complete, n = 2: the zero column becomes (-0.8, 0.6)");
+t_sv12_put4(SVB_X, 0, t_d(1), 0, 0, 0);
+t_sv12_put4(SVB_X, 4, t_d(1), 0, 0, 0);
+t_sv12_put4(SVB_X, 8, 0x7FF4000000000BAD, 0, 0, 0);
+store64(SVB_CE + 8, t_d(1));
+store64(SVB_CE + 16, 0);
+_linalg_svd_complete(SVB_X, 3, SVB_CE);
+assert_eq((load64(SVB_X + 48) == 0) && (load64(SVB_X + 56) == 0) && (load64(SVB_X + 64) == t_d(1)), 1,
+  "_linalg_svd_complete, n = 3, one zero column: e_0 x e_1 = e_2");
+t_sv12_put4(SVB_X, 0, 0x3FE3333333333333, 0x3FE999999999999A, 0, 0);
+store64(SVB_CE + 8, 0);
+_linalg_svd_complete(SVB_X, 3, SVB_CE);
+assert_eq(((load64(SVB_X + 24) & 0x7FFFFFFFFFFFFFFF) == 0) && ((load64(SVB_X + 32) & 0x7FFFFFFFFFFFFFFF) == 0)
+  && (load64(SVB_X + 40) == t_d(1)), 1, "_linalg_svd_complete, two zero columns: the first becomes e_2 ...");
+assert_eq((load64(SVB_X + 48) == 0x3FE999999999999A) && (load64(SVB_X + 56) == 0xBFE3333333333333)
+  && (load64(SVB_X + 64) == 0), 1, "  ... and the second (0.6, 0.8, 0) x e_2 = (0.8, -0.6, 0)");
+
 test_group("back-compat aliases");
 var a2 = mat_new(4, 5);
 assert_eq(mat_rows(a2), 4, "alias mat_rows");

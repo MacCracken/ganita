@@ -73,7 +73,7 @@
 handling. Every item below was reproduced against known values.
 
 `ganita_f64_asinh` and `ganita_binomial` were the two in this module serious
-enough to fix in 1.2.3 — see the [audit](../../audit/2026-09-07-v1.2.3-audit.md).
+enough to fix in 1.2.3 — see the [audit](../../../audit/2026-09-07-v1.2.3-audit.md).
 These are the rest.
 
 ## 1. Cancellation for small |x| — sinh, tanh, atanh (MEDIUM)

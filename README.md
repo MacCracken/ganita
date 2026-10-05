@@ -13,15 +13,17 @@ Written in [Cyrius](https://github.com/MacCracken/cyrius).
 
 ## Status
 
-**1.2.11** — the six 2026-09-30 filings closed: `binomial` exact up to i64_MAX, `atan2` on the
-whole C99 table, the hyperbolic family and `asin` free of their cancellation band, `sinh`/`cosh`
-within 1 ulp to overflow, and a new `tan` (f64 and f32); toolchain 6.6.12. See
+**1.2.12** — the three 2026-10-03 filings closed: the SVD is one-sided Jacobi on a pivoted QR
+and decomposes every finite matrix tested (it refused square matrices with a zero or repeated row,
+among others), non-convergence is `-3`, and every linalg function that judges a matrix refuses a
+NaN or infinite entry; toolchain 6.6.15. See
 [`CHANGELOG.md`](CHANGELOG.md) for the full history and
 [`docs/development/state.md`](docs/development/state.md) for the live snapshot.
 Recent releases in brief:
 
 | | |
 |---|---|
+| **1.2.12** | SVD rewritten as Jacobi on a column- and row-pivoted QR ([ADR 0005](docs/adr/0005-svd-is-jacobi-on-a-pivoted-qr.md)): no finite input known to reach non-convergence, now `-3`; 2.5–2.8× faster at 20×20 and 40×40; non-finite input refused across linalg ([ADR 0004](docs/adr/0004-non-finite-input.md)); toolchain 6.6.15 |
 | **1.2.11** | `ganita_f64_tan` / `ganita_f32_tan` (fdlibm `k_tan`; tan needs stdlib math ≥ 6.6.9, [ADR 0003](docs/adr/0003-tan-uses-stdlib-rem-pio2.md)); `binomial` refuses only past i64_MAX; `atan2` signed zeros / NaN / (±∞, ±∞); sinh/tanh/atanh/asinh/acosh/asin up to 1.3e8 ulp → ~2; sinh/cosh overflow band 495 → 1 ulp; toolchain 6.6.12 |
 | **1.2.10** | toolchain 6.6.11; `cyrius coverage --min 100` (6.6.11 no longer counts the uncallable `main`) |
 | **1.2.9** | f32 `sin` / `cos` correct past 2^63 (the NaN guard dropped — stdlib's `f64_sin` reduces every finite argument since cyrius 6.6.9); toolchain 6.6.10 |
@@ -70,9 +72,11 @@ array-returning functions; **negative** for the status ones (`-1` allocation,
 `-2` contract violation, `-3` non-convergence), so `< 0` is a universal failure
 test; and **NaN** for `det` and `condition` — because `0.0` and `-1.0` are real
 answers *about the matrix* there, and overloading either would report an
-invertible matrix as singular. `ganita_mat_lu` is the one exception: its
-successes are the permutation signs `+1`/`-1`, so it folds failure into its
-existing `0`. The full table is in
+invertible matrix as singular. Three functions fail with `0` instead of a
+negative: `ganita_mat_lu`, whose successes are the permutation signs `+1`/`-1`,
+and `ganita_mat_cholesky` and `ganita_mat_gaussian_elim`, which return `1` on
+success. A NaN or infinite input is refused by every function that judges a
+matrix ([ADR 0004](docs/adr/0004-non-finite-input.md)). The full table is in
 [`docs/examples/README.md`](docs/examples/README.md).
 
 ## Build

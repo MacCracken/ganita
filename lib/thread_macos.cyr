@@ -173,10 +173,10 @@ fn thread_join(t): i64 {
 #
 # ⚖️ HONEST LIMITATION, stated rather than hidden: the pthread is created JOINABLE and never
 # joined, so libpthread retains its stack until process exit. Making it truly detached needs
-# `_pthread_detach` bound into __got, which means growing GOT_SIZE and the parallel
-# symtab/bind/indirect-symtab tables in src/backend/macho/emit.cyr — a Mach-O WRITER change
-# with its own verification surface, deliberately not bundled into the release that first makes
-# threads real. The behaviour is correct; the resource is retained.
+# `_pthread_detach` bound into __got: one more appended import in GOT_SIZE and the parallel
+# symtab/bind/indirect-symtab tables in src/backend/macho/emit.cyr (6.6.13 grew them for
+# `_fork` / `___error`, __got[7..8], so the shape is worked), plus its own emitter and an ecb
+# verification. Not done yet. The behaviour is correct; the resource is retained.
 fn thread_create_detached(fp, arg): i64 {
     if (thread_create(fp, arg) == 0) { return 0; }
     return 1;

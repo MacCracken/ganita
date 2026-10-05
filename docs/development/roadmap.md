@@ -20,11 +20,12 @@ The point at which `ganita_*` becomes load-bearing and cannot change.
 - [x] CHANGELOG complete from 1.0.0 onward
 - [x] Benchmark baseline captured (`scripts/bench-history.sh` → `bench-history.csv`)
 - [ ] **Test coverage adequate for the surface area** — `cyrius coverage` reports
-      100 % (142/142 at 1.2.11; it counts references since cyrius 6.6.8), and every
+      100 % (142/142 at 1.2.12; it counts references since cyrius 6.6.8), and every
       public fn and every `_compat` alias is now called by name. Counted on word
-      boundaries with private helpers included the repo is at 89 % (152/170). The
+      boundaries with private helpers included the repo is at 91 % (173/190). The
       floor is a floor, not the target: what is still dark is private helpers
-      (`_f64_is_*`, the pow core's pieces) reached only through their callers.
+      (`_f64_is_*`, the pow core's pieces, four older linalg helpers) reached only
+      through their callers.
 - [ ] **`_compat.cyr` removed** — 55 aliases still ship (53 legacy names plus
       `f64_cbrt` and `f64_tan`, which arrived with their functions), and they are
       exported into cyrius's stdlib namespace by the fold. Needs the consumers to
@@ -97,7 +98,16 @@ Deliberately not in ganita, so that nobody adds them by accident:
 
 ---
 
-## Moving the cyrius pin (done at 1.2.7: 6.6.4 → 6.6.7; at 1.2.8: → 6.6.9; at 1.2.9: → 6.6.10; at 1.2.10: → 6.6.11; at 1.2.11: → 6.6.12)
+## Moving the cyrius pin (done at 1.2.7: 6.6.4 → 6.6.7; at 1.2.8: → 6.6.9; at 1.2.9: → 6.6.10; at 1.2.10: → 6.6.11; at 1.2.11: → 6.6.12; at 1.2.12: → 6.6.15)
+
+**1.2.12 moved it to `cyrius = "6.6.15"`** by the same sequence, before any `src/` change. The
+gate was green on 1.2.11's own source, 844/844. `lib/` is the 112-file 6.6.15 snapshot: 16 files
+changed and `tls_hostid.cyr` is new. Two things to know for the next bump:
+- **Vendor from the release tarball.** The local `~/.cyrius/versions/6.6.15` was an in-flight
+  build reporting the same version string, with a different `cycc` and 6 different `lib/` files.
+  Vendoring from it would have failed CI's lib-parity step.
+- **`f64_le` / `f64_ge` / `f64_trunc` became compiler builtins at 6.6.13.** ganita's calls are
+  unchanged, but a future pin that drops the builtins would need them back from `math.cyr`.
 
 **1.2.11 moved it to `cyrius = "6.6.12"`** by the same sequence, before any `src/`
 change: the pin, `cyrius lib sync --full` (111 files, 22 changed, `lib/math.cyr` not

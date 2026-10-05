@@ -4,6 +4,224 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.12] — 2026-10-04 — the SVD rewritten; NaN and infinite input refused across linalg; toolchain 6.6.15
+
+Three filings closed: two from hisab 3.3.3 and one from the audit that followed them. Each
+repro now exits 0 on x86_64 and on aarch64 (qemu), and stays in
+`docs/development/issues/repros/` as a regression witness. **`ganita_mat_svd` is a new
+algorithm** — one-sided Jacobi on a column- and row-pivoted QR — so every SVD's bits change
+([ADR 0005](docs/adr/0005-svd-is-jacobi-on-a-pivoted-qr.md)). **Return codes a caller can see
+change:**
+- the SVD's non-convergence is −3, not −1;
+- a NaN or infinite input is refused across linalg
+  ([ADR 0004](docs/adr/0004-non-finite-input.md));
+- `rank` passes the SVD's −2 and −3 through;
+- `eigen_sym`'s allocation failure is −1, not −2.
+
+No public signature changed and no public function was added. Toolchain **6.6.12 → 6.6.15**.
+**1,235 assertions** (was 844).
+
+### Fixed — `ganita_mat_svd` refused finite matrices that have an SVD
+
+Through 1.2.11 the SVD was one-sided Jacobi on A divided by its largest entry. hisab 3.3.3 found
+it returning −1, "did not converge", for three classes of finite input:
+- square matrices with a zero or a repeated row: 499 or 500 of 500 random ones at every n from 3
+  to 10;
+- column pairs that needed a very small rotation: A(t) = [[1, t], [t, t], [t, −t]] for every
+  t ≤ 2^-513;
+- a full-rank 5×4 that two-cycled at rounding level.
+
+rank, condition and pseudo_inv inherited it, answering −1 ("allocation failed"), NaN and null for
+[[1, 2, 3], [1, 2, 3], [4, 5, 6]]. The filing traced four branches. Patching them one by one could
+not reach the null column, which unpreconditioned Jacobi wears down to a residue still parallel to
+its partner. The SVD is now Drmač and Veselić's preconditioned Jacobi (LAPACK dgejsv / dgesvj):
+1. A is scaled by a power of two so its largest entry sits near the top of the range (exact).
+2. Householder QR with column pivoting and Powell–Reid row pivoting: A·P1 = Q1·R1.
+3. For n ≥ 4 the same factorisation of R1ᵀ, and X = R2ᵀ; for n ≤ 3, X = R1ᵀ.
+4. One-sided Jacobi on X's columns. Each column is scaled by the power of two of its own largest
+   entry, so the test is a cosine at every magnitude, against tol = √n·2^-52, with DGESVJ's second
+   stopping test. The test gains an absolute floor near the subnormal range. t = 1/(2ζ) replaces
+   squaring ζ past 2^27, and a pair more than 500 binades apart is a projection.
+
+Every sum over m rows is pairwise. After the 60-sweep cap the status is −3. −1 is the single
+allocation. Nothing is written to an out-param on any non-zero status. `ganita_mat_svd`'s comment
+lists every deviation from the reference, each measured.
+
+Measured against an exact oracle (Python `Fraction` and mpmath, every σ certified correctly
+rounded):
+- **No finite input is known to reach −3.** This is a measurement, not a proof, so the cap stays.
+  - A 20,622-matrix corpus built for the filing passes 20,622/20,622, the 18 non-finite ones as
+    −2, in at most 7 sweeps (mean 2.3).
+  - 3,809 adversarial matrices built against three candidate repairs pass, in at most 10 sweeps.
+  - 819,998 hunted matrices are all status 0.
+- **Accuracy** on the corpus:
+  - σ within 7.8 u·σ₁ of exact, and U·Σ·Vᵀ = A to 6.9 u·σ₁;
+  - U orthonormal to 5.9 u over every non-zero σ, and Vᵀ to 17.7 u;
+  - graded matrices (spans up to 600 binades) have every σ within 25 ulps relatively. 1.2.11 was
+    off by up to 4.4e19 ulps, and returned one graded 5×4 with two U columns at cosine 0.99999999.
+- **x86_64 and aarch64 are bit-identical** on every set.
+- **Faster from 8×8 up.** Medians of three interleaved runs pinned to one core, against 1.2.11:
+  - 20×20 takes 0.40× the time, 40×40 0.36×, rank 40×40 0.41×;
+  - a zero-row 10×10 takes 70 µs, where 1.2.11 spent 726 µs returning −1;
+  - 3×3 is unchanged in full (1.00×), and 1.15× in values-only (rank, condition).
+
+The design was chosen by a panel. Three independent repairs ran on a shared harness, an adversary
+built inputs against each, and two judges with different lenses scored them. Both judges chose
+this one. The other two still returned −3 on inputs that have an SVD: a DGESVJ port without the
+QR, and 1.2.11 kept bit for bit with a robust fallback phase. ADR 0005 records why.
+
+**Found by the final verification, and fixed before release.** When A's largest entry is near
+DBL_MAX the working copy is scaled down. A column of X whose σ lies within a few binades above
+2^-1022 then becomes all subnormal, and the subnormal floor leaves it orthogonal to the others only
+to its absolute rounding. For n ≥ 4, U is built from X's columns. It came out 530 u from
+orthonormal on a 4096×4 that 1.2.11 passed (by returning σ₂..σ₄ = 0), and 5e4 u on a 2^20×5.
+
+Such a column is now made orthonormal to the others: two Gram–Schmidt passes, with a
+coordinate-axis restart if it collapses (private `_linalg_svd_reorth`). Those U columns now come
+out to 1.4 u. The fix changes no σ, no V and no other U column:
+- the corpus and adv2 are bit-identical with and without it;
+- on 12 adversarial matrices the U columns of subnormal σ go from up to 1.7e6 u to 1.3 u;
+- a 2,275-matrix hunt aimed at it goes from up to 3.2e15 u to 5.2 u.
+
+The comments' measured numbers that the verifiers re-measured (a floor count, a sweep bound,
+descriptions of three adversarial matrices) are corrected.
+
+### Fixed — the SVD family accepted NaN and infinite input
+
+`_linalg_svd_impl` never asked whether A was finite, and a NaN disappeared on the way. The scale
+and the column norms are ordered maxima, which a NaN never wins. A NaN cosine fails the
+orthogonality test, so its pair counted as converged. An all-NaN 2×2 came back as status 0 with
+σ = (0, 0); [[NaN, 0], [0, 2]] as status 0 with the finite σ = (2, 0). rank, condition and
+pseudo_inv followed with rank 0 or 1, −1.0 ("singular") and a matrix of zeros.
+
+Now one exponent-bit scan (`_linalg_all_finite`) refuses a NaN or infinite entry with −2 before
+any work. rank passes the −2 through, condition gives NaN and pseudo_inv null. The repro goes from
+18 to 0.
+
+### Fixed — the rest of linalg accepted NaN and infinite input
+
+The audit that followed found the same defect in 22 silent cases across eigen_sym, qr,
+least_squares, lu_solve, cholesky_solve, cholesky, det, max_norm, eq and is_symmetric. Two
+mechanisms caused nearly all of them:
+- an infinite entry made every relative threshold +∞, so qr returned Q = I and R = A, and
+  eigen_sym the raw diagonal, with status 0;
+- an ordered comparison dropped a NaN. least_squares fitted x from a single row of A, and eq
+  accepted any two matrices under a NaN tolerance.
+
+lu, inv and gaussian_elim refused an infinity only through the same accident, and only while
+`LINALG_EPS > 0`.
+
+[ADR 0004](docs/adr/0004-non-finite-input.md) records the rule now applied. **Every function that
+judges a matrix refuses a NaN or infinite entry in its own failure shape, before it writes
+anything. Every function that only carries values propagates it.**
+- `_linalg_all_finite` guards eigen_sym, qr, least_squares (A and b), lu and inv, det (NaN, not
+  +0.0), gaussian_elim (the whole augmented matrix, so a NaN right-hand side refuses too),
+  cholesky, lu_solve and cholesky_solve (the factor and b).
+- `_linalg_tol_ok` refuses a NaN, infinite or negative tolerance in eq and is_symmetric. Both
+  fail closed on infinities, which compared equal only because |∞ − ∞| is NaN. is_symmetric also
+  reads the diagonal now, as its doc always said.
+- max_norm, a carrier, no longer drops a row whose sum is NaN.
+- frobenius recomputes with the largest magnitude scaled out only when the plain sum is +∞ or
+  below 2^-969, so [[1e200, 1e200]] has a finite norm and every other input keeps its bits.
+- `ganita_mat_print` shows NaN, inf and -inf (was 0/100 and ±INT64_MAX/100).
+
+Also fixed, outside the 22 cases:
+- lu_solve refuses a pivot index outside [0, n), a zero pivot and a non-square factor (the index
+  and the shape read out of bounds);
+- cholesky_solve refuses a non-square factor, and checks before its `alloc`;
+- eigen_sym returns −1, not −2, when its working copy cannot be allocated.
+
+The repro goes from 22 to 0. Each scan costs one O(m·n) pass ahead of an O(n³) function.
+
+### Changed — the failure codes follow ADR 0001 (amended)
+
+- **cholesky and gaussian_elim are listed as exceptions next to lu.** They return 1 on success
+  and 0 on any failure. The rule is `< 0` on every status function except those three, and
+  `== 0` on them. They stay 1/0 so that no caller's `== 0` test breaks.
+- **SVD non-convergence is −3**, not −1, which ADR 0001 reserves for allocation failure. No finite
+  input is known to reach it.
+- **rank passes the SVD's status through.** It mapped every SVD failure to −1, which is how a
+  singular matrix read as "out of memory".
+
+### Tests
+
+**844 → 1,235 assertions**, green on x86_64 and on aarch64 (qemu), with output byte-identical.
+Four new groups:
+- SVD family, non-finite input: 19;
+- linalg, non-finite input: 87, including the two predicates called directly;
+- the SVD: 225. Every row is checked against the exact σ under bounds about twice what 1.2.12
+  measures; the measures use TwoSum and TwoProduct, so the test's own rounding does not count.
+  The rows:
+  - A(t) at four t, B1 and B2;
+  - the zero- and repeated-row squares, and W54 at two scales;
+  - graded and row-graded matrices, asked for relative accuracy;
+  - the tall 512×2, and the 8×4 and 4096×4 of the U fix;
+  - every special branch end to end;
+  - rank, condition and pseudo_inv on the textbook singular matrices;
+  - the guards no input reaches, tested on the helpers directly.
+
+  The U check covers every non-zero σ, not only normal ones.
+- the SVD's building blocks, called directly: 60.
+
+Mutation runs against the suite:
+- 22 of 25 SVD mutants fail it. The 3 survivors are equivalent.
+- 27 of 29 non-finite guard mutants fail it. The survivors are an equivalent pair in eq: either
+  check alone refuses the case.
+- 4 of 5 mutants of the U re-orthonormalisation fail it. The survivor, one Gram–Schmidt pass
+  instead of two, stays within about 2 u because only a column that keeps half its length is
+  accepted.
+
+Word-boundary coverage is 173/190 (91 %; was 152/170): every new helper is called by name. CI's
+floor for it rises **89 → 91**. Tool coverage is 142/142. Bench: four `mat_svd` rows in
+`tests/ganita.bcyr` (3×3, 20×20, 40×40, and a 10×10 with a zero row).
+
+### Added — `scripts/svdh/`, the SVD's evaluation harness
+
+The measurements above come from a harness that now ships with the repo: the corpus generator
+and its exact oracle (Python `Fraction` and mpmath, every σ certified correctly rounded), the
+scorer, the Cyrius drivers (full and values-only SVD; rank, condition and pseudo_inv), the
+adversarial sets, both hunts, the D1-family hunt, and a bench. Every generator rebuilds its data
+byte for byte, and its README lists the reference checksums and scores for 1.2.12 and for 1.2.11
+(`tree-at.sh` exports any revision's `src/`), so a later change to the SVD can be measured the
+same way. It is a manual tool, not a CI step: it needs Python with mpmath and numpy
+(`scripts/svdh/requirements.txt`), and it writes only under `build/svdh/`. The sweep and branch
+counts quoted in the source comments came from temporary instrumentation, and the row-graded
+study and the 2^20×5 run from one-off scripts; neither is carried.
+
+### Changed
+
+- **Toolchain pin 6.6.12 → 6.6.15**, moved and gated before any `src/` change (844/844 on the
+  1.2.11 source). `lib/` was re-vendored with `cyrius lib sync --full`: 112 files, 16 changed and
+  `tls_hostid.cyr` new, `diff -rq` clean against the published 6.6.15 tarball. That tarball was
+  the source, not the local install: on 2026-10-03 the local `~/.cyrius/versions/6.6.15` was an
+  in-flight build reporting the same version, with a different `cycc` and 6 different `lib/`
+  files. `cyrius.lock` re-locked, `dist/` regenerated.
+  - In `lib/math.cyr`, `f64_le`, `f64_ge` and `f64_trunc` became compiler builtins at 6.6.13,
+    and NaN still gives 0 for the two comparisons. ganita's nine `f64_le` / `f64_ge` call sites
+    compile to them unchanged. `_f64_rem_pio2`, behind tan, is byte-identical.
+  - `lib/ganita.cyr`, ganita's own fold vendored back, is 1.2.11 at this pin (6.6.12 carried
+    1.2.9).
+- ADR 0001 is amended, and ADRs 0004 and 0005 are new. README, the examples' failure table,
+  `docs/development/state.md` and the roadmap are refreshed. Two archived filings, from 1.2.11
+  and 1.2.4, linked to the ADR and audit folders one directory short; fixed.
+
+### Known
+
+- **σ₁ within a few ulps of DBL_MAX can come back +∞.** 7 of 563 matrices built for it do; 1.2.11
+  kept 4 of those finite. The cause is the final rounding, which any floating-point SVD has. It is
+  documented at `ganita_mat_svd`.
+- **pseudo_inv and condition go wrong at the two ends of the range** (pre-existing). A kept σ
+  below 2^-1024 gives NaN entries. A σ₁ that overflows makes condition call DBL_MAX·[[1, 1], [1,
+  −1]] singular, and pseudo_inv return zeros. Filed as
+  [`2026-10-04-svd-derived-functions-at-the-range-ends`](docs/development/issues/2026-10-04-svd-derived-functions-at-the-range-ends.md);
+  its repro gives 5 on both 1.2.11 and 1.2.12.
+
+### Consumers
+
+cyrius 6.6.15 carries ganita 1.2.11. 1.2.12 is built and gated on cyrius 6.6.15 for the next
+cyrius fold, and changes no public signature. A caller that pinned SVD bits, or read −1 from the
+SVD as "did not converge", sees the changes above.
+
 ## [1.2.11] — 2026-10-01 — the six 2026-09-30 filings closed; `tan` in f64 and f32; toolchain 6.6.12
 
 Six filings closed: four from abaco (2.4.8 – 2.4.11), one from hisab, one from abaco's final

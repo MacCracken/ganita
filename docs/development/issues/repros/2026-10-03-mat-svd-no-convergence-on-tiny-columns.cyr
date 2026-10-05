@@ -1,17 +1,27 @@
 # ganita_mat_svd returns -1 ("did not converge") for finite matrices that have an SVD,
 # whenever the Jacobi rotation for a column pair needs a very small angle: zeta^2
 # overflows (rows A1..A6), or one column's squared norm underflows to 0 and the
-# orthogonality threshold with it (rows B1, B2).
+# orthogonality threshold with it (rows B1, B2). Also for a square matrix with a zero or
+# repeated row, whose null column stays nearly parallel to its partner (rows Z and R,
+# branch 3), and for a full-rank 5x4 whose rotation two-cycles at rounding level (row
+# W54, branch 4).
 #
 # Self-proving: the exit code is the number of rows below that come back wrong -- 0
-# when every row is right. A row is right when ganita_mat_svd returns 0, both
-# singular values are within 4 * 2^-52 * sigma_1 (+ one subnormal step) of the exact
-# ones, and U's columns (for a normal sigma) and Vt's rows are orthonormal to 2^-44.
-# The sigma test is normwise -- what a backward-stable SVD guarantees -- so it does
-# not ask for relative accuracy in a sigma_2 far below sigma_1; the orthonormality
-# test is what rejects returning 0 without converging (the unrotated columns of A1
-# have cosine 0.577). The exact values were computed with python3 Fraction / Decimal
-# (80 digits) from these bit patterns and rounded once to double.
+# when every row is right. A row is right when ganita_mat_svd returns 0, every singular
+# value is within 4 * 2^-52 * sigma_1 (+ one subnormal step) of the exact one, and U's
+# columns (for a normal sigma) and Vt's rows are orthonormal to 2^-44. The sigma test is
+# normwise -- what a backward-stable SVD guarantees -- so it does not ask for relative
+# accuracy in a sigma far below sigma_1; the orthonormality test is what rejects
+# returning 0 without converging (the unrotated columns of A1 have cosine 0.577). The
+# exact values were computed with python3 Fraction / Decimal (80 digits) from these bit
+# patterns and rounded once to double; those of Z, R and W54 come from the oracle of
+# scripts/svdh (Fraction + mpmath, certified), which reproduces the filing's quoted bits.
+#
+# THE ZERO SIGMA. Z and R have rank 2, so sigma_3 is exactly 0 and its U column is not
+# determined by A: any unit vector orthogonal to the other two would do. These rows take
+# ganita's convention instead -- a sigma that comes back exactly 0 has an ALL-ZERO U
+# column -- and check the other columns as above. A sigma that comes back at rounding
+# level instead (backward-stable too) must have a unit U column like any normal sigma.
 #
 # Filed with docs/development/issues/2026-10-03-mat-svd-no-convergence-on-tiny-columns.md.
 # Found by hisab 3.3.3 (its svd_truncated now maps this -1 onto
@@ -19,14 +29,18 @@
 #
 # Build and run from the ganita repo root:
 #   cyrius build docs/development/issues/repros/2026-10-03-mat-svd-no-convergence-on-tiny-columns.cyr /tmp/svdtiny
-#   /tmp/svdtiny; echo "exit=$?"      # -> 6 on 1.2.4 .. 1.2.11 (A1, A4, A5, A6, B1, B2)
+#   /tmp/svdtiny; echo "exit=$?"
+# -> 9 on 1.2.11 (A1, A4, A5, A6, B1, B2, Z, R, W54, all rc -1; measured 2026-10-04 with
+#    cyrius 6.6.15 on the 1.2.11 src/, and the SVD is byte-identical back to 1.2.4)
+# -> 0 on 1.2.12 (QR-preconditioned one-sided Jacobi; every row rc 0)
 #
 # The rows: A = [[1, t], [t, t], [t, -t]] for six t (A1..A6), two measured witnesses of
-# the underflow branch (B1, B2), and a well-conditioned control (C). A2 and A3 decompose
-# today and are controls too; A1 and A2 sit ON the boundary -- 2^-513 is the largest t
-# that fails and the next double up is the smallest that works.
-# After the zeta^2 fix sketched in the filing (tested), the exit code is 2: B1 and B2
-# need the second part of the repair.
+# the underflow branch (B1, B2), a well-conditioned control (C), the filing's zero-row Z
+# and repeated-row R, and W54. A2 and A3 decompose on 1.2.11 and are controls too; A1 and
+# A2 sit ON the boundary -- 2^-513 is the largest t that fails and the next double up is
+# the smallest that works.
+# After the zeta^2 fix sketched in the filing (tested), the exit code is 5: B1 and B2 need
+# the second part of the repair, and Z, R and W54 the rest.
 #
 # Includes src/ directly rather than lib/ganita.cyr so it exercises the working source.
 # To run it against a stdlib fold instead, drop the include lines and build from a
@@ -124,6 +138,114 @@ fn m32(a, b, c, d, e, f) {
 # same thing on every toolchain.
 fn fam(t) { return m32(0x3FF0000000000000, t, t, t, t, t ^ 0x8000000000000000); }
 
+# The column dot product u_i . u_j of the rows x cols matrix u.
+fn cdot(u, rows, i, j) {
+    var d = 0;
+    var k = 0;
+    while (k < rows) {
+        d = f64_add(d, f64_mul(ganita_mat_get(u, k, i), ganita_mat_get(u, k, j)));
+        k = k + 1;
+    }
+    return d;
+}
+
+# 1 when the rows x n U and n x n Vt pass, for any shape: Vt's rows orthonormal to 2^-44;
+# for a normal sigma_j, U's column j unit to 2^-44 and orthogonal to 2^-44 to every
+# other normal sigma's column; for a sigma_j that is exactly 0, U's column j all zero
+# (ganita's convention: the column is not determined by A). A U column for a subnormal
+# sigma cannot be unit length (see ortho) and is not checked.
+fn orthog(u, s, vt, rows, n) {
+    var i = 0;
+    while (i < n) {
+        var j = i;
+        while (j < n) {
+            var vd = 0;
+            var k = 0;
+            while (k < n) {
+                vd = f64_add(vd, f64_mul(ganita_mat_get(vt, i, k), ganita_mat_get(vt, j, k)));
+                k = k + 1;
+            }
+            var want = 0;
+            if (i == j) { want = 0x3FF0000000000000; }
+            if (near(vd, want) == 0) { return 0; }
+            var ni = f64_ge(load64(s + i * 8), 0x0010000000000000);
+            var nj = f64_ge(load64(s + j * 8), 0x0010000000000000);
+            if (ni == 1) {
+                if (nj == 1) {
+                    if (near(cdot(u, rows, i, j), want) == 0) { return 0; }
+                }
+            }
+            j = j + 1;
+        }
+        if ((load64(s + i * 8) & 0x7FFFFFFFFFFFFFFF) == 0) {
+            if (cdot(u, rows, i, i) != 0) { return 0; }
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# Like row, for a rows x n matrix a with n exact singular values at w.
+fn rowg(label, a, w) {
+    var rows = ganita_mat_rows(a);
+    var n = ganita_mat_cols(a);
+    var s = alloc(n * 8);
+    var i = 0;
+    while (i < n) {
+        store64(s + i * 8, 0x7FF4000000000BAD);
+        i = i + 1;
+    }
+    var u = ganita_mat_new(rows, n);
+    var vt = ganita_mat_new(n, n);
+    var rc = ganita_mat_svd(a, u, s, vt);
+    var ok = 0;
+    if (rc == 0) {
+        ok = 1;
+        i = 0;
+        while (i < n) {
+            if (close(load64(s + i * 8), load64(w + i * 8), load64(w)) == 0) { ok = 0; }
+            i = i + 1;
+        }
+        if (ok == 1) { ok = orthog(u, s, vt, rows, n); }
+    }
+    if (ok == 0) {
+        _bad = _bad + 1;
+        out("  WRONG ");
+    } else {
+        out("  ok    ");
+    }
+    out(label);
+    out("  rc ");
+    fmt_int(rc);
+    if (rc == 0) {
+        out("  S");
+        i = 0;
+        while (i < n) {
+            out(" ");
+            hex(load64(s + i * 8));
+            i = i + 1;
+        }
+    }
+    out("  want");
+    i = 0;
+    while (i < n) {
+        out(" ");
+        hex(load64(w + i * 8));
+        i = i + 1;
+    }
+    out("\n");
+    return 0;
+}
+
+# A matrix from its row-major bit patterns, four at a time: p[k..k+4) = a, b, c, d.
+fn put4(p, k, a, b, c, d) {
+    store64(p + k * 8, a);
+    store64(p + k * 8 + 8, b);
+    store64(p + k * 8 + 16, c);
+    store64(p + k * 8 + 24, d);
+    return 0;
+}
+
 fn row(label, a, w1, w2) {
     var s = alloc(16);
     store64(s, 0x7FF4000000000BAD);
@@ -180,6 +302,35 @@ fn main() {
     var c = m32(0x3FF4CCCCCCCCCCCD, 0x3FE6666666666666, 0x4000CCCCCCCCCCCD,
       0xBFD999999999999A, 0x3FECCCCCCCCCCCCD, 0x3FF999999999999A);
     row("C  well-conditioned     ", c, 0x4005D534C62740B5, 0x3FFA27692399E1D9);
+    out("a null column that stays nearly parallel to its partner (branch 3): sigma_3 = 0\n");
+    var z = ganita_mat_new(3, 3);
+    put4(z + 16, 0, 0x3FF4CCCCCCCCCCCD, 0x400599999999999A, 0x3FD999999999999A, 0);
+    put4(z + 16, 4, 0, 0, 0x3FECCCCCCCCCCCCD, 0x3FF199999999999A);
+    store64(z + 16 + 64, 0x4002666666666666);
+    var wz = alloc(24);
+    store64(wz, 0x400D3FB1257408C4);
+    store64(wz + 8, 0x3FFC17E03945F102);
+    store64(wz + 16, 0);
+    rowg("Z  [[1.3, 2.7, 0.4], [0, 0, 0], [0.9, 1.1, 2.3]]", z, wz);
+    var r = ganita_mat_new(3, 3);
+    put4(r + 16, 0, 0x3FF0000000000000, 0x4000000000000000, 0x4008000000000000, 0x3FF0000000000000);
+    put4(r + 16, 4, 0x4000000000000000, 0x4008000000000000, 0x4010000000000000, 0x4014000000000000);
+    store64(r + 16 + 64, 0x4018000000000000);
+    var wr = alloc(24);
+    store64(wr, 0x4024646BB0023E7B);
+    store64(wr + 8, 0x3FF04ECE4EBDCE2C);
+    store64(wr + 16, 0);
+    rowg("R  [[1, 2, 3], [1, 2, 3], [4, 5, 6]]", r, wr);
+    out("a full-rank 5x4 whose rotation two-cycles at rounding level (branch 4)\n");
+    var w54 = ganita_mat_new(5, 4);
+    put4(w54 + 16, 0, 0xBFC2CACD2BBA2BFC, 0x3FF436F97395FC68, 0xC00807F8A62BF805, 0x3FF337DF0357C8C9);
+    put4(w54 + 16, 4, 0x3FEFD315ACC77FE7, 0xBFA1614B40EA6CC2, 0xC0295CEBBFDDBB61, 0xBFC32AF6F3470282);
+    put4(w54 + 16, 8, 0xBFD6269DC8658203, 0xC025B46BF0A392B4, 0x3FC03FF652EED9BF, 0);
+    put4(w54 + 16, 12, 0x3FDF9160669D391A, 0x3FCC98B730A0D724, 0xBFBC46376FF5E5C4, 0x3FC92A56372A02BB);
+    put4(w54 + 16, 16, 0xC02551ACEC11860F, 0x400130C3519E4F30, 0x3FC6D251F22A1E9B, 0x3FE9E1EFC1AEB952);
+    var ww = alloc(32);
+    put4(ww, 0, 0x402A55180C7066EC, 0x402793D5C3F35250, 0x4023BC5D726B72E5, 0x3FF2F035DF06D48A);
+    rowg("W54 (cond 11.12)", w54, ww);
     out("rows wrong: ");
     fmt_int(_bad);
     out("\n");

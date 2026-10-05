@@ -1,0 +1,347 @@
+# Outside the SVD family, ganita's linalg has no finite check. A NaN or infinite entry
+# comes back as SUCCESS with a FINITE, plausible answer from eigen_sym, qr,
+# least_squares, lu_solve, cholesky_solve, cholesky, det, max_norm, and from eq and
+# is_symmetric when the tolerance is not finite. Most of these are one of two
+# mechanisms: an ordered max (f64_gt is false against a NaN) drops the NaN, or an
+# infinity in the matrix scale turns the tolerance into +inf, so every "should I act?"
+# test fails and the function returns its input as if it were already reduced.
+#
+# Self-proving: the exit code is the number of checks below that come back wrong, so
+# 0 means every check is right. Each check demands the failure shape ADR 0001 gives
+# the function:
+#   status fns (eigen_sym, qr, least_squares, lu_solve, cholesky_solve) -> a negative
+#   det, max_norm (f64)                                                  -> NaN
+#   cholesky, gaussian_elim (1 = success)                                -> not 1
+#   inv (matrix)                                                         -> null
+#   eq, is_symmetric (1 = true)                                          -> 0
+# Only cases where today's answer is SILENT are checked: a status of success with every
+# output finite, or a finite f64. Cases where the NaN or infinity already shows in the
+# output (frobenius, trace, mat_mul, a NaN in least_squares' b, ...) are not.
+# Finite controls must keep working.
+#
+# Filed with docs/development/issues/2026-10-03-linalg-non-finite-input.md, from the
+# non-finite audit that followed the SVD family's fix in 1.2.12.
+#
+# Build and run from the ganita repo root:
+#   cyrius build docs/development/issues/repros/2026-10-03-linalg-non-finite-input.cyr /tmp/linf
+#   /tmp/linf; echo "exit=$?"      # -> 22 on 1.2.11 and on the 1.2.12 working tree
+#
+# NaN and infinity are written as bit patterns, so the program means the same thing on
+# every toolchain. Includes src/ directly rather than lib/ganita.cyr so it exercises the
+# working source.
+
+include "lib/syscalls.cyr"
+include "lib/string.cyr"
+include "lib/alloc.cyr"
+include "lib/fmt.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/math.cyr"
+
+include "src/matrix.cyr"
+include "src/linalg.cyr"
+
+var _NAN = 0x7FF8000000000000;
+var _PINF = 0x7FF0000000000000;
+var _ONE = 0x3FF0000000000000;
+var _TWO = 0x4000000000000000;
+var _THREE = 0x4008000000000000;
+var _FOUR = 0x4010000000000000;
+var _FIVE = 0x4014000000000000;
+var _SIX = 0x4018000000000000;
+var _TOL = 0x3E112E0BE826D695;   # 1e-9
+var _POISON = 0x7FF4000000000BAD;
+var _bad = 0;
+var _hexd = "0123456789abcdef";
+
+fn out(s) { syscall(1, 1, s, strlen(s)); return 0; }
+
+# 0x + 16 hex digits.
+fn hex(v) {
+    var buf[18];
+    store8(&buf, 48);
+    store8(&buf + 1, 120);
+    var i = 0;
+    while (i < 16) {
+        store8(&buf + 2 + i, load8(_hexd + ((v >> ((15 - i) * 4)) & 15)));
+        i = i + 1;
+    }
+    syscall(1, 1, &buf, 18);
+    return 0;
+}
+
+fn is_nan(v) {
+    if (((v >> 52) & 0x7FF) != 0x7FF) { return 0; }
+    if ((v & 0x000FFFFFFFFFFFFF) == 0) { return 0; }
+    return 1;
+}
+
+fn is_finite(v) { return ((v & 0x7FF0000000000000) != 0x7FF0000000000000); }
+
+# 1 when all n words at p are finite (so a success status hid the non-finite input).
+fn all_finite(p, n) {
+    var i = 0;
+    while (i < n) {
+        if (is_finite(load64(p + i * 8)) == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn poison(p, n) {
+    var i = 0;
+    while (i < n) { store64(p + i * 8, _POISON); i = i + 1; }
+    return 0;
+}
+
+fn m22(a, b, c, d) {
+    var m = ganita_mat_new(2, 2);
+    ganita_mat_set(m, 0, 0, a); ganita_mat_set(m, 0, 1, b);
+    ganita_mat_set(m, 1, 0, c); ganita_mat_set(m, 1, 1, d);
+    return m;
+}
+
+fn m33(a, b, c, d, e, f, g, h, k) {
+    var m = ganita_mat_new(3, 3);
+    ganita_mat_set(m, 0, 0, a); ganita_mat_set(m, 0, 1, b); ganita_mat_set(m, 0, 2, c);
+    ganita_mat_set(m, 1, 0, d); ganita_mat_set(m, 1, 1, e); ganita_mat_set(m, 1, 2, f);
+    ganita_mat_set(m, 2, 0, g); ganita_mat_set(m, 2, 1, h); ganita_mat_set(m, 2, 2, k);
+    return m;
+}
+
+fn m32(a, b, c, d, e, f) {
+    var m = ganita_mat_new(3, 2);
+    ganita_mat_set(m, 0, 0, a); ganita_mat_set(m, 0, 1, b);
+    ganita_mat_set(m, 1, 0, c); ganita_mat_set(m, 1, 1, d);
+    ganita_mat_set(m, 2, 0, e); ganita_mat_set(m, 2, 1, f);
+    return m;
+}
+
+# A 3x1 matrix.
+fn col3(a, b, c) {
+    var m = ganita_mat_new(3, 1);
+    ganita_mat_set(m, 0, 0, a);
+    ganita_mat_set(m, 1, 0, b);
+    ganita_mat_set(m, 2, 0, c);
+    return m;
+}
+
+# A flat f64 array of three, the shape least_squares takes b in.
+fn vec3(a, b, c) {
+    var v = alloc(24);
+    store64(v, a);
+    store64(v + 8, b);
+    store64(v + 16, c);
+    return v;
+}
+
+fn check(ok, label) {
+    if (ok == 0) {
+        _bad = _bad + 1;
+        out("  WRONG ");
+    } else {
+        out("  ok    ");
+    }
+    out(label);
+    return 0;
+}
+
+fn status_line(rc) {
+    out("  -> ");
+    fmt_int(rc);
+    out("\n");
+    return 0;
+}
+
+fn f64_line(v) {
+    out("  -> ");
+    hex(v);
+    out("\n");
+    return 0;
+}
+
+# eigen_sym: a negative status, or at least a non-finite value in the output.
+fn eig(label, a, n) {
+    var vals = alloc(n * 8);
+    var vecs = ganita_mat_new(n, n);
+    poison(vals, n);
+    var rc = ganita_mat_eigen_sym(a, vals, vecs);
+    check(rc < 0, label);
+    status_line(rc);
+    if (rc >= 0) {
+        out("          vals all finite: ");
+        fmt_int(all_finite(vals, n));
+        out("\n");
+    }
+    return 0;
+}
+
+fn qr(label, a) {
+    var r = ganita_mat_rows(a);
+    var c = ganita_mat_cols(a);
+    var q = ganita_mat_new(r, r);
+    var rr = ganita_mat_new(r, c);
+    var rc = ganita_mat_qr(a, q, rr);
+    check(rc < 0, label);
+    status_line(rc);
+    if (rc == 0) {
+        out("          Q finite: ");
+        fmt_int(all_finite(q + 16, r * r));
+        out("  R[last][0] (below the diagonal) = ");
+        hex(ganita_mat_get(rr, r - 1, 0));
+        out("\n");
+    }
+    return 0;
+}
+
+fn ls(label, a, b) {
+    var c = ganita_mat_cols(a);
+    var x = alloc(c * 8);
+    poison(x, c);
+    var rc = ganita_mat_least_squares(a, b, x);
+    check(rc < 0, label);
+    status_line(rc);
+    if (rc == 0) {
+        out("          x[0] = ");
+        hex(load64(x));
+        out("  all finite: ");
+        fmt_int(all_finite(x, c));
+        out("\n");
+    }
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    var nanm = m22(_NAN, 0, 0, _TWO);
+
+    out("eigen_sym — any infinity makes the tolerance +inf; a NaN off-diagonal is never a pivot\n");
+    eig("[[2, +inf], [+inf, 3]]  (today: 0 rotations, the raw diagonal (2, 3), vecs = I)",
+      m22(_TWO, _PINF, _PINF, _THREE), 2);
+    eig("[[1, NaN, 5], [NaN, 2, 0], [5, 0, 3]]  (today: (1, 2, 3) — the finite 5 is dropped too)",
+      m33(_ONE, _NAN, _FIVE, _NAN, _TWO, 0, _FIVE, 0, _THREE), 3);
+    eig("[[2, NaN], [NaN, 3]]", m22(_TWO, _NAN, _NAN, _THREE), 2);
+
+    out("qr — +inf in the scale skips every reflector; a NaN below the diagonal skips its own\n");
+    qr("[[1, 2], [3, 4], [5, +inf]]  (today: 0, Q = I, R = A, not triangular)",
+      m32(_ONE, _TWO, _THREE, _FOUR, _FIVE, _PINF));
+    qr("[[1, 2], [3, 4], [NaN, 6]]", m32(_ONE, _TWO, _THREE, _FOUR, _NAN, _SIX));
+
+    out("least_squares — the unreduced top triangle is solved against b[0..n-1]\n");
+    var lsb = vec3(_ONE, _TWO, _TWO);
+    ls("A = [[1, 1], [1, 2], [1, +inf]], b = (1, 2, 2)  (today: x = (0, 1))",
+      m32(_ONE, _ONE, _ONE, _TWO, _ONE, _PINF), lsb);
+    ls("A = [[1, 1], [NaN, 2], [1, 3]], b = (1, 2, 2)", m32(_ONE, _ONE, _NAN, _TWO, _ONE, _THREE), lsb);
+    ls("A = (2, NaN, 1)^T, b = (4, 1, 1)  (today: x = b0 / a00 = 2)", col3(_TWO, _NAN, _ONE), vec3(_FOUR, _ONE, _ONE));
+
+    out("det — reports a non-finite matrix as singular (0.0), the answer ADR 0001 forbids overloading\n");
+    var d1 = ganita_mat_det(nanm);
+    check(is_nan(d1), "det([[NaN, 0], [0, 2]]) is NaN");
+    f64_line(d1);
+    var d2 = ganita_mat_det(m22(_PINF, _ONE, _ONE, _ONE));
+    check(is_nan(d2), "det([[+inf, 1], [1, 1]]) is NaN");
+    f64_line(d2);
+
+    out("lu_solve / cholesky_solve — an infinite diagonal divides to 0 and decouples x\n");
+    var a2 = m22(_FOUR, _THREE, _SIX, _THREE);
+    var lu = ganita_mat_new(2, 2);
+    var piv = alloc(16);
+    ganita_mat_lu(a2, lu, piv);
+    ganita_mat_set(lu, 1, 1, _PINF);
+    var x2 = alloc(16);
+    poison(x2, 2);
+    var b2 = alloc(16);
+    store64(b2, _ONE);
+    store64(b2 + 8, _TWO);
+    var rcl = ganita_mat_lu_solve(lu, piv, b2, x2);
+    check(rcl < 0 || all_finite(x2, 2) == 0, "lu_solve with U[1][1] = +inf refuses (today: 0, x all finite)");
+    status_line(rcl);
+    var l2 = m22(_TWO, 0, _ONE, _PINF);
+    var x3 = alloc(16);
+    poison(x3, 2);
+    var rcc = ganita_mat_cholesky_solve(l2, b2, x3);
+    check(rcc < 0 || all_finite(x3, 2) == 0, "cholesky_solve with L[1][1] = +inf refuses (today: 0, x all finite)");
+    status_line(rcc);
+
+    out("cholesky — a +inf pivot is 'positive' and zeroes its column of L\n");
+    var rch = ganita_mat_cholesky(m22(_PINF, _TWO, _TWO, _THREE), ganita_mat_new(2, 2));
+    check(rch != 1, "cholesky([[+inf, 2], [2, 3]]) does not report success");
+    status_line(rch);
+
+    out("gaussian_elim — +inf anywhere refuses, but a NaN in the right-hand side returns 1\n");
+    var aug = ganita_mat_new(2, 3);
+    ganita_mat_set(aug, 0, 0, _TWO); ganita_mat_set(aug, 0, 1, _ONE); ganita_mat_set(aug, 0, 2, _NAN);
+    ganita_mat_set(aug, 1, 0, _ONE); ganita_mat_set(aug, 1, 1, _THREE); ganita_mat_set(aug, 1, 2, _FOUR);
+    var rcg = ganita_mat_gaussian_elim(aug);
+    check(rcg != 1, "gaussian_elim([[2, 1 | NaN], [1, 3 | 4]]) does not report success");
+    status_line(rcg);
+
+    out("lu / inv — the infinity refusal is a side effect of LINALG_EPS > 0\n");
+    var saved = LINALG_EPS;
+    LINALG_EPS = 0;
+    var inv0 = ganita_mat_inv(m22(_PINF, _ONE, _ONE, _ONE));
+    LINALG_EPS = saved;
+    check(inv0 == 0, "inv([[+inf, 1], [1, 1]]) is null with LINALG_EPS = 0 (today: a finite matrix)");
+    out("\n");
+
+    out("max_norm — a row holding a NaN is dropped by the ordered max\n");
+    var mn1 = ganita_mat_max_norm(m22(_NAN, _ONE, _TWO, _THREE));
+    check(is_nan(mn1), "max_norm([[NaN, 1], [2, 3]]) is NaN (today: 5, row 1's sum)");
+    f64_line(mn1);
+    var one = ganita_mat_new(1, 1);
+    ganita_mat_set(one, 0, 0, _NAN);
+    var mn2 = ganita_mat_max_norm(one);
+    check(is_nan(mn2), "max_norm([[NaN]]) is NaN (today: 0.0, the zero matrix's norm)");
+    f64_line(mn2);
+
+    out("eq / is_symmetric — a NaN or +inf tolerance accepts anything; the diagonal is never read\n");
+    var p = m22(_ONE, _TWO, _THREE, _FOUR);
+    var q = m22(_FIVE, 0, _SIX, _ONE);
+    var e1 = ganita_mat_eq(p, q, _NAN);
+    check(e1 == 0, "eq([[1, 2], [3, 4]], [[5, 0], [6, 1]], tol = NaN) is 0");
+    status_line(e1);
+    # The documented idiom, tol = LINALG_EPS * a norm of the operand, gives +inf here.
+    var pinf = m22(_PINF, _TWO, _THREE, _FOUR);
+    var e2 = ganita_mat_eq(pinf, q, f64_mul(LINALG_EPS, ganita_mat_frobenius(pinf)));
+    check(e2 == 0, "eq([[+inf, 2], [3, 4]], [[5, 0], [6, 1]], tol = LINALG_EPS * frobenius) is 0");
+    status_line(e2);
+    var s1 = ganita_mat_is_symmetric(p, _NAN);
+    check(s1 == 0, "is_symmetric([[1, 2], [3, 4]], tol = NaN) is 0");
+    status_line(s1);
+    var s2 = ganita_mat_is_symmetric(m22(_NAN, _ONE, _ONE, _TWO), _TOL);
+    check(s2 == 0, "is_symmetric([[NaN, 1], [1, 2]], 1e-9) is 0 (its doc: 0 for ANY NaN)");
+    status_line(s2);
+    var asym = m22(_NAN, _ONE, _FOUR, _TWO);
+    var s3 = ganita_mat_is_symmetric(asym, f64_mul(LINALG_EPS, ganita_mat_frobenius(asym)));
+    check(s3 == 0, "is_symmetric([[NaN, 1], [4, 2]], tol = LINALG_EPS * frobenius) is 0 (asymmetric!)");
+    status_line(s3);
+
+    out("finite controls\n");
+    var cv = alloc(16);
+    var cvec = ganita_mat_new(2, 2);
+    check(ganita_mat_eigen_sym(m22(_TWO, _ONE, _ONE, _THREE), cv, cvec) >= 0,
+      "eigen_sym([[2, 1], [1, 3]]) succeeds");
+    out("\n");
+    var cq = ganita_mat_qr(m32(_ONE, _TWO, _THREE, _FOUR, _FIVE, _SIX), ganita_mat_new(3, 3), ganita_mat_new(3, 2));
+    check(cq == 0, "qr of a finite 3x2 succeeds");
+    out("\n");
+    var cx = alloc(16);
+    check(ganita_mat_least_squares(m32(_ONE, _ONE, _ONE, _TWO, _ONE, _THREE), lsb, cx) == 0,
+      "least_squares of a finite 3x2 succeeds");
+    out("\n");
+    check(is_finite(ganita_mat_det(a2)), "det of a finite 2x2 is finite");
+    out("\n");
+    check(ganita_mat_eq(p, p, _TOL) == 1, "eq(A, A, 1e-9) is 1");
+    out("\n");
+    check(ganita_mat_is_symmetric(m22(_ONE, _TWO, _TWO, _ONE), _TOL) == 1,
+      "is_symmetric of a symmetric 2x2 is 1");
+    out("\n");
+
+    out("checks wrong: ");
+    fmt_int(_bad);
+    out("\n");
+    return _bad;
+}
+
+var r = main();
+sys_exit_group(r);

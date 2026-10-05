@@ -1,0 +1,209 @@
+# bench.cyr — wall-clock cost of ganita_mat_svd (full) and _linalg_svd_impl (values only).
+# Build FROM A TREE ROOT (cwd-relative includes), like driver.cyr:
+#   cd <tree> && cyrius build <harness>/bench.cyr <out>
+#
+# Each case: calibrate a batch size so one batch takes >= ~25 ms, then time 9 batches and
+# print the median and the minimum ns per call. The heap is rewound (alloc_reset) after every
+# call, inside the timed loop, so memory stays bounded; the inputs and out-params live in a
+# separate anonymous mapping that the reset does not touch. The reset zeroes only what the
+# call allocated, a few KiB at most, which is noise next to an O(m n^2 sweeps) SVD.
+
+include "lib/syscalls.cyr"
+include "lib/string.cyr"
+include "lib/alloc.cyr"
+include "lib/fmt.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/math.cyr"
+include "lib/bench.cyr"
+
+include "src/matrix.cyr"
+include "src/linalg.cyr"
+include "src/math_advanced.cyr"
+
+var _xa = 0;
+var _xp = 0;
+var _seed = 0x2545F4914F6CDD1D;
+
+fn out(s) { sys_write(1, s, strlen(s)); return 0; }
+
+fn pad(s, w) {
+    out(s);
+    var k = strlen(s);
+    while (k < w) { out(" "); k = k + 1; }
+    return 0;
+}
+
+fn numw(v, w) {
+    var buf[24];
+    var i = 23;
+    var x = v;
+    var neg = 0;
+    if (x < 0) { neg = 1; x = 0 - x; }
+    if (x == 0) { store8(&buf + i, 48); i = i - 1; }
+    while (x > 0) { store8(&buf + i, 48 + (x % 10)); x = x / 10; i = i - 1; }
+    if (neg == 1) { store8(&buf + i, 45); i = i - 1; }
+    var len = 23 - i;
+    var k = len;
+    while (k < w) { out(" "); k = k + 1; }
+    sys_write(1, &buf + i + 1, len);
+    return 0;
+}
+
+# bump allocator over a private mapping that alloc_reset() never sees
+fn xalloc(sz) {
+    if (_xa == 0) {
+        _xa = syscall(SYS_MMAP, 0, 0x4000000, 3, 0x22, 0 - 1, 0);
+        _xp = 0;
+    }
+    var p = _xa + _xp;
+    _xp = _xp + ((sz + 15) & (0 - 16));
+    return p;
+}
+
+fn xmat(rows, cols) {
+    var m = xalloc(16 + rows * cols * 8);
+    store64(m, rows);
+    store64(m + 8, cols);
+    var i = 0;
+    while (i < rows * cols) { store64(m + 16 + i * 8, 0); i = i + 1; }
+    return m;
+}
+
+# uniform-ish in (-1, 1), 21 random bits, deterministic
+fn rnd() {
+    _seed = _seed * 6364136223846793005 + 1442695040888963407;
+    var r = ((_seed >> 11) % 2000001) - 1000000;
+    return f64_div(f64_from(r), f64_from(1000000));
+}
+
+fn xrand(rows, cols) {
+    var m = xmat(rows, cols);
+    var i = 0;
+    while (i < rows * cols) { store64(m + 16 + i * 8, rnd()); i = i + 1; }
+    return m;
+}
+
+fn xproduct(rows, r, cols) {
+    var x = xrand(rows, r);
+    var y = xrand(r, cols);
+    var m = xmat(rows, cols);
+    var i = 0;
+    while (i < rows) {
+        var j = 0;
+        while (j < cols) {
+            var acc = f64_from(0);
+            var k = 0;
+            while (k < r) {
+                acc = f64_add(acc, f64_mul(ganita_mat_get(x, i, k), ganita_mat_get(y, k, j)));
+                k = k + 1;
+            }
+            ganita_mat_set(m, i, j, acc);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+var _u = 0;
+var _s = 0;
+var _vt = 0;
+var _last = 0;
+
+fn calls(a, full, reps) {
+    var i = 0;
+    while (i < reps) {
+        if (full == 1) {
+            _last = ganita_mat_svd(a, _u, _s, _vt);
+        } else {
+            _last = _linalg_svd_impl(a, 0, _s, 0, 0);
+        }
+        alloc_reset();
+        i = i + 1;
+    }
+    return 0;
+}
+
+var _times[72];   # 9 batch results (ns per call), i64
+
+fn sort9() {
+    var i = 0;
+    while (i < 9) {
+        var j = i + 1;
+        while (j < 9) {
+            if (load64(&_times + j * 8) < load64(&_times + i * 8)) {
+                var t = load64(&_times + i * 8);
+                store64(&_times + i * 8, load64(&_times + j * 8));
+                store64(&_times + j * 8, t);
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# times one (matrix, path); prints "median min reps"; returns the status
+fn timeit(a, full) {
+    calls(a, full, 3);
+    var reps = 1;
+    while (1 == 1) {
+        var t0 = now_ns();
+        calls(a, full, reps);
+        var dt = now_ns() - t0;
+        if (dt >= 25000000) { break; }
+        if (reps >= 4000000) { break; }
+        if (dt < 1000000) { reps = reps * 10; } else { reps = (reps * 30000000) / dt + 1; }
+    }
+    var b = 0;
+    while (b < 9) {
+        var t1 = now_ns();
+        calls(a, full, reps);
+        store64(&_times + b * 8, (now_ns() - t1) / reps);
+        b = b + 1;
+    }
+    sort9();
+    numw(load64(&_times + 4 * 8), 11);
+    numw(load64(&_times), 11);
+    numw(reps, 8);
+    return _last;
+}
+
+fn run_case(name, a) {
+    var rows = ganita_mat_rows(a);
+    var cols = ganita_mat_cols(a);
+    _u = xmat(rows, cols);
+    _s = xalloc(cols * 8);
+    _vt = xmat(cols, cols);
+    pad(name, 22);
+    var st = timeit(a, 1);
+    out("  ");
+    numw(st, 3);
+    out(" |");
+    var st2 = timeit(a, 0);
+    out("  ");
+    numw(st2, 3);
+    out("\n");
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    out("ns per call: median and min of 9 batches; reps = calls per batch; st = status\n");
+    out("case                   full: median        min    reps   st | values: median        min    reps   st\n");
+    run_case("rand 3x3", xrand(3, 3));
+    run_case("rand 8x8", xrand(8, 8));
+    run_case("rand 20x20", xrand(20, 20));
+    run_case("rand 40x40", xrand(40, 40));
+    run_case("rand 60x30", xrand(60, 30));
+    var z = xrand(10, 10);
+    var j = 0;
+    while (j < 10) { ganita_mat_set(z, 4, j, f64_from(0)); j = j + 1; }
+    run_case("10x10 zero row", z);
+    run_case("20x20 rank-15 prod", xproduct(20, 15, 20));
+    return 0;
+}
+
+var rc = main();
+sys_exit_group(rc);

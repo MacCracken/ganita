@@ -1,0 +1,7 @@
+# The versions the reference files (README.md) were made with; the generators warn on others.
+# python 3.14.7
+# openblas Haswell 16
+#   numpy's bundled OpenBLAS: the kernel set it ran (OPENBLAS_CORETYPE) and the thread count,
+#   which the generators set themselves (corpus.blas_setup) and warn on another kernel set.
+mpmath==1.4.1
+numpy==2.5.0

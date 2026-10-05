@@ -1,0 +1,175 @@
+# driver_rcp.cyr — rank, condition and pseudo_inv on every corpus matrix, for the adversarial sets.
+#
+# Reads corpus.bin on fd 0 and writes on fd 1, per matrix (report.py reads it):
+#   i64 status of _linalg_svd_impl(A, 0, S, 0, 0), then S[0] (sigma_1 bits, the poison when not
+#   written), i64 ganita_mat_rank(A, 0), tol = 1e-12 * sigma_1 (f64 bits; 0 when the status is
+#   not 0), i64 ganita_mat_rank(A, tol), ganita_mat_condition(A) (f64 bits), and then u64 1 and the
+#   m*n bits of ganita_mat_pseudo_inv(A) (n x m, row-major), or u64 0 when it returned null.
+# S is filled with the NaN poison 0x7FF4000000000BAD before the call.
+# Build it FROM A TREE ROOT that holds lib/ and src/ (includes are cwd-relative):
+#   cd <tree> && cyrius build <harness>/adv/driver_rcp.cyr <out>
+#
+# Memory: as driver.cyr. The corpus and the output live in their own anonymous mappings,
+# outside the bump heap, and alloc_reset() rewinds the heap after every matrix. Build with
+# `-D SVDH_NO_RESET` for a candidate that caches a heap pointer across calls.
+#
+# A diagnostic line goes to fd 2: matrices processed, and in how many A was modified (A is
+# compared with the input once per matrix, after all five calls).
+
+include "lib/syscalls.cyr"
+include "lib/string.cyr"
+include "lib/alloc.cyr"
+include "lib/fmt.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/math.cyr"
+
+include "src/matrix.cyr"
+include "src/linalg.cyr"
+include "src/math_advanced.cyr"
+
+var POISON = 0x7FF4000000000BAD;
+var IN_CAP = 0x40000000;    # 1 GiB virtual (NORESERVE, lazily committed)
+var OUT_CAP = 0x40000000;
+var _ob = 0;
+var _op = 0;
+
+fn err(s) { sys_write(2, s, strlen(s)); return 0; }
+
+fn errnum(v) {
+    var buf[24];
+    var i = 23;
+    var x = v;
+    var neg = 0;
+    if (x < 0) { neg = 1; x = 0 - x; }
+    if (x == 0) { store8(&buf + i, 48); i = i - 1; }
+    while (x > 0) {
+        store8(&buf + i, 48 + (x % 10));
+        x = x / 10;
+        i = i - 1;
+    }
+    if (neg == 1) { store8(&buf + i, 45); i = i - 1; }
+    sys_write(2, &buf + i + 1, 23 - i);
+    return 0;
+}
+
+fn die(s) { err("driver: "); err(s); err("\n"); sys_exit_group(2); return 0; }
+
+fn map_region(sz) {
+    var p = syscall(SYS_MMAP, 0, sz, 3, 0x4022, 0 - 1, 0);
+    if (p < 0) { die("mmap failed"); }
+    if (p == 0) { die("mmap failed"); }
+    return p;
+}
+
+fn emit(v) {
+    store64(_ob + _op, v);
+    _op = _op + 8;
+    if (_op > OUT_CAP - 64) { die("output region full"); }
+    return 0;
+}
+
+fn flush_all() {
+    var off = 0;
+    while (off < _op) {
+        var w = sys_write(1, _ob + off, _op - off);
+        if (w <= 0) { die("write failed"); }
+        off = off + w;
+    }
+    _op = 0;
+    return 0;
+}
+
+fn poison(p, nwords) {
+    var i = 0;
+    while (i < nwords) { store64(p + i * 8, POISON); i = i + 1; }
+    return 0;
+}
+
+fn load_matrix(src, rows, cols) {
+    var a = ganita_mat_new(rows, cols);
+    if (a == 0) { die("ganita_mat_new failed for A"); }
+    var i = 0;
+    while (i < rows * cols) { store64(a + 16 + i * 8, load64(src + i * 8)); i = i + 1; }
+    return a;
+}
+
+fn same_as(a, src, n) {
+    var i = 0;
+    while (i < n) {
+        if (load64(a + 16 + i * 8) != load64(src + i * 8)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn main() {
+    alloc_init();
+    var inb = map_region(IN_CAP);
+    _ob = map_region(OUT_CAP);
+    var len = 0;
+    while (1 == 1) {
+        if (len >= IN_CAP - 4096) { die("input too large"); }
+        var r = sys_read(0, inb + len, IN_CAP - len);
+        if (r < 0) { die("read failed"); }
+        if (r == 0) { break; }
+        len = len + r;
+    }
+    if (len < 8) { die("short input"); }
+    var count = load64(inb);
+    var p = inb + 8;
+    var end = inb + len;
+    var k = 0;
+    var modified = 0;
+    while (k < count) {
+        if (p + 16 > end) { die("truncated corpus header"); }
+        var rows = load64(p);
+        var cols = load64(p + 8);
+        p = p + 16;
+        if (rows <= 0 || cols <= 0) { die("bad shape"); }
+        if (p + rows * cols * 8 > end) { die("truncated corpus data"); }
+
+        # rank(A, 0), rank(A, 1e-12 * s1), condition(A), pseudo_inv(A)
+        var a = load_matrix(p, rows, cols);
+        var s = alloc(cols * 8);
+        if (s == 0) { die("alloc failed"); }
+        poison(s, cols);
+        var st = _linalg_svd_impl(a, 0, s, 0, 0);
+        emit(st);
+        emit(load64(s));
+        var r0 = ganita_mat_rank(a, 0);
+        emit(r0);
+        var tol = 0;
+        if (st == 0) { tol = f64_mul(0x3D719799812DEA11, load64(s)); }
+        emit(tol);
+        var r1 = ganita_mat_rank(a, tol);
+        emit(r1);
+        var cn = ganita_mat_condition(a);
+        emit(cn);
+        var pi = ganita_mat_pseudo_inv(a);
+        if (pi == 0) {
+            emit(0);
+        } else {
+            emit(1);
+            var i = 0;
+            while (i < rows * cols) { emit(load64(pi + 16 + i * 8)); i = i + 1; }
+        }
+        if (same_as(a, p, rows * cols) == 0) { modified = modified + 1; }
+        p = p + rows * cols * 8;
+        if (_op > 0x1000000) { flush_all(); }
+        #ifndef SVDH_NO_RESET
+        alloc_reset();
+        #endif
+        k = k + 1;
+    }
+    flush_all();
+    err("driver: ");
+    errnum(count);
+    err(" matrices; matrices where a call modified A: ");
+    errnum(modified);
+    err("\n");
+    return 0;
+}
+
+var rc = main();
+sys_exit_group(rc);
