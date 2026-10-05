@@ -4,6 +4,37 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.13] — 2026-10-04 — `pseudo_inv` and `condition` right at the ends of the double range
+
+One filing closed: `2026-10-04-svd-derived-functions-at-the-range-ends`, from the 1.2.12
+verification. Its repro goes from 5 wrong checks to 0. No public signature changed, and no result
+changed for any matrix whose singular values neither under- nor overflow (the 1.2.6 test that
+rebuilds pseudo_inv's arithmetic bit for bit still passes). Toolchain stays at **6.6.15**.
+**1,248 assertions** (was 1,235).
+
+### Fixed — `pseudo_inv` NaN entries, and `pseudo_inv` / `condition` when σ₁ overflows
+
+Both functions took σ already unscaled to A's own magnitude, then did arithmetic on it that the
+SVD's working scale would have kept in range:
+- **A kept σ below 2^-1024**: 1/σ was +∞ and met Vᵀ's zeros as NaN. diag(2^-1060, 2^-1060) gave
+  four NaN entries; it now gives diag(+∞, +∞), the exact pseudo-inverse rounded once.
+  diag(2^-1000, 2^-1030) gives diag(2^1000, +∞).
+- **σ₁ above DBL_MAX**: σ₁ was +∞, so 1e-12·σ₁ was +∞ and every σ was "negligible". `condition`
+  answered −1.0 ("singular") for DBL_MAX·[[1, 1], [1, −1]], whose condition number is exactly 1,
+  and `pseudo_inv` answered zeros. They now give 1 and [[1, 1], [1, −1]]/(2·DBL_MAX), subnormal
+  entries correctly rounded. DBL_MAX·[[1, 1], [1, ½]] gives 6.3423292192132454 to 2 ulps.
+
+`_linalg_svd_impl` takes a sixth argument, `out_sh`. When it is non-zero the singular values
+come back in the working scale, σ_j·2^sh, with σ₁ near 2^1020, and sh is stored there. `condition`
+takes the ratio there, where the power of two cancels. `pseudo_inv` forms each kept reciprocal as
+2^t/σ_j′, with t = ⌊log₂ σ₁′⌋. It applies the one remaining factor, 2^(sh−t), to each entry at the
+end, rounded once. An entry above DBL_MAX is ±∞, as IEEE arithmetic rounds it, and no entry is
+NaN. `ganita_mat_svd` and `rank` pass 0, so their bits are unchanged. The svdh harness drivers
+follow the new arity.
+
+`rank` still accepts a tolerance of +∞ (answer 0). The filing raised it as a question, not as a
+defect, and it stays as documented.
+
 ## [1.2.12] — 2026-10-04 — the SVD rewritten; NaN and infinite input refused across linalg; toolchain 6.6.15
 
 Three filings closed: two from hisab 3.3.3 and one from the audit that followed them. Each
@@ -213,7 +244,7 @@ study and the 2^20×5 run from one-off scripts; neither is carried.
 - **pseudo_inv and condition go wrong at the two ends of the range** (pre-existing). A kept σ
   below 2^-1024 gives NaN entries. A σ₁ that overflows makes condition call DBL_MAX·[[1, 1], [1,
   −1]] singular, and pseudo_inv return zeros. Filed as
-  [`2026-10-04-svd-derived-functions-at-the-range-ends`](docs/development/issues/2026-10-04-svd-derived-functions-at-the-range-ends.md);
+  [`2026-10-04-svd-derived-functions-at-the-range-ends`](docs/development/issues/archived/2026-10-04-svd-derived-functions-at-the-range-ends.md);
   its repro gives 5 on both 1.2.11 and 1.2.12.
 
 ### Consumers

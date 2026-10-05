@@ -87,7 +87,7 @@ status. The cap stays at 60 sweeps.
 - **Neutral.**
   - `pseudo_inv` and `condition` still work from σ unscaled to A's magnitude, which goes wrong at
     the ends of the range. That is pre-existing, and filed as
-    [`2026-10-04-svd-derived-functions-at-the-range-ends`](../development/issues/2026-10-04-svd-derived-functions-at-the-range-ends.md).
+    [`2026-10-04-svd-derived-functions-at-the-range-ends`](../development/issues/archived/2026-10-04-svd-derived-functions-at-the-range-ends.md).
 
 ## Alternatives considered
 

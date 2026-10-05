@@ -1,6 +1,13 @@
 # `pseudo_inv` and `condition` go wrong at the two ends of the double range — NaN entries when a kept σ is below 2^-1024, "singular" and a zero pseudo-inverse when σ₁ overflows
 
-**Status:** 🟡 **OPEN** — found by the 1.2.12 verification of the SVD rewrite.
+**Status:** ✅ **RESOLVED in 1.2.13.** Repro 5 → 0. `_linalg_svd_impl` gained an `out_sh`
+out-param that returns σ in the working scale, σ_j·2^sh, as this filing proposed. `condition`
+takes σ₁′/σ_n′ there. `pseudo_inv` scales Vᵀ's rows by 2^t/σ_j′, with t = ⌊log₂ σ₁′⌋, and
+applies 2^(sh−t) to each entry once at the end. An overflowing entry is ±∞ rather than refused
+(null): the input is finite and the answer is IEEE's rounding of the exact one. Results are
+bit-identical wherever no unscaled σ under- or overflows. `rank`'s +∞ tolerance is unchanged.
+Regression group in `tests/ganita.tcyr` (1.2.13).
+**Originally:** OPEN, found by the 1.2.12 verification of the SVD rewrite.
 **Placement:** unpinned.
 **Discovered:** 2026-10-04, while verifying the 1.2.12 SVD (`ganita_mat_svd` is not at fault: its σ, U
 and Vᵀ are right on every input below, and +∞ is the correctly rounded σ₁ in the overflow rows).

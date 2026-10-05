@@ -2,7 +2,7 @@
 #
 # Reads corpus.bin on fd 0 and writes results on fd 1 in driver.cyr's format (../README.md):
 #   i64 status of ganita_mat_svd(A, U, S, Vt), n sigma bits, m*n U bits, n*n Vt bits,
-#   i64 status of _linalg_svd_impl(A, 0, S2, 0, 0), n sigma bits.
+#   i64 status of _linalg_svd_impl(A, 0, S2, 0, 0, 0), n sigma bits.
 # and on fd 3, per matrix, two i64: the nanoseconds the full call and the values-only call took.
 # The clock is syscall 228 (clock_gettime on x86_64 Linux) with CLOCK_MONOTONIC; an aarch64
 # build gets clock_gettime too (cyrius renumbers the x86_64 syscall numbers for aarch64), and
@@ -172,7 +172,7 @@ fn main() {
         if (s2 == 0) { die("alloc failed"); }
         poison(s2, cols);
         var t2 = now_ns2();
-        var st2 = _linalg_svd_impl(a2, 0, s2, 0, 0);
+        var st2 = _linalg_svd_impl(a2, 0, s2, 0, 0, 0);
         var t3 = now_ns2();
         store64(_tb + _tp, t3 - t2);
         _tp = _tp + 8;

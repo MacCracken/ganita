@@ -7,7 +7,7 @@
 #
 # Per matrix it writes:
 #   i64 status of ganita_mat_svd(A, U, S, Vt), n sigma bits, m*n U bits, n*n Vt bits,
-#   i64 status of _linalg_svd_impl(A, 0, S2, 0, 0), n sigma bits.
+#   i64 status of _linalg_svd_impl(A, 0, S2, 0, 0, 0), n sigma bits.
 # Every out-param is filled with the NaN poison 0x7FF4000000000BAD before the call,
 # so anything the call did not write is visible.
 #
@@ -156,7 +156,7 @@ fn main() {
         var s2 = alloc(cols * 8);
         if (s2 == 0) { die("alloc failed"); }
         poison(s2, cols);
-        var st2 = _linalg_svd_impl(a2, 0, s2, 0, 0);
+        var st2 = _linalg_svd_impl(a2, 0, s2, 0, 0, 0);
         if (same_as(a2, p, rows * cols) == 0) { modified = modified + 1; }
         emit(st2);
         i = 0;

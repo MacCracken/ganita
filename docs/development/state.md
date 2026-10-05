@@ -2,10 +2,17 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-10-04 (1.2.12 — the SVD rewritten as Jacobi on a pivoted QR, NaN and
-> infinite input refused across linalg, toolchain 6.6.15).
+> Last refreshed: 2026-10-04 (1.2.13 — pseudo_inv and condition right at the ends of the double
+> range, toolchain 6.6.15).
 
 ## Version
+
+**1.2.13** — **the one open filing closed:
+`2026-10-04-svd-derived-functions-at-the-range-ends`**. Repro 5 → 0. `pseudo_inv` and `condition`
+take σ in the SVD's working scale (`_linalg_svd_impl`'s new `out_sh` out-param). A kept σ below
+2^-1024 no longer makes NaN entries, and an overflowing σ₁ no longer reads as "singular". Every
+result is bit-identical wherever no unscaled σ under- or overflows. **1,248 assertions** (was
+1,235). Toolchain unchanged at 6.6.15.
 
 **1.2.12** — **the three 2026-10-03 filings closed: the SVD rewritten, and non-finite input
 refused.** Each repro now exits 0 on x86_64 and on aarch64:
@@ -294,7 +301,7 @@ operands whose product is not.
   `ganita_mat_pseudo_inv`, in its transposed form, both go through it.
   Single-pass order: matrix → linalg → math_advanced → math_f32 → `_compat`
   last, since its aliases reference every `ganita_*` symbol.
-- `dist/ganita.cyr` — regenerated via `cyrius distlib` at 1.2.12 on 6.6.15 (5002 lines; 3863 at 1.2.11). This is the artifact folded into `cyrius/lib/ganita.cyr`. Regeneration
+- `dist/ganita.cyr` — regenerated via `cyrius distlib` at 1.2.13 on 6.6.15 (5036 lines; 5002 at 1.2.12). This is the artifact folded into `cyrius/lib/ganita.cyr`. Regeneration
   is idempotent.
 - `dist/ganita.deps` — 10 stdlib leaves: `syscalls string alloc fmt vec str math
   io assert bench`. Verified sufficient by `scripts/consumer-check.sh` (`str` is
@@ -316,7 +323,7 @@ operands whose product is not.
   band, the overflow band, and tan in f64 and f32** (37 + 65 + 58 + 13 + 73 assertions) +
   **the 1.2.12 groups: non-finite input in the SVD family and the rest of linalg, the SVD against
   exact σ, and its building blocks called directly** (19 + 87 + 225 + 60 assertions).
-  **1,235 assertions, green** on 6.6.15, x86_64 and aarch64 (qemu), output byte-identical.
+  **1,248 assertions, green** on 6.6.15 (1,235 at 1.2.12), x86_64 and aarch64 (qemu), output byte-identical.
 
   **The 1.2.12 SVD is measured by `scripts/svdh/`, its evaluation harness** (README there).
   The claims in `ganita_mat_svd`'s comment rest on the sets it rebuilds deterministically:
@@ -476,11 +483,11 @@ wrong thing:
 
 ## Open filings
 
-**One**, pre-existing and of low severity:
+**None.** 1.2.13 closed the one open at 1.2.12:
 
-| Severity | Filing | State |
+| Severity | Filing | Resolution |
 |---|---|---|
-| LOW | [`svd-derived-functions-at-the-range-ends`](issues/2026-10-04-svd-derived-functions-at-the-range-ends.md) (1.2.12 verification) | pseudo_inv gives NaN entries for a kept σ below 2^-1024. When σ₁ overflows, condition returns −1.0 and pseudo_inv zeros. Repro exits 5 on 1.2.11 and 1.2.12. A fix is proposed (work in the SVD's working scale), not prototyped. |
+| LOW | [`svd-derived-functions-at-the-range-ends`](issues/archived/2026-10-04-svd-derived-functions-at-the-range-ends.md) (1.2.12 verification) | pseudo_inv and condition take σ in the SVD's working scale; entries past DBL_MAX are ±∞, none NaN. Repro 5 → 0. |
 
 1.2.12 closed the three filed on 2026-10-03, and all are in `issues/archived/` with resolution
 banners:

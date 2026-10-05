@@ -1,7 +1,7 @@
 # driver_rcp.cyr — rank, condition and pseudo_inv on every corpus matrix, for the adversarial sets.
 #
 # Reads corpus.bin on fd 0 and writes on fd 1, per matrix (report.py reads it):
-#   i64 status of _linalg_svd_impl(A, 0, S, 0, 0), then S[0] (sigma_1 bits, the poison when not
+#   i64 status of _linalg_svd_impl(A, 0, S, 0, 0, 0), then S[0] (sigma_1 bits, the poison when not
 #   written), i64 ganita_mat_rank(A, 0), tol = 1e-12 * sigma_1 (f64 bits; 0 when the status is
 #   not 0), i64 ganita_mat_rank(A, tol), ganita_mat_condition(A) (f64 bits), and then u64 1 and the
 #   m*n bits of ganita_mat_pseudo_inv(A) (n x m, row-major), or u64 0 when it returned null.
@@ -134,7 +134,7 @@ fn main() {
         var s = alloc(cols * 8);
         if (s == 0) { die("alloc failed"); }
         poison(s, cols);
-        var st = _linalg_svd_impl(a, 0, s, 0, 0);
+        var st = _linalg_svd_impl(a, 0, s, 0, 0, 0);
         emit(st);
         emit(load64(s));
         var r0 = ganita_mat_rank(a, 0);

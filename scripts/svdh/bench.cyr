@@ -117,7 +117,7 @@ fn calls(a, full, reps) {
         if (full == 1) {
             _last = ganita_mat_svd(a, _u, _s, _vt);
         } else {
-            _last = _linalg_svd_impl(a, 0, _s, 0, 0);
+            _last = _linalg_svd_impl(a, 0, _s, 0, 0, 0);
         }
         alloc_reset();
         i = i + 1;

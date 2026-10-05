@@ -1,6 +1,6 @@
 # svdh — the evaluation harness for ganita's SVD
 
-svdh scores `ganita_mat_svd` (the full decomposition) and `_linalg_svd_impl(m, 0, s, 0, 0)` (the
+svdh scores `ganita_mat_svd` (the full decomposition) and `_linalg_svd_impl(m, 0, s, 0, 0, 0)` (the
 values-only path behind `rank` and `condition`) from any ganita tree. It compares them against an
 exact oracle on a fixed corpus of 20,622 matrices, and against two adversarial sets. It also runs
 hunts that need no oracle. These are the measurements behind the numbers in `ganita_mat_svd`'s
@@ -218,7 +218,7 @@ All binary files are little-endian u64 / i64 words.
   `grading` on some matrices: the condition number of the row- or column-normalised matrix.
 - **results.bin** (`driver.cyr`, `driver_adv.cyr`), per matrix, in corpus order: `status` (i64,
   `ganita_mat_svd`), `n` σ bits, `m·n` U bits (row major), `n·n` Vt bits, `status_vo` (i64,
-  `_linalg_svd_impl(A, 0, S2, 0, 0)`), `n` σ bits. That is 8·(2 + 2n + mn + n²) bytes per
+  `_linalg_svd_impl(A, 0, S2, 0, 0, 0)`), `n` σ bits. That is 8·(2 + 2n + mn + n²) bytes per
   matrix. Before each call every out-param word is set to the poison `0x7FF4000000000BAD`, so
   output that was not written stays visible.
 - **times_\<L\>.bin** (`driver_adv.cyr`, fd 3): per matrix, two i64, the nanoseconds of the full

@@ -17,13 +17,13 @@
 #                and mpmath, rounded once); -1.0 is the wrong answer "singular"
 # A control (diag(2, 3)) must still give its exact answers.
 #
-# Filed with docs/development/issues/2026-10-04-svd-derived-functions-at-the-range-ends.md.
+# Filed with docs/development/issues/archived/2026-10-04-svd-derived-functions-at-the-range-ends.md.
 # Found by the 1.2.12 verification of the SVD rewrite; every check gives the same result on
 # 1.2.11, so neither defect is new.
 #
 # Build and run from the ganita repo root:
 #   cyrius build docs/development/issues/repros/2026-10-04-svd-derived-functions-at-the-range-ends.cyr /tmp/svdends
-#   /tmp/svdends; echo "exit=$?"      # -> 5 on 1.2.11 and 1.2.12
+#   /tmp/svdends; echo "exit=$?"      # -> 5 on 1.2.11 and 1.2.12; 0 from 1.2.13
 #
 # Every value is written as a bit pattern, so the program means the same thing on every
 # toolchain. Includes src/ directly rather than lib/ganita.cyr so it exercises the working
