@@ -214,6 +214,23 @@ jobs:
       - name: Distribution — bundle compiles as a downstream consumer
         run: ./scripts/consumer-check.sh "${RUNNER_TEMP}/consumer-check"
 
+      # From 1.2.14 (cyrius 6.6.18 distlib) the bundle carries a compile-verified
+      # "# Requires" include block, so `include "dist/ganita.cyr"` alone compiles.
+      # `cyrius test` above also runs this file, but it auto-prepends the
+      # manifest's [deps].stdlib, which would hide a bundle without the block —
+      # so build it here with --no-deps, where the bundle's own includes are the
+      # only stdlib in scope. The 1.2.13 bundle fails this step (F64_HALF undefined).
+      - name: Distribution — bundle compiles from a raw include alone
+        run: |
+          set -euo pipefail
+          bin="${RUNNER_TEMP}/ganita_raw_include"
+          out=$(cyrius build --no-deps tests/ganita_raw_include.tcyr "$bin" 2>&1) || {
+            printf '%s\n' "$out"; echo "::error::tests/ganita_raw_include.tcyr does not compile from the bundle alone"; exit 1; }
+          if printf '%s\n' "$out" | grep -q '^warning:'; then
+            printf '%s\n' "$out" | grep '^warning:'; echo "::error::raw-include build emitted compiler warnings"; exit 1
+          fi
+          "$bin"
+
       # Documentation that is VERIFIED rather than asserted. Every file in
       # docs/examples/ is a real program against the real API, so an example
       # that stopped being true fails the gate instead of quietly becoming a

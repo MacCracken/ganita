@@ -25,9 +25,9 @@ var CLOCK_MONOTONIC = 1;
 # bare `syscall(...)` builtin, and a consumer whose `[deps] stdlib` lists "chrono" without
 # "syscalls" therefore stopped building for PE with `undefined function 'sys_qpc_ns'`.
 # Nothing in-repo caught it (every in-repo consumer pulls lib/syscalls.cyr) and the
-# vendoring closure cannot rescue it either — `_distlib_union_declared_stdlib` derives its
-# edges from literal `include "lib/X.cyr"` lines, and there is no chrono→syscalls edge to
-# derive. Pinned by tests/gates/toolchain/bench_timer_floor_measured.sh axis E, which
+# vendoring closure cannot rescue it either — it derives its edges from
+# literal `include "lib/X.cyr"` lines, and there is no chrono→syscalls edge. Pinned by
+# tests/gates/toolchain/bench_timer_floor_measured.sh axis E, which
 # cross-builds a chrono-only consumer for PE. CHANGELOG [6.6.5].
 #
 # 0xF038 = 61496 → kernel32!QueryPerformanceCounter(LARGE_INTEGER*)

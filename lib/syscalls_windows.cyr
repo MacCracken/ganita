@@ -856,6 +856,16 @@ fn sys_fcntl(fd, cmd, arg): i64 { return 0 - 38; }
 fn fd_set_nonblocking(fd): i64 { return 0 - 38; }
 # Restore saved fd status flags. Declines on Windows.
 fn fd_restore_flags(fd, saved): i64 { return 0 - 38; }
+# The calling thread's last Winsock error, negated: -WSAGetLastError (0xF024). WSAGetLastError
+# returns a C `int` and the reroute defines only eax (no extension in the emitter), so the
+# value is masked to 32 bits before it is negated. Never 0: a failure must not read as
+# success. Same contract as lib/net.cyr's _net_wsa_err, which this file cannot include.
+# CHANGELOG [6.6.16]
+fn _sw_wsa_err(): i64 {
+    var e = syscall(61476) & 0xFFFFFFFF;            # WSAGetLastError (0xF024)
+    if (e == 0) { return 0 - 1; }
+    return 0 - e;
+}
 # Wait until SOCKET `fd` is readable (`want_write` == 0) or writable (`want_write` != 0), for at
 # most `timeout_ms` ms (< 0 waits indefinitely; clamped to INT_MAX). Returns 1 ready — including
 # an error or hang-up, so the next recv/send reports it — 0 on timeout, or -WSAGetLastError
@@ -865,6 +875,8 @@ fn fd_restore_flags(fd, saved): i64 { return 0 - 38; }
 # ws2_32!WSAPoll (0xF04A, sign-extended) over one WSAPOLLFD { SOCKET; SHORT events, revents },
 # with POLLRDNORM 0x100 / POLLWRNORM 0x10 — Windows refuses POLLIN's POLLPRI half. Sockets only:
 # WSAPoll knows nothing of file or pipe HANDLEs. Same contract as the POSIX peer. CHANGELOG [6.6.13]
+# The error read goes through _sw_wsa_err: WSAGetLastError returns a C `int`, and the 0xF024
+# reroute defines only eax, so rax[63:32] is the callee's to leave dirty. CHANGELOG [6.6.16]
 fn fd_wait_ready(fd, want_write, timeout_ms): i64 {
     if (fd < 0) { return 0 - 10038; }                   # INVALID_SOCKET → -WSAENOTSOCK
     var ms = timeout_ms;
@@ -877,7 +889,7 @@ fn fd_wait_ready(fd, want_write, timeout_ms): i64 {
     store16(&pfd + 10, 0);
     store32(&pfd + 12, 0);
     var r = syscall(0xF04A, &pfd, 1, ms);               # WSAPoll
-    if (r < 0) { return 0 - syscall(61476); }           # -WSAGetLastError (0xF024)
+    if (r < 0) { return _sw_wsa_err(); }                # -WSAGetLastError (0xF024)
     if (r == 0) { return 0; }
     if ((load16(&pfd + 10) & 0x4) != 0) { return 0 - 10038; }  # POLLNVAL → -WSAENOTSOCK
     return 1;
@@ -937,22 +949,25 @@ fn sys_fdatasync(fd): i64 { return syscall(75, fd); }
 # Closes docs/development/issues/2026-07-14-windows-getpeername-reroute-missing.md
 #
 # Normalize to the POSIX contract consumers check (`r < 0` = failure): ws2_32
-# returns 0 on success (peer written) or SOCKET_ERROR (int -1, which cyrius sees
-# ZERO-extended as 0xFFFFFFFF — a POSITIVE value that would defeat a `< 0` check
-# and let a caller fabricate a peer, cf. sandhi_server_peer_sockaddr's
-# `if (r < 0) return 0`). On failure return `-WSAGetLastError` (negative, and it
-# carries the real Winsock error, e.g. -10057 WSAENOTCONN). WSAGetLastError is read
-# immediately, before any other call can reset the per-thread last-error.
+# returns 0 on success (peer written) or SOCKET_ERROR (int -1). These reroutes define
+# ONLY eax — the emitter does not extend the C `int` — so rax[63:32] is whatever the
+# callee left: 0xFFFFFFFF on the builds measured, a POSITIVE value that would defeat a
+# `< 0` check and let a caller fabricate a peer (cf. sandhi_server_peer_sockaddr's
+# `if (r < 0) return 0`), and in principle dirty upper bits over a 0 that would read a
+# success as a failure. So the result is tested masked to 32 bits. On failure return
+# `-WSAGetLastError` through _sw_wsa_err (negative, never 0, and it carries the real
+# Winsock error, e.g. -10057 WSAENOTCONN). WSAGetLastError is read immediately, before
+# any other call can reset the per-thread last-error. CHANGELOG [6.6.16]
 fn sys_getpeername(fd, addr, addrlen): i64 {
     var r = syscall(61494, fd, addr, addrlen);
-    if (r == 0) { return 0; }
-    return 0 - syscall(61476);      # -WSAGetLastError (0xF024)
+    if ((r & 0xFFFFFFFF) == 0) { return 0; }
+    return _sw_wsa_err();           # -WSAGetLastError (0xF024)
 }
 # getsockname (0xF037 → ws2_32!getsockname): same normalization as getpeername.
 fn sys_getsockname(fd, addr, addrlen): i64 {
     var r = syscall(61495, fd, addr, addrlen);
-    if (r == 0) { return 0; }
-    return 0 - syscall(61476);
+    if ((r & 0xFFFFFFFF) == 0) { return 0; }
+    return _sw_wsa_err();
 }
 # listen (0xF033 → ws2_32!listen): same normalization as getsockname — 0, or -WSAGetLastError.
 # 6.6.10: the reroute existed since v6.4.44 but no `sys_listen` did, so a portable caller of
@@ -961,8 +976,8 @@ fn sys_getsockname(fd, addr, addrlen): i64 {
 # returned -38 there and this comment described a socket nothing could create). CHANGELOG [6.6.10]
 fn sys_listen(fd, backlog): i64 {
     var r = syscall(0xF033, fd, backlog);
-    if (r == 0) { return 0; }
-    return 0 - syscall(61476);      # -WSAGetLastError (0xF024)
+    if ((r & 0xFFFFFFFF) == 0) { return 0; }
+    return _sw_wsa_err();           # -WSAGetLastError (0xF024)
 }
 
 # ================================================================

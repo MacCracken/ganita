@@ -734,6 +734,14 @@ fn sys_sendmsg(fd, msghdr, flags): i64 { return 0 - 38; }
 # Send a datagram to an address. agnos sockets are connection-id based (sock_connect +
 # sock_send); there is no unconnected send-to-address form.
 fn sys_sendto(fd, buf, len, flags, dstaddr, dstaddrlen): i64 { return 0 - 38; }
+# Set a socket option. agnos has no socket-option syscall, so this declines (-ENOSYS) for
+# every level / name. ⛔ NO setsockopt `SYS_*` number is minted here, ever: Linux #54 is
+# agnos udp_unbind (agnos ABI decision O5), so a raw syscall(54) silently unbinds a UDP
+# listener (yantra's pre-1.0.7 bug). The options agnos CAN honour are reachable portably:
+# lib/net.cyr's sock_set_recv_timeout / sock_set_send_timeout set the peer's per-socket
+# deadlines, and sock_reuse is already a success no-op. A stub rather than a missing symbol
+# so an unguarded portable call links on agnos. CHANGELOG [6.6.16]
+fn sys_setsockopt(fd, level, optname, val, vallen): i64 { return 0 - 38; }
 # Set a file's length by descriptor. agnos has no truncate family.
 fn sys_ftruncate(fd, length): i64 { return 0 - 38; }
 # Set a file's length by path. agnos has no truncate family.
@@ -2023,6 +2031,130 @@ fn sys_sock_accept(listen_id): i64 {
     var c = syscall(SYS_SOCK_ACCEPT, listen_id);
     if (c >= 0) { _agnos_accept_mark(c, _agnos_listen_slot_of(listen_id) + 1); }
     return c;
+}
+
+# ── 6.6.17: the BSD socket verbs — socket / bind / listen / connect / accept4 — the Linux-common
+# wrappers a portable caller links against, which this peer lacked (each was a link failure on
+# agnos). agnos has no syscall for any of them: its TCP surface is sock_connect#47 (socket +
+# connect in one), sock_listen#56 (bind + listen in one) and sock_accept#57. So each verb is
+# built on the tagged-fd adapter below — the one lib/net.cyr's agnos arms already drive — and a
+# shape agnos does not provide declines -38, like sys_setsockopt (6.6.16). ⛔ NO `SYS_*` NUMBER IS
+# MINTED: Linux #41 / #49 / #50 / #42 / #288 are sleep_ms, sock_recv, sock_close, kbscan and
+# nothing on agnos (ABI O5). Errors are -errno. CHANGELOG [6.6.17]
+
+# A TCP socket: AF_INET (2), SOCK_STREAM (1), protocol 0 or IPPROTO_TCP (6); SOCK_CLOEXEC is
+# accepted (agnos execs inherit no socket fd). Returns a tagged fd, or -24 (EMFILE: the 8-slot fd
+# table is full). Declines -38 for every other shape: UDP is the udp_bind#51 listener band (no
+# fd), there is no AF_UNIX or IPv6, and SOCK_NONBLOCK cannot be honoured (an agnos socket read is
+# a bounded blocking poll).
+fn sys_socket(domain, type, protocol): i64 {
+    if (domain != 2) { return 0 - 38; }
+    if ((type & 0xF) != 1) { return 0 - 38; }
+    if ((type & (~0x8000F)) != 0) { return 0 - 38; }  # any flag but SOCK_CLOEXEC (0x80000)
+    if (protocol != 0) {
+        if (protocol != 6) { return 0 - 38; }
+    }
+    var fd = _agnos_sock_open();
+    if (fd < 0) { return 0 - 24; }
+    return fd;
+}
+
+# The address (the kernel ip4() form) and host-order port of the sockaddr_in `sa` (`len` bytes),
+# through `ip_out` / `port_out`. 0, or -14 (EFAULT: no sockaddr), -22 (EINVAL: shorter than a
+# sockaddr_in), -97 (EAFNOSUPPORT: not AF_INET).
+fn _agnos_sa_in(sa, len, ip_out, port_out): i64 {
+    if (sa == 0) { return 0 - 14; }
+    if (len < 16) { return 0 - 22; }
+    if ((load16(sa) & 0xFFFF) != 2) { return 0 - 97; }
+    store64(port_out, ((load8(sa + 2) & 0xFF) << 8) | (load8(sa + 3) & 0xFF));
+    var ip = (load8(sa + 4) & 0xFF) << 24;
+    ip = ip | ((load8(sa + 5) & 0xFF) << 16);
+    ip = ip | ((load8(sa + 6) & 0xFF) << 8);
+    store64(ip_out, ip | (load8(sa + 7) & 0xFF));
+    return 0;
+}
+
+# Bind a socket fd to the sockaddr_in `sockaddr`. agnos merges bind into listen, so this records
+# the port and the address class for sys_listen — 127/8 a LOOPBACK listener, 0.0.0.0 or this
+# host's address ANY (CVE-48's rule, _agnos_listen_class). 0, or -88 (ENOTSOCK), the sockaddr's
+# -14 / -22 / -97, -99 (EADDRNOTAVAIL: an address this host does not have — refused, never
+# widened), -22 (EINVAL: port 0 or above 65535; agnos has no ephemeral bind).
+fn sys_bind(fd, sockaddr, addrlen): i64 {
+    if (_agnos_is_sock_fd(fd) == 0) { return 0 - 88; }
+    var ip[8];
+    var port[8];
+    var r = _agnos_sa_in(sockaddr, addrlen, &ip, &port);
+    if (r < 0) { return r; }
+    var cls = _agnos_listen_class(load64(&ip));
+    if (cls < 0) { return 0 - 99; }
+    if (_agnos_listen_stash(fd, load64(&port), cls, load64(&ip)) < 0) { return 0 - 22; }
+    return 0;
+}
+
+# Listen on a bound socket fd: sock_listen#56 on the port and class sys_bind recorded. `backlog`
+# is advisory (the kernel's 8-slot table bounds it). 0, or -88 (ENOTSOCK), -22 (EINVAL: not
+# bound), -98 (EADDRINUSE: the port is taken or the table is full — or a LOOPBACK bind on an
+# agnos older than 1.57.7, which fails closed rather than listening on the network).
+fn sys_listen(fd, backlog): i64 {
+    if (_agnos_is_sock_fd(fd) == 0) { return 0 - 88; }
+    _agnos_conn_init();
+    if (load64(&_agnos_listen_port + (fd & 7) * 8) <= 0) { return 0 - 22; }
+    if (_agnos_listen_start(fd) < 0) { return 0 - 98; }
+    return 0;
+}
+
+# Connect a socket fd to the sockaddr_in `sockaddr`: sock_connect#47, which BLOCKS the caller up
+# to ~8 s. 0, or -88 (ENOTSOCK), -106 (EISCONN: connected already, or listening), the sockaddr's
+# -14 / -22 / -97, -111 (ECONNREFUSED: refused, timed out or the kernel table full — #47 answers
+# one -1 for all of them).
+fn sys_connect(fd, sockaddr, addrlen): i64 {
+    if (_agnos_is_sock_fd(fd) == 0) { return 0 - 88; }
+    if (_agnos_fd_conn(fd) >= 0) { return 0 - 106; }
+    if (_agnos_fd_listen(fd) >= 0) { return 0 - 106; }
+    var ip[8];
+    var port[8];
+    var r = _agnos_sa_in(sockaddr, addrlen, &ip, &port);
+    if (r < 0) { return r; }
+    var c = sys_sock_connect(load64(&ip), load64(&port), 0);
+    if (c < 0) { return 0 - 111; }
+    _agnos_sock_bind(fd, c);
+    return 0;
+}
+
+# Accept the next connection on a listening socket fd: sock_accept#57, which is NON-blocking on
+# agnos — none pending is -11 (EAGAIN), as on a non-blocking Linux listener. The connection's
+# tagged fd; a non-zero `srcaddr` receives its peer as a sockaddr_in (sock_peer#106, with
+# sys_getpeername's `srcaddrlen` truncation rule; an agnos older than 1.57.7 has no #106 and
+# `*srcaddrlen` reads 0). `flags`: SOCK_CLOEXEC is accepted; anything else declines -38. Errors:
+# -88 (ENOTSOCK), -22 (EINVAL: not listening, or a negative `*srcaddrlen`), -14 (EFAULT: a
+# `srcaddr` with no `srcaddrlen`), -11, -24 (EMFILE: the fd table is full — the accepted
+# connection is closed, never leaked). Every argument is checked BEFORE #57, so a connection the
+# kernel hands over is never taken and then dropped by a refusal.
+fn sys_accept4(fd, srcaddr, srcaddrlen, flags): i64 {
+    if (_agnos_is_sock_fd(fd) == 0) { return 0 - 88; }
+    if ((flags & (~0x80000)) != 0) { return 0 - 38; }
+    if (srcaddr != 0) {
+        if (srcaddrlen == 0) { return 0 - 14; }      # Linux: EFAULT (it reads *addrlen)
+        if (load32(srcaddrlen) > 0x7FFFFFFF) { return 0 - 22; }   # a negative i32 capacity
+    }
+    var lid = _agnos_fd_listen(fd);
+    if (lid < 0) { return 0 - 22; }
+    var cid = sys_sock_accept(lid);
+    if (cid < 0) { return 0 - 11; }
+    var cfd = _agnos_sock_open();
+    if (cfd < 0) {
+        sys_sock_close(cid);
+        return 0 - 24;
+    }
+    _agnos_sock_bind(cfd, cid);
+    if (srcaddr != 0) {
+        var pr = syscall(SYS_SOCK_PEER, cid);
+        if (pr >= 0) { _agnos_put_sockaddr(srcaddr, srcaddrlen, (pr >> 16) & 0xFFFFFFFF, pr & 0xFFFF); }
+        if (pr < 0) {
+            if (srcaddrlen != 0) { store32(srcaddrlen, 0); }
+        }
+    }
+    return cfd;
 }
 
 # Raw UDP (dig / DNS). #52 packs both ports into arg2 (src<<16|dst) and

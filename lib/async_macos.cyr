@@ -630,9 +630,10 @@ fn async_recv(rt, fd, buf, len): i64 {
     store64(ctx + 32, rt);
     return async_spawn(rt, &_async_recv_task, ctx);
 }
-# send task: a plain write inline in the task (no park). v6.4.39.
+# send task: one write inline in the task (no park). v6.4.39. Through the SO_NOSIGPIPE leaf, so a
+# reset peer answers -EPIPE instead of killing the process with SIGPIPE. CHANGELOG [6.6.16]
 fn _async_send_task(ctx): i64 {
-    return sys_write(load64(ctx + 8), load64(ctx + 16), load64(ctx + 24));
+    return _fd_write_nosigpipe(load64(ctx + 8), load64(ctx + 16), load64(ctx + 24));
 }
 # Async single-shot send: spawn a task that writes from buf; task_join yields the byte count.
 # Returns the task handle, or 0 if an allocation is refused. v6.4.39.
@@ -712,10 +713,12 @@ fn async_wait_rw(rt, fd): i64 {
 
 # v6.5.26 — one direction of a byte relay. The same body as every backend (lib/async.cyr
 # explains why no park): read once, write what was read. Returns bytes WRITTEN, 0 on clean EOF.
+# The write takes the SO_NOSIGPIPE leaf (a reset socket answers -EPIPE; a pipe keeps write(2)).
+# CHANGELOG [6.6.16]
 fn async_relay_once(rt, rfd, wfd, buf, len): i64 {
     var n = sys_read(rfd, buf, len);
     if (n <= 0) { return n; }
-    return sys_write(wfd, buf, n);
+    return _fd_write_nosigpipe(wfd, buf, n);
 }
 
 # Run `fp(arg)` in a forked child and wait at most `ms` milliseconds for its 8-byte result

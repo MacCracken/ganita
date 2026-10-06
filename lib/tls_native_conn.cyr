@@ -768,13 +768,14 @@ fn _tn_os_write(fd, buf, n): i64 {
     #endif
 }
 
-# macOS has no MSG_NOSIGNAL: SO_NOSIGPIPE (SOL_SOCKET 0xFFFF, 0x1022) makes every write on the
-# socket answer EPIPE instead of raising SIGPIPE. Set once per connection, before its first write
-# — the ctx remembers the fd it covered (TLS_CTX_OFF_NOSIGPIPE = fd + 1); a ctx-less write sets
-# it every time. Returns 0, or the setsockopt error: anything but ENOTSOCK (38: a pipe or a file,
-# which keeps write(2)'s SIGPIPE) fails the write CLOSED, because a socket we could not protect may
-# be written into a reset — xnu answers EINVAL for a socket already shut down both ways, which is
-# what an RST leaves. Every other target: 0, nothing to do.
+# macOS: MSG_NOSIGNAL is not relied on (SO_NOSIGPIPE works on every Darwin): SO_NOSIGPIPE
+# (SOL_SOCKET 0xFFFF, 0x1022) makes every write on the socket answer EPIPE instead of raising
+# SIGPIPE. Set once per connection, before its first write — the ctx remembers the fd it covered
+# (TLS_CTX_OFF_NOSIGPIPE = fd + 1); a ctx-less write sets it every time. Returns 0, or the
+# setsockopt error: anything but ENOTSOCK (38: a pipe or a file, which keeps write(2)'s SIGPIPE)
+# fails the write CLOSED, because a socket we could not protect may be written into a reset — xnu
+# answers EINVAL for a socket already shut down both ways, which is what an RST leaves. Every
+# other target: 0, nothing to do.
 fn _tn_nosigpipe(ctx, fd): i64 {
     #ifdef CYRIUS_TARGET_MACOS
     if (ctx != 0) {

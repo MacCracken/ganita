@@ -1,0 +1,13 @@
+# ganita raw-include test — the bundle alone is enough to compile against.
+# Includes ONLY dist/ganita.cyr (and the test framework after it): no stdlib
+# leaf is named here. From 1.2.14 (cyrius 6.6.18 distlib) the bundle opens with
+# a compile-verified "# Requires" include block for the leaves its .deps
+# sidecar declares (math, alloc, fmt), so `include "dist/ganita.cyr"` compiles
+# on its own. The 1.2.13 bundle had no such block and fails here.
+
+include "dist/ganita.cyr"
+include "lib/assert.cyr"
+
+assert_eq(ganita_binomial(10, 3), 120, "C(10,3)=120 from the raw-included bundle");
+
+var r = assert_summary();

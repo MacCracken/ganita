@@ -489,7 +489,9 @@ fn async_wait_rw(rt, fd): i64 {
 fn async_relay_once(rt, rfd, wfd, buf, len): i64 {
     var n = sys_read(rfd, buf, len);
     if (n <= 0) { return n; }
-    return sys_write(wfd, buf, n);
+    # wfd may be a socket or a pipe: the leaf answers -EPIPE for a reset socket instead of a
+    # SIGPIPE kill, and keeps write(2) for a pipe. CHANGELOG [6.6.16]
+    return _fd_write_nosigpipe(wfd, buf, n);
 }
 
 # Record `fd` as owned by the CURRENT task, so _async_retire closes it if the task is
@@ -620,7 +622,8 @@ fn _async_send_task(ctx): i64 {
         async_wait_writable(load64(ctx + 32), load64(ctx + 8));   # park on EPOLLOUT
         return 0;
     }
-    return syscall(SYS_WRITE, load64(ctx + 8), load64(ctx + 16), load64(ctx + 24));
+    # Not a raw SYS_WRITE: a reset peer must answer -EPIPE, never a SIGPIPE kill. CHANGELOG [6.6.16]
+    return _fd_write_nosigpipe(load64(ctx + 8), load64(ctx + 16), load64(ctx + 24));
 }
 
 # Async single-shot send on the reactor: park until `fd` is writable, then write up to

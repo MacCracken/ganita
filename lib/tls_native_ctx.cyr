@@ -21,12 +21,12 @@
 # after it hold the parsed credentials, the traffic keys and sequence
 # numbers, the record buffers and the 6.6.13 additions, up to TLS_CTX_LEN.
 
-# 616 = 77 i64 slots. 512 held +3 record partial-read hold buffer, +1 (v6.2.25) ALLOC,
+# 624 = 78 i64 slots. 512 held +3 record partial-read hold buffer, +1 (v6.2.25) ALLOC,
 # +1 (v6.2.8) CERT_REQUESTED; 6.6.13 added +512..+568 (see the block after READ_HOLD_OFF), 6.6.14
-# filled +560 and +568 and added +576 (NOSIGPIPE), 6.6.15 the key-exchange block from +584 (at the
-# end of the list).
+# filled +560 and +568 and added +576 (NOSIGPIPE), 6.6.15 the key-exchange block from +584, 6.6.17
+# the backend tag at +616 (at the end of the list).
 # Nothing outside _tn_ctx_new_in reads this; a new slot goes INSIDE it, never past it.
-var TLS_CTX_LEN          = 616;
+var TLS_CTX_LEN          = 624;
 var TLS_CTX_OFF_ROLE       = 0;   # TlsRole (CLIENT/SERVER)
 var TLS_CTX_OFF_STATE      = 8;   # TlsState
 var TLS_CTX_OFF_VERSION    = 16;  # negotiated TlsProtocolVersion (0 until SH)
@@ -156,6 +156,15 @@ var TLS_CTX_OFF_HRR            = 600; # 1 once a HelloRetryRequest was SENT (ser
 var TLS_CTX_OFF_KS_GROUP       = 608; # 1.3 client: the group of the key_share in our latest ClientHello (its key is
 #                                       EPH_PRIV / EPH_PUB); the ServerHello's share must be on it
 # CHANGELOG [6.6.15]
+# 6.6.17 — +616: what makes a native ctx recognisable as one. lib/tls.cyr's hook-handle verbs
+# (tls_set_alpn, tls_ctx_set_session_*_cb, …) take either a native ctx or a libssl SSL_CTX*, and
+# dispatched on the GLOBAL backend, so a handle used after tls_set_backend flipped reached the wrong
+# backend (an SSL_CTX* handed to native code, a native ctx handed to libssl). They dispatch on this
+# tag instead (_tls_handle_native). A 64-bit value no pointer or flag word holds — its top 16 bits
+# make it a non-canonical address — so reading it at +616 of an SSL_CTX (over 1 KiB on OpenSSL 3)
+# cannot match. Written by _tn_ctx_new_in, never changed. CHANGELOG [6.6.17]
+var TLS_CTX_OFF_BACKEND_TAG    = 616; # _TN_CTX_TAG on every native ctx
+var _TN_CTX_TAG = 0x434E534C54525943;   # "CYRTLSNC", little-endian
 
 # Handshake state-machine events. The protocol-message build/parse
 # that fires each event lands in .16-.19; this slot validates the
@@ -190,6 +199,7 @@ fn _tn_ctx_new_in(a, role): i64 {
     store64(ctx + TLS_CTX_OFF_MIN_VER, TLS_VERSION_1_2);
     store64(ctx + TLS_CTX_OFF_MAX_VER, TLS_VERSION_1_3);
     store64(ctx + TLS_CTX_OFF_ALLOC,   a);
+    store64(ctx + TLS_CTX_OFF_BACKEND_TAG, _TN_CTX_TAG);
     return ctx;
 }
 

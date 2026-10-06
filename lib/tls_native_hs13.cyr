@@ -539,6 +539,11 @@ fn _tn_verify_sig_scheme(scheme, leaf, msg, msg_len, sig, sig_len): i64 {
         return _tn_ecdsa_p384_verify_der(pk, msg, msg_len, sig, sig_len);
     }
     if (scheme == TLS_SIG_ED25519) {
+        # ed25519_verify reads a fixed 64 bytes and the pubkey slot holds any key type, so
+        # bind the leaf to Ed25519 and the field to exactly 64 bytes (RFC 8032 §5.1.7,
+        # RFC 8446 §4.4.3), as _tn_verify_client_sig does. CHANGELOG [6.6.16]
+        if (x509_cert_curve(leaf) != X509_CURVE_ED25519) { return 0; }
+        if (sig_len != 64) { return 0; }
         return ed25519_verify(pk, msg, msg_len, sig);
     }
     return _tn_rsa_verify_scheme(scheme, leaf, msg, msg_len, sig, sig_len);
@@ -1201,9 +1206,110 @@ fn tls_native_new_server(cert_chain, cert_len, key, key_len): i64 {
 # in sigil (`lib/sigil.cyr`, folded 3.5.9); this is the protocol-layer
 # wiring. Signing with the loaded key is .18 (CertificateVerify).
 
+# ⛔ 6.6.16 — A PEM PRIVATE KEY IS DECODED ONCE PER PROCESS, NOT ON EVERY ACCEPT.
+# lib/tls.cyr's server accept builds a ctx from the caller's credentials on EVERY connection and
+# loads them (_tls_native_accept_alloc_in -> tls_native_server_load_creds -> here), and a PEM key
+# went through sigil's pem_decode_privkey each time. That decoder takes its DER scratch from the
+# GLOBAL bump heap (`alloc(pem_len)`), never from the allocator the accept was given, so a
+# long-running server kept pem_len bytes (rounded to 8) of heap per connection, each a decoded
+# copy of its private key: 120 B per request for sandhi's 119-byte Ed25519 key, measured on
+# 6.6.15 with every other per-connection byte in a per-connection arena. A DER key costs 0.
+#
+# The PEM text does not change between accepts, so its decode is cached. The first load of a
+# given text decodes it once and records sigil's answer: the key material, the algorithm, or the
+# refusal. The record goes on the GLOBAL heap, because it must outlive every arena's reset_via.
+# A later load of the same text copies that answer into its ctx and allocates nothing outside the
+# ctx's allocator. Same error, same point, same key material as before.
+#
+# KEYED ON THE TEXT, NOT THE POINTER: sandhi packs a fresh creds struct for every accept, and a
+# buffer refilled with another key must not be served the old one.
+#
+# THREAD-SAFE WITHOUT A WAIT: a pooled server loads credentials on every worker at once.
+# - An entry is immutable once published. It is prepended under a release fence, so a lookup
+#   walks the list without a lock.
+# - A miss TRIES the claim (0 -> 1): the holder looks again, decodes, publishes and releases.
+# - A miss that finds the claim taken does not wait: it decodes uncached, as before 6.6.16, and
+#   tries the claim again on its next load. Nothing can spin on a holder that will never release
+#   (a child forked while a worker held the claim degrades to the 6.6.15 behaviour), at the cost
+#   of a few duplicate decodes during a cold-start race.
+# At most _TN_PK_CACHE_MAX distinct texts are kept. Past that, a new text decodes on every call,
+# as before. CHANGELOG [6.6.16]
+var _TN_PK_CACHE_MAX = 32;
+var _tn_pk_head  = 0;    # the newest entry, or 0; every entry is immutable once published
+var _tn_pk_count = 0;    # entries published; written by the claim holder only
+var _tn_pk_claim = 0;    # 0 free · 1 one thread is adding an entry
+# Entry (global heap, never freed): +0 next (older) · +8 PEM length · +16 sigil's answer (32 / 48
+# key-material bytes, or its negative refusal) · +24 SIG_PRIVKEY_* · +32 key material (48 B) ·
+# +80 the PEM text.
+var _TN_PK_HDR = 80;
+
+# The published entry for this PEM text, or 0.
+fn _tn_pk_find(pem, pem_len): i64 {
+    var e = atomic_load(&_tn_pk_head);
+    # Acquire half (aarch64): no field or byte of an entry may be read before the head load that
+    # published it. x86 (TSO) never reorders loads.
+    #ifdef CYRIUS_ARCH_AARCH64
+    atomic_fence();
+    #endif
+    while (e != 0) {
+        if (load64(e + 8) == pem_len) {
+            if (memeq(e + _TN_PK_HDR, pem, pem_len) == 1) { return e; }
+        }
+        e = load64(e);
+    }
+    return 0;
+}
+
+# Claim holder only: decode `pem` once into a new entry and publish it. The entry, or 0 when the
+# cache is full or out of memory.
+fn _tn_pk_new(pem, pem_len): i64 {
+    if (_tn_pk_count >= _TN_PK_CACHE_MAX) { return 0; }
+    var e = alloc(_TN_PK_HDR + pem_len);
+    if (e == 0) { return 0; }
+    var ao = 0;
+    store64(e + 16, pem_decode_privkey(pem, pem_len, e + 32, 48, &ao));
+    store64(e + 24, ao);
+    store64(e + 8, pem_len);
+    memcpy(e + _TN_PK_HDR, pem, pem_len);
+    store64(e, _tn_pk_head);
+    _tn_pk_count = _tn_pk_count + 1;
+    # Release half (aarch64): the whole entry before the head that publishes it.
+    #ifdef CYRIUS_ARCH_AARCH64
+    atomic_fence();
+    #endif
+    atomic_store(&_tn_pk_head, e);
+    return e;
+}
+
+# A miss: add the text's entry if the claim is free. The entry (another thread's, if it published
+# the same text first), or 0 when the claim is taken, the cache is full, or memory is out.
+fn _tn_pk_add(pem, pem_len): i64 {
+    if (atomic_cas(&_tn_pk_claim, 0, 1) == 0) { return 0; }
+    var e = _tn_pk_find(pem, pem_len);
+    if (e == 0) { e = _tn_pk_new(pem, pem_len); }
+    #ifdef CYRIUS_ARCH_AARCH64
+    atomic_fence();
+    #endif
+    atomic_store(&_tn_pk_claim, 0);
+    return e;
+}
+
+# pem_decode_privkey(pem, pem_len, kmat, 48, out_algo), answered from the cache above: 32 / 48
+# key-material bytes written to `kmat`, or the decoder's negative refusal.
+fn _tn_pem_privkey(pem, pem_len, kmat, out_algo): i64 {
+    var e = _tn_pk_find(pem, pem_len);
+    if (e == 0) { e = _tn_pk_add(pem, pem_len); }
+    if (e == 0) { return pem_decode_privkey(pem, pem_len, kmat, 48, out_algo); }
+    var n = load64(e + 16);
+    store64(out_algo, load64(e + 24));
+    if (n > 0) { memcpy(kmat, e + 32, n); }
+    return n;
+}
+
 # Detect + parse the private key into ctx (KEY_ALGO / KEY_MAT /
 # KEY_MAT_LEN). PEM input ("-----BEGIN", first byte 0x2D) routes to
-# sigil's auto-detecting `pem_decode_privkey`; raw DER (0x30) tries
+# sigil's auto-detecting `pem_decode_privkey`, through the decode-once
+# cache above; raw DER (0x30) tries
 # each typed parser (the wrong-type ones reject). Returns TLS_OK,
 # TLS_ERR_KEY_UNSUPPORTED (RSA or undecodable), TLS_ERR_OOM, or
 # TLS_ERR_INVALID_PARAM.
@@ -1218,7 +1324,7 @@ fn _tn_load_privkey(ctx): i64 {
     var klen = 0;
     if ((load8(key) & 0xFF) == 0x2D) {
         var ao = 0;
-        var n = pem_decode_privkey(key, key_len, kmat, 48, &ao);
+        var n = _tn_pem_privkey(key, key_len, kmat, &ao);
         if (n < 0) {
             # n == 0 - SIG_PRIVKEY_RSA for a recognized RSA key (parser
             # arrives in a later sigil tag); any other negative is a

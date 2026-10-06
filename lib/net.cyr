@@ -298,6 +298,12 @@ fn _net_wsa_nbio(fd, on): i64 {
 #endif
 
 # Send up to `len` bytes on socket `fd`: the count, or -errno.
+# ⛔ WHY the POSIX arm is not a plain sys_write: a write(2) to a peer that has reset the connection
+# raises SIGPIPE, which by default KILLS the process — every sock_send / sock_send_all / sock_send_a
+# caller (http, ws, ws_server, yantra, sandhi's client paths) was one reset peer away from a remote,
+# unauthenticated kill. lib/syscalls.cyr's _fd_write_nosigpipe answers -EPIPE instead (MSG_NOSIGNAL
+# on Linux, SO_NOSIGPIPE on macOS) and keeps write(2) for an fd that is not a socket; on agnos it
+# is the same sys_write as before (the peer routes a tagged fd to #48). CHANGELOG [6.6.16]
 fn _net_os_send(fd, buf, len): i64 {
     #ifdef CYRIUS_TARGET_WIN
     if (len > 0x7FFFFFFF) { len = 0x7FFFFFFF; }    # send() takes an int length; a short write is legal
@@ -306,7 +312,7 @@ fn _net_os_send(fd, buf, len): i64 {
     return n;
     #endif
     #ifndef CYRIUS_TARGET_WIN
-    return sys_write(fd, buf, len);                # agnos: the peer routes a tagged fd to #48
+    return _fd_write_nosigpipe(fd, buf, len);      # never SIGPIPE on a socket (CVE-74)
     #endif
 }
 
@@ -385,7 +391,13 @@ fn _net_os_listen(fd, backlog): i64 {
 }
 
 # accept(fd, NULL, NULL): the connection's fd, or -errno (-EAGAIN when a non-blocking listener
-# has nothing pending, on every target).
+# has nothing pending, on every target). The returned socket is BLOCKING on every target.
+# ⛔ WHY the Windows and macOS arms reset the mode: there an accepted socket INHERITS the
+# listener's non-blocking mode (Windows FIONBIO; BSD/macOS O_NONBLOCK), while Linux never does.
+# A server that made its listener non-blocking (the documented accept-loop pattern) handed native
+# TLS a non-blocking fd on those two targets only, and its no-deadline read failed TLS_ERR_IO at
+# once. On a failed mode reset the accepted socket is closed (never leaked) and the error returned.
+# Linux and agnos are unchanged: no extra syscall. CHANGELOG [6.6.16]
 fn _net_os_accept(fd): i64 {
     #ifdef CYRIUS_TARGET_WIN
     var c = syscall(0xF045, fd, 0, 0);
@@ -394,10 +406,34 @@ fn _net_os_accept(fd): i64 {
         if (e == 0 - 10035) { return 0 - _NET_EAGAIN; }        # WSAEWOULDBLOCK
         return e;
     }
+    # Windows cannot read FIONBIO back, so this is one ioctlsocket per accept, unconditionally.
+    var nb = _net_wsa_nbio(c, 0);
+    if (nb != 0) {
+        syscall(0xF023, c);                                    # closesocket
+        return nb;
+    }
     return c;
     #endif
     #ifndef CYRIUS_TARGET_WIN
-    return syscall(SYS_ACCEPT, fd, 0, 0);
+    var a = syscall(SYS_ACCEPT, fd, 0, 0);
+    #ifdef CYRIUS_TARGET_MACOS
+    if (a >= 0) {
+        var fl = sys_fcntl(a, 3, 0);                           # F_GETFL
+        if (fl < 0) {
+            sys_close(a);
+            return fl;
+        }
+        var onb = _fd_o_nonblock();
+        if ((fl & onb) != 0) {
+            var r = sys_fcntl(a, 4, fl & (~onb));              # F_SETFL, O_NONBLOCK cleared
+            if (r < 0) {
+                sys_close(a);
+                return r;
+            }
+        }
+    }
+    #endif
+    return a;
     #endif
 }
 
@@ -600,6 +636,10 @@ fn sock_listen(fd, backlog) : Result {
 }
 
 # Accept a connection. Returns Result(client_fd). On AGNOS it issues sock_accept#57 (see sock_bind).
+# Contract: the accepted socket is BLOCKING on every target, whatever the listener's mode — the
+# Linux semantics, now also on Windows and macOS, where the OS hands over a socket that inherits
+# the listener's non-blocking mode (_net_os_accept resets it). Set a timeout (SO_RCVTIMEO) or
+# sock_set_nonblocking on the accepted fd if the caller wants otherwise. CHANGELOG [6.6.16]
 fn sock_accept(fd) : Result {
     #ifdef CYRIUS_TARGET_AGNOS
     # AGNOS sock_accept(#57) is NON-BLOCKING: it drives net_poll (advancing the

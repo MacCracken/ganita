@@ -23,6 +23,14 @@
 # = 104 bytes. The OVERLAPPED + WSABUF + buffers live in the ctx (never a stack local —
 # a stack OVERLAPPED corrupts on completion after the issuing frame returns).
 #
+# INT RESULTS. WSAGetLastError (0xF024), WSAIoctl, WSARecv, WSASend, getaddrinfo and the
+# ConnectEx / AcceptEx BOOLs return a C `int`; their reroutes (and callptr) define only eax,
+# so every one is tested masked to 32 bits — dirty upper bits must not turn WSA_IO_PENDING
+# or a 0 into a failure. Pinned by tests/gates/platform/pe_wsa_lasterr_masked.sh. CHANGELOG [6.6.16]
+# 6.6.17: the kernel32 BOOLs too — SetWaitableTimer (0xF02F), RegisterWaitForSingleObject
+# (0xF02D) and CreateProcessW (0xF005 / 61445), whose emitters do not extend eax either — and the
+# connect task's bind (0xF025) is checked, not discarded. Same gate, axis 5. CHANGELOG [6.6.17]
+#
 # >>> include "lib/fnptr.cyr"
 include "lib/fnptr.cyr"
 
@@ -281,11 +289,56 @@ fn async_wait_rw(rt, fd): i64 {
 
 # v6.5.26 — one direction of a byte relay. The epoll backend parks until rfd is readable;
 # here the read itself blocks, which is the equivalent wait, so the body is the same shape
-# minus the park. Returns bytes WRITTEN, 0 on clean EOF, -1 on error.
+# minus the park. Returns bytes WRITTEN, 0 on clean EOF, a negative error otherwise
+# (-WSAGetLastError for a socket, -1 for a HANDLE).
+# ⛔ 6.6.17 — WHY recv / send. This read with sys_read and wrote with sys_write — ReadFile /
+# WriteFile — and on a Winsock SOCKET those do not work: measured on cass over two loopback pairs
+# with five bytes waiting, the read returned 0 (a false EOF) and nothing was relayed, either way
+# round. A socket now goes through recv / send (0xF048 / 0xF047, sign-extended by their emitters);
+# Winsock's WSAENOTSOCK sends a file or pipe HANDLE back to ReadFile / WriteFile (the native TLS
+# transport's _tn_os_read / _tn_os_write rule). CHANGELOG [6.6.17]
 fn async_relay_once(rt, rfd, wfd, buf, len): i64 {
-    var n = sys_read(rfd, buf, len);
+    var n = _asw_relay_read(rfd, buf, len);
     if (n <= 0) { return n; }
-    return sys_write(wfd, buf, n);
+    return _asw_relay_write(wfd, buf, n);
+}
+
+# 1 when Winsock's negated error `e` says the handle is not a socket at all: WSAENOTSOCK, or
+# WSANOTINITIALISED (no socket exists in a process that never started Winsock).
+fn _asw_notsock(e): i64 {
+    var code = (0 - e) & 0xFFFFFFFF;
+    if (code == 10038) { return 1; }                 # WSAENOTSOCK
+    if (code == 10093) { return 1; }                 # WSANOTINITIALISED
+    return 0;
+}
+
+# The calling thread's last Winsock error, negated; never 0.
+fn _asw_wsa_err(): i64 {
+    var e = syscall(0xF024) & 0xFFFFFFFF;            # WSAGetLastError
+    if (e == 0) { return 0 - 1; }
+    return 0 - e;
+}
+
+# Read up to `len` bytes from `fd`: recv on a socket, ReadFile on any other HANDLE.
+fn _asw_relay_read(fd, buf, len): i64 {
+    var n = len;
+    if (n > 0x7FFFFFFF) { n = 0x7FFFFFFF; }          # recv takes an int length
+    var r = syscall(0xF048, fd, buf, n, 0);          # recv
+    if (r >= 0) { return r; }
+    var e = _asw_wsa_err();
+    if (_asw_notsock(e) == 1) { return sys_read(fd, buf, len); }
+    return e;
+}
+
+# Write `len` bytes to `fd`: send on a socket (a short send is legal), WriteFile on any other HANDLE.
+fn _asw_relay_write(fd, buf, len): i64 {
+    var n = len;
+    if (n > 0x7FFFFFFF) { n = 0x7FFFFFFF; }
+    var w = syscall(0xF047, fd, buf, n, 0);          # send
+    if (w >= 0) { return w; }
+    var e = _asw_wsa_err();
+    if (_asw_notsock(e) == 1) { return sys_write(fd, buf, len); }
+    return e;
 }
 
 # Reactor connect task: create an overlapped socket, associate it with the IOCP, bind a
@@ -299,11 +352,13 @@ fn _async_connect_task(ctx): i64 {
         store64(ctx + 48, s);
         syscall(0xF01F, s, load64(rt), 0, 0);                # associate socket with the IOCP
         var la[16]; store16(&la, 2); store16(&la + 2, 0); store32(&la + 4, 0); store64(&la + 8, 0);
-        syscall(0xF025, s, &la, 16);                         # bind 0.0.0.0:0
+        # bind 0.0.0.0:0 — ConnectEx requires a bound socket, so a failed bind is a failed connect
+        # (it was discarded, and the ConnectEx below then failed WSAEINVAL instead). CHANGELOG [6.6.17]
+        if ((syscall(0xF025, s, &la, 16) & 0xFFFFFFFF) != 0) { syscall(0xF023, s); return 0 - 1; }
         var guid[16]; store64(&guid, 0x4660DDF325A207B9); store64(&guid + 8, 0x3E06748CE576E98E);
         var cxp[8]; store64(&cxp, 0);
         var nbf[8]; store32(&nbf, 0);
-        if (syscall(0xF027, s, 0xC8000006, &guid, 16, &cxp, 8, &nbf, 0, 0) != 0) {
+        if ((syscall(0xF027, s, 0xC8000006, &guid, 16, &cxp, 8, &nbf, 0, 0) & 0xFFFFFFFF) != 0) {
             syscall(0xF023, s); return 0 - 1;
         }
         var connectex = load64(&cxp);
@@ -318,8 +373,8 @@ fn _async_connect_task(ctx): i64 {
         var cr = callptr(connectex, s, &sa, 16, 0, 0, 0, ctx);   # ConnectEx(overlapped=ctx)
         # A synchronous failure (FALSE + last-error != WSA_IO_PENDING) queues NO completion —
         # don't park (the reactor would hang), fail the task instead.
-        if (cr == 0) {
-            if (syscall(0xF024) != 997) { syscall(0xF023, s); return 0 - 1; }   # not WSA_IO_PENDING
+        if ((cr & 0xFFFFFFFF) == 0) {   # BOOL: only eax is defined
+            if ((syscall(0xF024) & 0xFFFFFFFF) != 997) { syscall(0xF023, s); return 0 - 1; }   # not WSA_IO_PENDING
         }
         _async_win_park(rt);
         return 0;
@@ -359,7 +414,7 @@ fn _async_accept_task(ctx): i64 {
         var guid[16]; store64(&guid, 0x11CFCBACB5367DF1); store64(&guid + 8, 0x92A1485F8000CA95);
         var axp[8]; store64(&axp, 0);
         var nbf[8]; store32(&nbf, 0);
-        if (syscall(0xF027, load64(ctx + 56), 0xC8000006, &guid, 16, &axp, 8, &nbf, 0, 0) != 0) {
+        if ((syscall(0xF027, load64(ctx + 56), 0xC8000006, &guid, 16, &axp, 8, &nbf, 0, 0) & 0xFFFFFFFF) != 0) {
             syscall(0xF023, acc); return 0 - 1;
         }
         var acceptex = load64(&axp);
@@ -369,8 +424,8 @@ fn _async_accept_task(ctx): i64 {
         # AcceptEx(listen, accept, outbuf, dwRecvLen=0, localAddrLen=32, remoteAddrLen=32, &bytes,
         # overlapped=ctx). localAddrLen/remoteAddrLen = sizeof(sockaddr_in)+16 = 32; outbuf holds both.
         var ar = callptr(acceptex, load64(ctx + 56), acc, ctx + 80, 0, 32, 32, ctx + 72, ctx);
-        if (ar == 0) {
-            if (syscall(0xF024) != 997) { syscall(0xF023, acc); return 0 - 1; }   # not WSA_IO_PENDING
+        if ((ar & 0xFFFFFFFF) == 0) {   # BOOL: only eax is defined
+            if ((syscall(0xF024) & 0xFFFFFFFF) != 997) { syscall(0xF023, acc); return 0 - 1; }   # not WSA_IO_PENDING
         }
         _async_win_park(rt);
         return 0;
@@ -409,8 +464,8 @@ fn _async_recv_task(ctx): i64 {
         store64(ctx + 40, 1);
         # WSARecv(s, &WSABUF, 1, NULL, &flags, &overlapped=ctx, NULL)
         var rc = syscall(0xF029, load64(ctx + 48), ctx + 80, 1, 0, ctx + 96, ctx, 0);
-        if (rc != 0) {   # SOCKET_ERROR — a non-pending failure queues no completion; don't park
-            if (syscall(0xF024) != 997) { return 0 - 1; }   # not WSA_IO_PENDING
+        if ((rc & 0xFFFFFFFF) != 0) {   # SOCKET_ERROR — a non-pending failure queues no completion; don't park
+            if ((syscall(0xF024) & 0xFFFFFFFF) != 997) { return 0 - 1; }   # not WSA_IO_PENDING
         }
         _async_win_park(rt);
         return 0;
@@ -443,8 +498,8 @@ fn _async_send_task(ctx): i64 {
         store64(ctx + 40, 1);
         # WSASend(s, &WSABUF, 1, NULL, dwFlags=0, &overlapped=ctx, NULL)
         var rc = syscall(0xF02A, load64(ctx + 48), ctx + 80, 1, 0, 0, ctx, 0);
-        if (rc != 0) {   # SOCKET_ERROR — a non-pending failure queues no completion; don't park
-            if (syscall(0xF024) != 997) { return 0 - 1; }   # not WSA_IO_PENDING
+        if ((rc & 0xFFFFFFFF) != 0) {   # SOCKET_ERROR — a non-pending failure queues no completion; don't park
+            if ((syscall(0xF024) & 0xFFFFFFFF) != 997) { return 0 - 1; }   # not WSA_IO_PENDING
         }
         _async_win_park(rt);
         return 0;
@@ -470,7 +525,8 @@ fn async_send(rt, fd, buf, len): i64 {
 # (getaddrinfo is synchronous — acceptable for R1). ctx = { host, rt }.
 fn _async_resolve_task(ctx): i64 {
     var result[8]; store64(&result, 0);
-    if (syscall(0xF02B, load64(ctx), 0, 0, &result) != 0) { return 0 - 1; }   # getaddrinfo(host,0,0,&res)
+    var gr = syscall(0xF02B, load64(ctx), 0, 0, &result);   # getaddrinfo(host,0,0,&res)
+    if ((gr & 0xFFFFFFFF) != 0) { return 0 - 1; }
     var ai = load64(&result);
     var ipv4 = 0 - 1;
     var found = 0;
@@ -531,13 +587,27 @@ fn _async_timeout_sentinel(ctx): i64 {
         }
         store64(ctx + 56, timer);
         var due[8]; store64(&due, 0 - (load64(ctx + 64) * 10000));   # -(ms * 1e4) 100ns units (relative)
-        syscall(0xF02F, timer, &due, 0, 0, 0, 0);        # SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)
         store64(ctx, 0); store64(ctx + 8, 0); store64(ctx + 16, 0); store64(ctx + 24, 0);
         store64(ctx + 32, load64(rt + 40));
         store64(ctx + 40, 1);
+        # SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE). A timer that cannot be armed — or a
+        # wait that cannot be registered on it, below — is the create failure above: the timer is
+        # closed and the sentinel parks with no completion source, i.e. NO deadline (6.6.17: both
+        # BOOLs were discarded; the outcome was the same, the timer stayed open until the retire).
+        if ((syscall(0xF02F, timer, &due, 0, 0, 0, 0) & 0xFFFFFFFF) == 0) {
+            syscall(3, timer);
+            store64(ctx + 56, 0);
+            _async_win_park(rt);
+            return 0;
+        }
         var wh[8]; store64(&wh, 0);
         # RegisterWaitForSingleObject(&wh, timer, cb, ctx, INFINITE, WT_EXECUTEONLYONCE=8)
-        syscall(0xF02D, &wh, timer, &_async_win_timer_cb, ctx, 0 - 1, 8);
+        if ((syscall(0xF02D, &wh, timer, &_async_win_timer_cb, ctx, 0 - 1, 8) & 0xFFFFFFFF) == 0) {
+            syscall(3, timer);
+            store64(ctx + 56, 0);
+            _async_win_park(rt);
+            return 0;
+        }
         store64(ctx + 72, load64(&wh));  # stash the wait registration for UnregisterWaitEx
         _async_win_park(rt);
         return 0;
@@ -584,7 +654,7 @@ fn _async_interval_task(ctx): i64 {
         store64(ctx + 56, timer);
         var due[8]; store64(&due, 0 - (load64(ctx + 96) * 10000));   # first fire after `ms`
         # SetWaitableTimer(timer, &due, lPeriod=ms, NULL, NULL, FALSE) — auto-repeats every ms
-        if (syscall(0xF02F, timer, &due, load64(ctx + 96), 0, 0, 0) == 0) {
+        if ((syscall(0xF02F, timer, &due, load64(ctx + 96), 0, 0, 0) & 0xFFFFFFFF) == 0) {   # BOOL: eax only
             syscall(3, timer); return 0 - 1;          # arm failed → close timer, fail (never park)
         }
         store64(ctx, 0); store64(ctx + 8, 0); store64(ctx + 16, 0); store64(ctx + 24, 0);
@@ -595,7 +665,7 @@ fn _async_interval_task(ctx): i64 {
         # A failed registration leaves NO completion source; parking would hang the reactor's
         # GetQueuedCompletionStatus(INFINITE) forever AND leak the armed timer (no retire path,
         # unlike the sentinel) — so close the timer and fail the task instead.
-        if (syscall(0xF02D, &wh, timer, &_async_win_timer_cb, ctx, 0 - 1, 0) == 0) {
+        if ((syscall(0xF02D, &wh, timer, &_async_win_timer_cb, ctx, 0 - 1, 0) & 0xFFFFFFFF) == 0) {   # BOOL
             syscall(3, timer); return 0 - 1;
         }
         store64(ctx + 88, load64(&wh));
@@ -701,7 +771,7 @@ fn _asw_wenvblock(envp): i64 {
 }
 
 # CreateProcessW with inherited stdio. `wcmd` = writable UTF-16LE cmdline, `wenv` = env
-# block (0 = inherit). `pi` = caller's 24-byte PROCESS_INFORMATION. Returns the BOOL.
+# block (0 = inherit). `pi` = caller's 24-byte PROCESS_INFORMATION. Returns 1, or 0 on failure.
 # 6.6.10: created CREATE_SUSPENDED, put in a KILL_ON_JOB_CLOSE Job object (lib/syscalls_windows.cyr
 # `_win_job_start`) and resumed; the job handle is stored at `job_out` (0 = none — the child
 # then runs untracked, as before). A child that could not be resumed is terminated and
@@ -726,7 +796,7 @@ fn _asw_create_process(wcmd, wenv, pi, job_out): i64 {
     store64(&a + 72, pi);                        # lpProcessInformation
     store64(job_out, 0);
     var ok = syscall(61445, &a);                 # CreateProcessW
-    if (ok == 0) { return 0; }
+    if ((ok & 0xFFFFFFFF) == 0) { return 0; }    # BOOL: only eax is defined (6.6.17)
     var job = _win_job_start(pi, 1);
     if (job < 0) {                               # could not be resumed: it was terminated
         syscall(3, load64(pi + 8));
@@ -734,7 +804,7 @@ fn _asw_create_process(wcmd, wenv, pi, job_out): i64 {
         return 0;
     }
     store64(job_out, job);
-    return ok;
+    return 1;
 }
 
 # Close the child's job after a NORMAL exit: KILL_ON_JOB_CLOSE is cleared first, so what the
@@ -771,7 +841,7 @@ fn _async_process_task(ctx): i64 {
         var wh[8]; store64(&wh, 0);
         # RegisterWaitForSingleObject(&wh, hProcess, cb, ctx, INFINITE, WT_EXECUTEONLYONCE=8) —
         # one-shot (the process handle stays signalled after exit; a persistent wait would spin).
-        if (syscall(0xF02D, &wh, hProcess, &_async_win_timer_cb, ctx, 0 - 1, 8) == 0) {
+        if ((syscall(0xF02D, &wh, hProcess, &_async_win_timer_cb, ctx, 0 - 1, 8) & 0xFFFFFFFF) == 0) {   # BOOL
             # Registration failed: don't park into a dead completion source. Degrade to a
             # blocking reap (returns the real exit code — better than a hang or a leak).
             syscall(61441, hProcess, 4294967295);   # WaitForSingleObject(INFINITE)

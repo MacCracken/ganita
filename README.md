@@ -13,15 +13,15 @@ Written in [Cyrius](https://github.com/MacCracken/cyrius).
 
 ## Status
 
-**1.2.13** — `pseudo_inv` and `condition` are right at the ends of the double range: no NaN
-entries for a kept σ below 2^-1024, and an overflowing σ₁ no longer reads as "singular"; toolchain
-6.6.15. See
+**1.2.14** — toolchain 6.6.18; `dist/` regenerated with a compile-verified requires block, so
+`include "dist/ganita.cyr"` alone compiles, and a three-leaf sidecar (`math alloc fmt`). See
 [`CHANGELOG.md`](CHANGELOG.md) for the full history and
 [`docs/development/state.md`](docs/development/state.md) for the live snapshot.
 Recent releases in brief:
 
 | | |
 |---|---|
+| **1.2.14** | toolchain 6.6.18; `dist/ganita.cyr` carries a compile-verified `# Requires` block (raw-includable); `dist/ganita.deps` 10 leaves → `math alloc fmt` |
 | **1.2.13** | `pseudo_inv` / `condition` work in the SVD's working scale: no NaN entries for a σ below 2^-1024, and condition(DBL_MAX·[[1, 1], [1, −1]]) is 1, not −1.0 |
 | **1.2.12** | SVD rewritten as Jacobi on a column- and row-pivoted QR ([ADR 0005](docs/adr/0005-svd-is-jacobi-on-a-pivoted-qr.md)): no finite input known to reach non-convergence, now `-3`; 2.5–2.8× faster at 20×20 and 40×40; non-finite input refused across linalg ([ADR 0004](docs/adr/0004-non-finite-input.md)); toolchain 6.6.15 |
 | **1.2.11** | `ganita_f64_tan` / `ganita_f32_tan` (fdlibm `k_tan`; tan needs stdlib math ≥ 6.6.9, [ADR 0003](docs/adr/0003-tan-uses-stdlib-rem-pio2.md)); `binomial` refuses only past i64_MAX; `atan2` signed zeros / NaN / (±∞, ±∞); sinh/tanh/atanh/asinh/acosh/asin up to 1.3e8 ulp → ~2; sinh/cosh overflow band 495 → 1 ulp; toolchain 6.6.12 |

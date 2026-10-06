@@ -2140,54 +2140,82 @@ var _tn_ca_sys_skipped = 0;  # blocks of the bundle the set could not use       
 # not in the bundle, counted into `_tn_ca_sys_skipped`. Always 0 elsewhere.
 # Written by the claim holder only, in _tn_ca_read_win. CHANGELOG [6.6.14]
 var _tn_ca_sys_refused = 0;
+# ⛔ CVE-77 — THE STORE'S PURPOSE IS THE CHAIN'S PURPOSE. The set above is the system roots
+# trusted for SERVER authentication, which a CLIENT ctx anchors a server chain to. A SERVER ctx
+# anchors CLIENT chains (mTLS, _TN_PURPOSE_CLIENT), and Windows records per root which purposes
+# its root program trusts it for (CERT_ENHKEY_USAGE_PROP_ID): tls_native_set_ca_system gave an
+# mTLS server the serverAuth export, so a root Windows trusts for server authentication only
+# anchored client identities — the trust-store half of CVE-75, which enforces a CA CERTIFICATE's
+# own extendedKeyUsage. Windows now exports a second set for a server ctx, filtered for
+# clientAuth by the same rules (_tn_w_policy), cached and published exactly like the first. A
+# POSIX bundle carries no per-root purpose (it is the distro's serverAuth export), so both roles
+# share the set above there. Same publish protocol and validity rules as the five above.
+var _tn_ca_cl_state = 0;
+var _tn_ca_cl_buf = 0;
+var _tn_ca_cl_len = 0;
+var _tn_ca_cl_set = 0;
+var _tn_ca_cl_skipped = 0;
+var _tn_ca_cl_refused = 0;
 
 # Load and parse the bundle once per process: returns TLS_OK once `_tn_ca_buf`/`_tn_ca_len` and
 # the shared root set are published (a cached "none readable" and a cached unusable bundle
 # included), or TLS_ERR_OOM, which is NOT cached — the claim is rolled back to 0 so a later caller
 # tries again. Safe from any thread.
-#
+fn _tn_ca_load(): i64 {
+    return _tn_ca_load_into(&_tn_ca_state, &_tn_ca_buf, &_tn_ca_len, &_tn_ca_sys_set,
+      &_tn_ca_sys_skipped, &_tn_ca_sys_refused, _TN_PURPOSE_SERVER);
+}
+
+# _tn_ca_load for the CLIENT-purpose set a Windows server ctx installs (the `_tn_ca_cl_*` cells).
+fn _tn_ca_load_client(): i64 {
+    return _tn_ca_load_into(&_tn_ca_cl_state, &_tn_ca_cl_buf, &_tn_ca_cl_len, &_tn_ca_cl_set,
+      &_tn_ca_cl_skipped, &_tn_ca_cl_refused, _TN_PURPOSE_CLIENT);
+}
+
+# The once-per-process load behind both: the cells are the state, the bundle bytes and length, the
+# set, its skipped count and the store's refused count, for roots trusted for `purpose`.
 # ⚠ Nothing between the claim and the publish may `return`: the state would stay 1 and every later
 # connect would spin forever. The build lives in `_tn_ca_read` and `_tn_ca_parse_set`; the only
 # exits here are the two OOM rollbacks, each of which releases the claim itself.
-fn _tn_ca_load(): i64 {
-    var s = atomic_load(&_tn_ca_state);
+fn _tn_ca_load_into(st, pbuf, plen, pset, pskip, pref, purpose): i64 {
+    var s = atomic_load(st);
     while (s != 2) {
         if (s == 0) {
-            if (atomic_cas(&_tn_ca_state, 0, 1) == 1) {
+            if (atomic_cas(st, 0, 1) == 1) {
                 var cap = 1048576;              # 1 MiB; system bundles are ~250 KB
                 var buf = alloc(cap);
                 if (buf == 0) {
-                    atomic_store(&_tn_ca_state, 0);
+                    atomic_store(st, 0);
                     return TLS_ERR_OOM;
                 }
-                var total = _tn_ca_read(buf, cap);
+                var total = _tn_ca_read(buf, cap, pref, purpose);
                 var set = 0;
                 var skipped = 0;
                 if (total > 0) {
                     # Global heap (arena 0, allocator 0): the set outlives every ctx that shares it.
                     set = _tn_ca_parse_set(0, 0, buf, total, 0, &skipped);
                     if (set == TLS_ERR_OOM) {
-                        atomic_store(&_tn_ca_state, 0);
+                        atomic_store(st, 0);
                         return TLS_ERR_OOM;
                     }
                 }
-                _tn_ca_buf = buf;
-                _tn_ca_len = total;
-                _tn_ca_sys_set = set;
-                _tn_ca_sys_skipped = skipped + _tn_ca_sys_refused;
+                store64(pbuf, buf);
+                store64(plen, total);
+                store64(pset, set);
+                store64(pskip, skipped + load64(pref));
                 # Release half: the bytes, the set, the pointer and the length before the 2. aarch64 only
                 # — x86 (TSO) keeps store order, so a fence there is pure tax (lib/freelist.cyr).
                 #ifdef CYRIUS_ARCH_AARCH64
                 atomic_fence();
                 #endif
-                atomic_store(&_tn_ca_state, 2);
+                atomic_store(st, 2);
                 return TLS_OK;
             }
         }
-        s = atomic_load(&_tn_ca_state);
+        s = atomic_load(st);
     }
-    # Acquire half: on aarch64 the loads of `_tn_ca_buf`/`_tn_ca_len`, the set and the bytes behind
-    # them must not be satisfied before the state load that saw 2. x86 (TSO) never reorders loads.
+    # Acquire half: on aarch64 the loads of the bundle cells, the set and the bytes behind them must
+    # not be satisfied before the state load that saw 2. x86 (TSO) never reorders loads.
     #ifdef CYRIUS_ARCH_AARCH64
     atomic_fence();
     #endif
@@ -2198,33 +2226,51 @@ fn _tn_ca_load(): i64 {
 # above): after the first call this stores a pointer and allocates nothing, from the global heap or
 # the ctx's allocator. Records the set's skipped count for tls_native_ca_skipped. A bundle with no
 # usable root is TLS_ERR_CERT_INVALID every time (the ctx keeps any set it had), as
-# tls_native_set_ca_bundle answers it.
+# tls_native_set_ca_bundle answers it. A SERVER ctx (it verifies client chains) gets, on Windows,
+# the roots the store trusts for client authentication (CVE-77, above); a client ctx, and
+# every ctx elsewhere, the roots trusted for server authentication.
 fn tls_native_set_ca_system(ctx): i64 {
     if (ctx == 0) { return TLS_ERR_INVALID_PARAM; }
+    #ifdef CYRIUS_TARGET_WIN
+    if (load64(ctx + TLS_CTX_OFF_ROLE) == TLS_ROLE_SERVER) {
+        var cr = _tn_ca_load_client();
+        if (cr != TLS_OK) { return cr; }
+        return _tn_ca_install(ctx, _tn_ca_cl_len, _tn_ca_cl_set, _tn_ca_cl_skipped);
+    }
+    #endif
     var lr = _tn_ca_load();
     if (lr != TLS_OK) { return lr; }
-    if (_tn_ca_len < 0) {
+    return _tn_ca_install(ctx, _tn_ca_len, _tn_ca_sys_set, _tn_ca_sys_skipped);
+}
+
+# Store a published system set on `ctx`: `len` < 0 is no bundle (TLS_ERR_IO), a negative `set` an
+# unusable one; `skipped` goes to tls_native_ca_skipped either way.
+fn _tn_ca_install(ctx, len, set, skipped): i64 {
+    if (len < 0) {
         # No bundle. On Windows that includes a store whose every TLS root was refused: report those
         # through tls_native_ca_skipped, or the reason the ctx has no roots is invisible. CHANGELOG [6.6.14]
-        if (_tn_ca_sys_skipped > 0) { store64(ctx + TLS_CTX_OFF_CA_SKIPPED, _tn_ca_sys_skipped); }
+        if (skipped > 0) { store64(ctx + TLS_CTX_OFF_CA_SKIPPED, skipped); }
         return TLS_ERR_IO;
     }
-    store64(ctx + TLS_CTX_OFF_CA_SKIPPED, _tn_ca_sys_skipped);
-    if (_tn_ca_sys_set < 0) { return _tn_ca_sys_set; }
-    store64(ctx + TLS_CTX_OFF_CA_ROOT, _tn_ca_sys_set);
+    store64(ctx + TLS_CTX_OFF_CA_SKIPPED, skipped);
+    if (set < 0) { return set; }
+    store64(ctx + TLS_CTX_OFF_CA_ROOT, set);
     return TLS_OK;
 }
 
 # Read the first readable system bundle into `buf` (`cap` bytes). Returns the byte count, or -1
-# when no candidate is readable (the caller caches that). Called only by the claim holder.
+# when no candidate is readable (the caller caches that). Called only by the claim holder. `refused`
+# receives the roots the store refused (Windows; 0 elsewhere), `purpose` the TlsChainPurpose the
+# roots must be trusted for — a POSIX bundle has no per-root purpose, so it is read the same for both.
 # ⛔ CVE-65 (6.6.14) — NEVER THE POSIX PATHS ON WINDOWS. There a rooted path is DRIVE-RELATIVE:
 # "/etc/ssl/cert.pem" is C:\etc\ssl\cert.pem, and any authenticated user may create folders at the
 # root of the system drive, so one local user could plant trust anchors every native TLS client on
 # the box then trusted (measured on cass: a planted cert.pem installed as the only root). Windows
 # reads its own store instead (_tn_ca_read_win) — CVE-54 / CVE-57's class. CHANGELOG [6.6.14]
-fn _tn_ca_read(buf, cap): i64 {
+fn _tn_ca_read(buf, cap, refused, purpose): i64 {
+    store64(refused, 0);
     #ifdef CYRIUS_TARGET_WIN
-    var w = _tn_ca_read_win(buf, cap);
+    var w = _tn_ca_read_win(buf, cap, refused, purpose);
     return w;
     #endif
     #ifndef CYRIUS_TARGET_WIN
@@ -2265,7 +2311,9 @@ fn _tn_ca_read(buf, cap): i64 {
 # (AuthRoot) roots and Group Policy / Enterprise roots (measured on cass: CurrentUser\ROOT 59 ⊇
 # LocalMachine\ROOT 59 ⊇ AuthRoot 47).
 # WHICH ROOTS: the ones the root's own properties and the Disallowed store say Windows trusts for TLS
-# server authentication — the policy only ever REMOVES roots, and anything it cannot judge is refused:
+# server authentication — the policy only ever REMOVES roots, and anything it cannot judge is refused.
+# (A server ctx's set asks the same of CLIENT authentication — every "serverAuth" below reads
+# "clientAuth" for it; CVE-77 at `_tn_ca_cl_state`.)
 #   - a root whose root-program purposes (CERT_ENHKEY_USAGE_PROP_ID) leave out serverAuth is not a
 #     TLS anchor (cass: 6, e.g. Thawte Timestamping CA) — the analogue of the Mozilla trust bits the
 #     POSIX bundles are already filtered by;
@@ -2341,12 +2389,15 @@ fn _tn_w_open(fns, name): i64 {
     return st;
 }
 
-# 1 when the content `o[0..l)` of an OBJECT IDENTIFIER is serverAuth (1.3.6.1.5.5.7.3.1) or
-# anyExtendedKeyUsage (2.5.29.37.0).
-fn _tn_w_oid_server(o, l): i64 {
+# 1 when the content `o[0..l)` of an OBJECT IDENTIFIER names `purpose` (TlsChainPurpose) —
+# serverAuth (1.3.6.1.5.5.7.3.1) for _TN_PURPOSE_SERVER, clientAuth (1.3.6.1.5.5.7.3.2) for
+# _TN_PURPOSE_CLIENT — or is anyExtendedKeyUsage (2.5.29.37.0), which names both.
+fn _tn_w_oid_purpose(o, l, purpose): i64 {
     if (l == 8) {
         if (load32(o) == 0x0501062B) {
-            if (load32(o + 4) == 0x01030705) { return 1; }
+            var want = 0x01030705;                          # 05 07 03 01: serverAuth
+            if (purpose == _TN_PURPOSE_CLIENT) { want = 0x02030705; }   # 05 07 03 02: clientAuth
+            if (load32(o + 4) == want) { return 1; }
         }
     }
     if (l == 4) {
@@ -2356,12 +2407,12 @@ fn _tn_w_oid_server(o, l): i64 {
 }
 
 # The DER SEQUENCE OF OBJECT IDENTIFIER at p[0..n) — a purpose-list property: 1 when it names
-# serverAuth or anyExtendedKeyUsage, 0 when it is well formed and names neither, -1 when it is
+# `purpose` (_tn_w_oid_purpose) or anyExtendedKeyUsage, 0 when it is well formed and names neither, -1 when it is
 # MALFORMED (not one SEQUENCE filling exactly n bytes, or an element that is not a short-form,
 # non-empty OID). Three answers because the callers fail closed in OPPOSITE directions: for the
 # allow-list (prop 9) malformed is "cannot tell it is a TLS root", for a distrust scope (122, 127)
 # it is "cannot tell the distrust spares TLS". CHANGELOG [6.6.14]
-fn _tn_w_eku_server(p, n): i64 {
+fn _tn_w_eku_purpose(p, n, purpose): i64 {
     if (n < 2) { return 0 - 1; }
     if ((load8(p) & 0xFF) != 0x30) { return 0 - 1; }
     var len = load8(p + 1) & 0xFF;
@@ -2389,7 +2440,7 @@ fn _tn_w_eku_server(p, n): i64 {
         if (l == 0) { return 0 - 1; }
         if (l >= 0x80) { return 0 - 1; }
         if (i + 2 + l > end) { return 0 - 1; }
-        if (_tn_w_oid_server(p + i + 2, l) == 1) { found = 1; }
+        if (_tn_w_oid_purpose(p + i + 2, l, purpose) == 1) { found = 1; }
         i = i + 2 + l;
     }
     return found;
@@ -2418,35 +2469,35 @@ fn _tn_w_prop(fns, cc, id, scratch, scap): i64 {
 }
 
 # 1 when the store certificate `cc` carries the dated distrust `date_id` and its purpose scope
-# `eku_id` covers TLS (an absent scope covers every purpose; a malformed one may), or when either
-# cannot be read; 0 when it carries no such distrust.
-fn _tn_w_dated(fns, cc, date_id, eku_id, scratch, scap): i64 {
+# `eku_id` covers `purpose` (an absent scope covers every purpose; a malformed one may), or when
+# either cannot be read; 0 when it carries no such distrust.
+fn _tn_w_dated(fns, cc, date_id, eku_id, scratch, scap, purpose): i64 {
     var n = _tn_w_prop(fns, cc, date_id, scratch, scap);
     if (n == 0 - 1) { return 0; }
     if (n == 0 - 2) { return 1; }
     n = _tn_w_prop(fns, cc, eku_id, scratch, scap);
     if (n < 0) { return 1; }            # absent: the date applies to every purpose
-    if (_tn_w_eku_server(scratch, n) != 0) { return 1; }   # names TLS, or malformed
+    if (_tn_w_eku_purpose(scratch, n, purpose) != 0) { return 1; }   # names it, or malformed
     return 0;
 }
 
-# How Windows trusts the store certificate `cc` (a PCCERT_CONTEXT) for TLS server authentication:
-# 1 = as an anchor, 0 = not at all (its purposes leave serverAuth out), 2 = refused (a dated
-# distrust covers TLS, it carries root-program name constraints, or a property cannot be read or is
-# malformed — it cannot be judged, so it is refused and COUNTED). Any failure other than "property
-# absent" fails closed. Property values are read into scratch[0..scap) — the unused tail of the
-# bundle buffer.
-fn _tn_w_policy(fns, cc, scratch, scap): i64 {
+# How Windows trusts the store certificate `cc` (a PCCERT_CONTEXT) for TLS `purpose` (TlsChainPurpose:
+# server or client authentication): 1 = as an anchor, 0 = not at all (its purposes leave that one
+# out), 2 = refused (a dated distrust covers it, it carries root-program name constraints, or a
+# property cannot be read or is malformed — it cannot be judged, so it is refused and COUNTED). Any
+# failure other than "property absent" fails closed. Property values are read into scratch[0..scap)
+# — the unused tail of the bundle buffer.
+fn _tn_w_policy(fns, cc, scratch, scap, purpose): i64 {
     var n = _tn_w_prop(fns, cc, _TN_W_PROP_EKU, scratch, scap);
     if (n == 0 - 2) { return 2; }
     if (n >= 0) {
-        var e = _tn_w_eku_server(scratch, n);
+        var e = _tn_w_eku_purpose(scratch, n, purpose);
         if (e < 0) { return 2; }
         if (e == 0) { return 0; }
     }
     if (_tn_w_prop(fns, cc, _TN_W_PROP_NAMES, scratch, scap) != 0 - 1) { return 2; }
-    if (_tn_w_dated(fns, cc, _TN_W_PROP_DISABLE, _TN_W_PROP_DISABLE_EKU, scratch, scap) == 1) { return 2; }
-    if (_tn_w_dated(fns, cc, _TN_W_PROP_NOTBEFORE, _TN_W_PROP_NOTBEFORE_EKU, scratch, scap) == 1) { return 2; }
+    if (_tn_w_dated(fns, cc, _TN_W_PROP_DISABLE, _TN_W_PROP_DISABLE_EKU, scratch, scap, purpose) == 1) { return 2; }
+    if (_tn_w_dated(fns, cc, _TN_W_PROP_NOTBEFORE, _TN_W_PROP_NOTBEFORE_EKU, scratch, scap, purpose) == 1) { return 2; }
     return 1;
 }
 
@@ -2504,12 +2555,12 @@ fn _tn_w_pem_put(buf, pos, cap, der, dlen): i64 {
     return o + 26;
 }
 
-# Walk the store `root` and write every certificate the policy takes — and `dis` (the Disallowed
-# store) does not hold — into buf[0..cap) as PEM. The byte count (0 when none qualified); the
-# number refused (policy 2, or a block that did not fit) is stored at `refused`. Takes the two
-# store handles so the policy can be exercised on stores built in memory
+# Walk the store `root` and write every certificate the policy takes for `purpose` — and `dis` (the
+# Disallowed store) does not hold — into buf[0..cap) as PEM. The byte count (0 when none
+# qualified); the number refused (policy 2, or a block that did not fit) is stored at `refused`.
+# Takes the two store handles so the policy can be exercised on stores built in memory
 # (tests/tcyr/crossos/tls_system_trust_store.tcyr). CHANGELOG [6.6.14]
-fn _tn_w_export(fns, root, dis, buf, cap, refused): i64 {
+fn _tn_w_export(fns, root, dis, buf, cap, refused, purpose): i64 {
     var en = load64(fns + 8);
     var total = 0;
     var nref = 0;
@@ -2517,7 +2568,7 @@ fn _tn_w_export(fns, root, dis, buf, cap, refused): i64 {
     while (c != 0) {
         var der = load64(c + 8);
         var dlen = load32(c + 16);
-        var pol = _tn_w_policy(fns, c, buf + total, cap - total);
+        var pol = _tn_w_policy(fns, c, buf + total, cap - total, purpose);
         if (pol != 0) {
             if (_tn_w_in_store(fns, dis, der, dlen) == 1) { pol = 0; }
         }
@@ -2533,11 +2584,12 @@ fn _tn_w_export(fns, root, dis, buf, cap, refused): i64 {
     return total;
 }
 
-# The Windows system store for _tn_ca_read: every root Windows trusts as a TLS anchor, as a PEM
-# bundle in buf[0..cap). The byte count, or -1 for no store (crypt32 or a store would not open, or
-# no root qualified) — the caller caches that as TLS_ERR_IO. Sets `_tn_ca_sys_refused`.
-fn _tn_ca_read_win(buf, cap): i64 {
-    _tn_ca_sys_refused = 0;
+# The Windows system store for _tn_ca_read: every root Windows trusts as an anchor for `purpose`, as
+# a PEM bundle in buf[0..cap). The byte count, or -1 for no store (crypt32 or a store would not
+# open, or no root qualified) — the caller caches that as TLS_ERR_IO. Writes the refused count
+# through `refused`.
+fn _tn_ca_read_win(buf, cap, refused, purpose): i64 {
+    store64(refused, 0);
     var fns[32];
     if (_tn_w_crypt32(&fns) == 0) { return 0 - 1; }
     var root = _tn_w_open(&fns, "ROOT");
@@ -2548,7 +2600,7 @@ fn _tn_ca_read_win(buf, cap): i64 {
         callptr(cl, root, 0);
         return 0 - 1;
     }
-    var total = _tn_w_export(&fns, root, dis, buf, cap, &_tn_ca_sys_refused);
+    var total = _tn_w_export(&fns, root, dis, buf, cap, refused, purpose);
     callptr(cl, dis, 0);
     callptr(cl, root, 0);
     if (total <= 0) { return 0 - 1; }
@@ -2613,7 +2665,14 @@ fn tls_native_set_client_key(ctx, key, key_len): i64 {
 # set, != -1) must permit `below` intermediate CAs beneath it toward the leaf.
 # `below` is the path-build depth at which this CA signs (0 = it directly signs
 # the leaf). Uses the sigil 3.7.12 keyUsage/pathLen fields. Returns 1 if OK.
-fn _tn_ca_signer_ok(ca, below): i64 {
+# ⛔ 6.6.16 (CVE-75) — WHY `purpose`: a CA's extendedKeyUsage confines what it may vouch
+# for, and this never looked at it. A CA limited to clientAuth / codeSigning / S/MIME could issue
+# a leaf the native client took as a TLS server, and a serverAuth-only CA in an mTLS server's
+# trust set could issue a client identity; OpenSSL refuses both. The check sits HERE, inside the
+# conjunction _tn_verify_chain uses to SELECT a candidate (intermediate and trust anchor alike),
+# so a wrongly purposed CA is skipped and path building goes on to the next one — never fatal.
+# CHANGELOG [6.6.16]
+fn _tn_ca_signer_ok(ca, below, purpose): i64 {
     var ku = x509_cert_key_usage(ca);
     if (ku != 0) {                          # keyUsage present
         if ((ku & 0x04) == 0) { return 0; } # keyCertSign required to sign certs
@@ -2622,6 +2681,7 @@ fn _tn_ca_signer_ok(ca, below): i64 {
     if (pl != (0 - 1)) {                     # pathLenConstraint set
         if (below > pl) { return 0; }
     }
+    if (_tn_eku_purpose_ok(ca, purpose) != 1) { return 0; }
     return 1;
 }
 
@@ -2632,6 +2692,8 @@ fn _tn_ca_signer_ok(ca, below): i64 {
 #   _TN_PURPOSE_CLIENT  a TLS client: keyUsage allows digitalSignature | keyAgreement (0x88, the
 #                       mask of OpenSSL's ssl_client purpose); extendedKeyUsage lists clientAuth or
 #                       anyExtendedKeyUsage
+# The extendedKeyUsage half binds every CA on the path too, intermediates and the trust anchor
+# (_tn_eku_purpose_ok, 6.6.16); keyUsage on a CA is keyCertSign (_tn_ca_signer_ok).
 enum TlsChainPurpose {
     _TN_PURPOSE_SERVER = 0;
     _TN_PURPOSE_CLIENT = 1;
@@ -2709,6 +2771,21 @@ fn _tn_cert_eku_client_auth(der, der_len): i64 {
     return 0;
 }
 
+# 1 if `cert`'s extendedKeyUsage permits `purpose` (see TlsChainPurpose), else 0 — the ONE EKU
+# rule, applied at every depth: the leaf (_tn_leaf_purpose_ok) and every CA, intermediate or trust
+# anchor (_tn_ca_signer_ok). An absent extension imposes no restriction (RFC 5280 §4.2.1.12).
+# anyExtendedKeyUsage satisfies either purpose at every depth, as RFC 5280 reads it and as the leaf
+# rule always did; OpenSSL 3.6.5 honours it at NO depth (measured) — going strict is this one
+# function, and it moves the leaf rule too. `cert`'s DER (load64(cert)) must be live: sigil
+# records the serverAuth bit only, so the client purpose reads the extension from the DER.
+# CHANGELOG [6.6.16]
+fn _tn_eku_purpose_ok(cert, purpose): i64 {
+    var eku = x509_cert_eku(cert);
+    if (eku == 0) { return 1; }
+    if (purpose == _TN_PURPOSE_SERVER) { return eku & 0x01; }
+    return _tn_cert_eku_client_auth(load64(cert), load64(cert + 8));
+}
+
 # 1 if `leaf`'s keyUsage and extendedKeyUsage permit `purpose` (see TlsChainPurpose), else 0.
 fn _tn_leaf_purpose_ok(leaf, purpose): i64 {
     var kmask = 0xA8;
@@ -2717,10 +2794,7 @@ fn _tn_leaf_purpose_ok(leaf, purpose): i64 {
     if (lku != 0) {
         if ((lku & kmask) == 0) { return 0; }
     }
-    var leku = x509_cert_eku(leaf);
-    if (leku == 0) { return 1; }
-    if (purpose == _TN_PURPOSE_SERVER) { return leku & 0x01; }
-    return _tn_cert_eku_client_auth(load64(leaf), load64(leaf + 8));
+    return _tn_eku_purpose_ok(leaf, purpose);
 }
 
 # The chain verifier both roles share (6.6.14): `leaf` (a parsed x509 cert, or 0), `inters` (the
@@ -2779,8 +2853,9 @@ fn _tn_verify_chain(ctx, leaf, inters, now_unix, purpose): i64 {
                     if (x509_cert_is_ca(R) == 1) {
                         if (_x509_verify_link(cur, R) == 1) {
                             # CVE-17: the anchoring root must assert keyCertSign
-                            # (if it has keyUsage) + honor pathLen for `depth`.
-                            if (_tn_ca_signer_ok(R, depth) == 1) { return TLS_OK; }
+                            # (if it has keyUsage) + honor pathLen for `depth`;
+                            # 6.6.16: and its EKU must permit `purpose`.
+                            if (_tn_ca_signer_ok(R, depth, purpose) == 1) { return TLS_OK; }
                         }
                     }
                 }
@@ -2798,8 +2873,9 @@ fn _tn_verify_chain(ctx, leaf, inters, now_unix, purpose): i64 {
                         if (_x509_in_window(P, now_unix) == 1) {
                             if (_x509_verify_link(cur, P) == 1) {
                                 # CVE-17: signing intermediate must assert
-                                # keyCertSign + honor pathLen for `depth`.
-                                if (_tn_ca_signer_ok(P, depth) == 1) { nextp = P; ii = ni; }
+                                # keyCertSign + honor pathLen for `depth`;
+                                # 6.6.16: and its EKU must permit `purpose`.
+                                if (_tn_ca_signer_ok(P, depth, purpose) == 1) { nextp = P; ii = ni; }
                             }
                         }
                     }

@@ -61,6 +61,18 @@ include "lib/syscalls.cyr"
 
 include "lib/atomic.cyr"
 
+# 6.6.18 — POISON MODE reaches alloc(). Under `#define CYRIUS_POISON` (what `cyrius fuzz
+# --poison` sets) every alloc() block gets a leading and a trailing redzone and sits on the
+# poison core's live list; arenas become an accounting shell over those blocks. ⛔ EVERY
+# poison line in this file is under `#ifdef CYRIUS_POISON`, never a run-time `if`: this file
+# is COMPILER SOURCE, no compiler build defines the flag, and so cycc's bytes on all seven
+# forks are unchanged (an unconditional include here broke the seed chain at 6.6.6).
+# Invariant: poison never changes which requests succeed, alloc_used() / arena_used(), or
+# the zero-init of user bytes. agnos and cx alloc() are not instrumented. CHANGELOG [6.6.18]
+#ifdef CYRIUS_POISON
+include "lib/poison.cyr"
+#endif
+
 var _alloc_lock = 0;
 
 # v6.3.17 (PF-02): single-threaded fast path. The v6.0.64 spinlock+2-fences is only
@@ -295,6 +307,10 @@ fn alloc(size): i64 {
     # validated OUTSIDE the lock so bad calls never contend.
     if (size <= 0) { return 0; }
     if (size > ALLOC_MAX) { return 0; }
+    #ifdef CYRIUS_POISON
+    var pz_req = size;
+    size = size + _POISON_HDR + _POISON_RZ + _POISON_RZ;
+    #endif
     # Align to 8 bytes (local — outside the lock).
     size = (size + 7) & (0 - 8);
     # --- critical section: chunk state + _linux_new_chunk are shared ---
@@ -309,7 +325,13 @@ fn alloc(size): i64 {
     var ptr = _heap_ptr;
     _heap_ptr = ptr + size;
     _heap_used = _heap_used + size;
+    #ifdef CYRIUS_POISON
+    _heap_used = _heap_used - size + ((pz_req + 7) & (0 - 8));   # alloc_used() counts the REQUEST
+    #endif
     _alloc_lock_release();
+    #ifdef CYRIUS_POISON
+    return _poison_arm_alloc(ptr, pz_req, 1);                    # armed + published outside the lock
+    #endif
     return ptr;
 }
 
@@ -329,6 +351,9 @@ fn alloc(size): i64 {
 #
 # Reset only when nothing from the previous epoch will be read again.
 fn alloc_reset(): i64 {
+    #ifdef CYRIUS_POISON
+    poison_forget_all();     # every listed block dies here, and its address is re-issued
+    #endif
     _alloc_lock_acquire();
     # Scrub the reused span of the FIRST chunk before rewinding, so a later
     # alloc() can't read the prior occupant's bytes (memory-reuse info-leak,
@@ -346,12 +371,18 @@ fn alloc_reset(): i64 {
     _heap_ptr = _heap_first_base;
     _heap_end = _heap_first_end;
     _heap_used = 0;
+    #ifdef CYRIUS_POISON
+    _poison_hidden = 0;
+    #endif
     _alloc_lock_release();
     return 0;
 }
 
 # Return the number of heap bytes handed out since the last init/reset
 fn alloc_used(): i64 {
+    #ifdef CYRIUS_POISON
+    return _heap_used - _poison_hidden;     # 6.6.18: arena blocks are not global heap use
+    #endif
     return _heap_used;
 }
 #endif
@@ -440,6 +471,9 @@ var ARENA_FULL_ABORT = 3;
 # Create a new arena with the given capacity (bytes). Fixed-size, returns 0 when
 # exhausted — unchanged from every prior release.
 fn arena_new(capacity): i64 {
+    #ifdef CYRIUS_POISON
+    return _poison_arena_new(capacity);     # 6.6.18: the 64-byte header (owner list at a+56)
+    #endif
     var a = alloc(56);
     if (a == 0) { return 0; }
     var ch = alloc(capacity + 16);
@@ -519,12 +553,23 @@ fn _arena_grow(a, need): i64 {
 fn arena_alloc(a, size): i64 {
     if (size <= 0) { return 0; }
     if (a == 0) { return 0; }
+    # 6.6.18 — under CYRIUS_POISON the arena is an ACCOUNTING SHELL: the bookkeeping below runs
+    # unchanged on the request, so accept/refuse, arena_used and arena_remaining are exactly the
+    # non-poison values, and each accepted request is served by a redzoned block the arena owns
+    # (quarantined at arena_reset / arena_free). Carving the redzones in place would need ~11x
+    # over-reservation to keep the decisions identical.
+    #ifdef CYRIUS_POISON
+    var pz_req = size;
+    #endif
     size = (size + 7) & (0 - 8);
     var ptr = load64(a + 8);
     var new_ptr = ptr + size;
     if (new_ptr < ptr) { return 0; }
     if (new_ptr <= load64(a + 16)) {
         store64(a + 8, new_ptr);
+        #ifdef CYRIUS_POISON
+        return _poison_arena_take(a, pz_req);
+        #endif
         return ptr;
     }
     var pol = load64(a + 24);
@@ -541,12 +586,18 @@ fn arena_alloc(a, size): i64 {
         # passed, because it only checked the pointer was non-zero.
         if (np2 > load64(a + 16)) { return 0; }
         store64(a + 8, np2);
+        #ifdef CYRIUS_POISON
+        return _poison_arena_take(a, pz_req);
+        #endif
         return p2;
     }
     if (pol == ARENA_FULL_SPILL) {
         # Served from the global bump: never reclaimed by arena_reset, which is the
         # documented cost of this policy. It restores the pre-arena behaviour rather
         # than the crash, and is strictly weaker than GROW.
+        #ifdef CYRIUS_POISON
+        return _poison_block(pz_req, 1);    # one poisoned alloc() block — never wrapped twice
+        #endif
         return alloc(size);
     }
     if (pol == ARENA_FULL_ABORT) {
@@ -564,6 +615,9 @@ fn arena_alloc(a, size): i64 {
 # a request loop converges on its high-water mark and then allocates nothing at all.
 fn arena_reset(a): i64 {
     if (a == 0) { return 0; }
+    #ifdef CYRIUS_POISON
+    _poison_arena_quarantine(a);            # 6.6.18: check, fill, mark DEAD every owned block
+    #endif
     var first = load64(a + 32);
     if (first != 0) {
         store64(a + 40, first);
@@ -611,6 +665,9 @@ fn arena_remaining(a): i64 {
 # handle fails safely instead of leaking writes into stale memory.
 fn arena_free(a): i64 {
     if (a == 0) { return 0; }
+    #ifdef CYRIUS_POISON
+    _poison_arena_quarantine(a);
+    #endif
     store64(a,      0);   # base = 0
     store64(a + 8,  0);   # ptr  = 0  (matches base; arena_used == 0)
     store64(a + 16, 0);   # end  = 0  (so arena_alloc's bounds check fails)
