@@ -796,7 +796,7 @@ fn getppid(): i64 { return sys_getppid(); }
 # (path not found). v5.10.44 added the `_str` family specifically
 # to give Str-pushing consumers a working verb; pre-v5.10.44 the
 # natural cyrius idiom (Str push) silently failed under exec_vec.
-# Filed at `docs/development/issues/2026-05-10-process-exec-str-
+# Filed at `docs/development/issues/archived/2026-05-10-process-exec-str-
 # cstr-ambiguity.md` (argonaut-blocking).
 #
 # Both shapes share the same envp shape with their family — the

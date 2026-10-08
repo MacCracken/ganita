@@ -685,6 +685,22 @@ var _agnos_sock_sndto_us: i64[8];
 # there — measured by mutation, 6.6.10. It stays as belt and braces, not as a guarantee.
 # CHANGELOG [6.6.8] [6.6.10]
 var _agnos_accept_from: i64[8];
+# 6.6.19: the READINESS STASH behind async_await_readable_ms (lib/async_agnos.cyr). agnos has no
+# probe that leaves data in place — sock_accept#57 and sock_recv#49 both CONSUME, and epoll#21
+# sees no conn — so the probe takes the item and parks it here until the consumer asks:
+#   _agnos_listen_pend  per LISTEN fd slot: a conn the probe pre-accepted (conn_id + 1; 0 = none).
+#                       sys_sock_accept hands it out before issuing #57; sys_close of the listener
+#                       closes it if nobody did (a LISTEN close reaps only UN-accepted children).
+#   _agnos_peek         per kernel CONN ID 0..7 (not per fd slot): a byte the probe read
+#                       (0x100 | byte), or 0x200 for an EOF it saw; 0 = none. Delivered inside
+#                       _agnos_sock_recv_block, which every tagged read goes through — sys_read
+#                       AND tls_native's _tn_agnos_read_full, which reads by conn id — and cleared
+#                       whenever that conn id is closed or handed out again.
+# ⚠ A consumer reading a conn through RAW sys_sock_recv(conn_id) would miss a peeked byte;
+# nothing in lib/ does. A pre-accepted conn holds one of the kernel's 8 conn slots until it is
+# accepted or its listener closes. CHANGELOG [6.6.19]
+var _agnos_listen_pend: i64[8];
+var _agnos_peek: i64[8];
 
 # ================================================================
 # Wrappers — mirror the consumer sys_* surface with agnos numbers.
@@ -949,6 +965,12 @@ fn sys_close(fd): i64 {
         store64(&_agnos_conn_tbl + slot * 8, 0);
         store64(&_agnos_sock_rcvto_us + slot * 8, 0);    # v6.6.7: per-socket deadlines
         store64(&_agnos_sock_sndto_us + slot * 8, 0);
+        # 6.6.19: a conn the readiness probe pre-accepted for this listener and nobody accepted
+        # is OURS now, not the listener's child — close it, or its kernel slot leaks.
+        var pend = load64(&_agnos_listen_pend + slot * 8);
+        store64(&_agnos_listen_pend + slot * 8, 0);
+        if (pend > 0) { sys_sock_close(pend - 1); }
+        if (v > 0) { _agnos_peek_clear(v - 1); }
         if (lv > 0) { return syscall(SYS_SOCK_CLOSE, lv - 1); }   # LISTEN: reaps children (1.45.6)
         if (v > 0) { return syscall(SYS_SOCK_CLOSE, v - 1); }     # client/accepted conn: FIN
         return 0;
@@ -1930,6 +1952,7 @@ fn sys_nanosleep(req, rem): i64 {
 fn sys_sock_connect(dst_ip, dst_port, src_port): i64 {
     var c = syscall(SYS_SOCK_CONNECT, dst_ip, dst_port, src_port);
     _agnos_accept_mark(c, 0);
+    _agnos_peek_clear(c);          # 6.6.19: a recycled conn id never inherits a peeked byte
     return c;
 }
 # Send `len` bytes over an ESTABLISHED conn (#48). BLOCKS only the caller (agnos 1.57.7) and
@@ -1947,6 +1970,7 @@ fn sys_sock_recv(conn_id, buf, maxlen): i64 { return syscall(SYS_SOCK_RECV, conn
 # connect rewrites the mark anyway.
 fn sys_sock_close(conn_id): i64 {
     _agnos_accept_mark(conn_id, 0);
+    _agnos_peek_clear(conn_id);    # 6.6.19: the readiness stash's byte dies with the conn
     return syscall(SYS_SOCK_CLOSE, conn_id);
 }
 
@@ -2027,10 +2051,60 @@ var SOCK_LISTEN_LOOPBACK = 0x100000000;
 # / bad listen_id).
 # v6.6.8: it also marks the conn with the listen slot it came from (_agnos_accept_from), so the
 # fd _agnos_sock_bind wraps it in inherits the listener's timeouts.
+# 6.6.19: a conn the readiness probe already pre-accepted for this listener is handed out FIRST,
+# with no #57 (it was marked when the probe took it) — so net.cyr's sock_accept and sys_accept4,
+# which both come through here, consume it.
 fn sys_sock_accept(listen_id): i64 {
+    var slot = _agnos_listen_slot_of(listen_id);
+    if (slot >= 0) {
+        var pend = load64(&_agnos_listen_pend + slot * 8);
+        if (pend > 0) {
+            store64(&_agnos_listen_pend + slot * 8, 0);
+            return pend - 1;
+        }
+    }
     var c = syscall(SYS_SOCK_ACCEPT, listen_id);
-    if (c >= 0) { _agnos_accept_mark(c, _agnos_listen_slot_of(listen_id) + 1); }
+    if (c >= 0) {
+        _agnos_accept_mark(c, slot + 1);
+        _agnos_peek_clear(c);      # a recycled conn id never inherits a peeked byte
+    }
     return c;
+}
+
+# 6.6.19: the readiness probe for async_await_readable_ms (see _agnos_listen_pend / _agnos_peek).
+# 1 = ready (a conn is pending, or a byte or EOF is stashed), 0 = not yet, -1 = no probe for this
+# fd — not a tagged LISTEN or CONN socket (a pipe, a file, the keyboard). agnos 1.57.8+ reads of
+# those BLOCK, so for them the read itself is the wait. Never blocks.
+fn _agnos_fd_ready(fd): i64 {
+    if (_agnos_is_sock_fd(fd) == 0) { return 0 - 1; }
+    _agnos_conn_init();
+    var slot = fd & 7;
+    var lid = _agnos_fd_listen(fd);
+    if (lid >= 0) {
+        if (load64(&_agnos_listen_pend + slot * 8) > 0) { return 1; }
+        var c = sys_sock_accept(lid);                 # #57: non-blocking; marks the conn
+        if (c < 0) { return 0; }
+        store64(&_agnos_listen_pend + slot * 8, c + 1);
+        return 1;
+    }
+    var cid = _agnos_fd_conn(fd);
+    if (cid < 0) { return 0 - 1; }
+    if (cid > 7) { return 0 - 1; }
+    if (load64(&_agnos_peek + cid * 8) != 0) { return 1; }
+    var b[8];
+    store64(&b, 0);
+    var r = syscall(SYS_SOCK_RECV, cid, &b, 1);      # #49: non-blocking, at most ONE byte
+    if (r > 0) { store64(&_agnos_peek + cid * 8, 0x100 | (load8(&b) & 0xFF)); return 1; }
+    if (r < 0) { store64(&_agnos_peek + cid * 8, 0x200); return 1; }   # EOF: ready, read says 0
+    return 0;
+}
+
+# Drop conn `conn_id`'s stashed byte or EOF, if any. Ignores an id outside the kernel's 0..7.
+fn _agnos_peek_clear(conn_id): i64 {
+    if (conn_id < 0) { return 0; }
+    if (conn_id > 7) { return 0; }
+    store64(&_agnos_peek + conn_id * 8, 0);
+    return 0;
 }
 
 # ── 6.6.17: the BSD socket verbs — socket / bind / listen / connect / accept4 — the Linux-common
@@ -2286,6 +2360,8 @@ fn _agnos_conn_init(): i64 {
         store64(&_agnos_sock_rcvto_us + i * 8, 0);
         store64(&_agnos_sock_sndto_us + i * 8, 0);
         store64(&_agnos_accept_from + i * 8, 0);
+        store64(&_agnos_listen_pend + i * 8, 0);  # 6.6.19: the readiness stash
+        store64(&_agnos_peek + i * 8, 0);
         i = i + 1;
     }
     _agnos_conn_ready = 1;
@@ -2446,6 +2522,25 @@ fn _agnos_fd_listen(fd): i64 {
 # answered 502) — and an entry RTC read of 0 made the deadline 30 and fired it at once.
 # CHANGELOG [6.6.7]
 fn _agnos_sock_recv_block(conn_id, buf, n, tmo_us): i64 {
+    # 6.6.19: a byte (or EOF) the readiness probe stashed for this conn comes FIRST, then ONE
+    # non-blocking #49 for the rest — the byte is already "data ready", so this read must not
+    # wait. Here rather than in sys_read because tls_native reads conns by id through this fn.
+    if (n > 0) {
+        if (conn_id >= 0) {
+            if (conn_id <= 7) {
+                var pk = load64(&_agnos_peek + conn_id * 8);
+                if (pk != 0) {
+                    store64(&_agnos_peek + conn_id * 8, 0);
+                    if (pk == 0x200) { return 0; }            # the probe saw EOF
+                    store8(buf, pk & 0xFF);
+                    if (n == 1) { return 1; }
+                    var rest = syscall(SYS_SOCK_RECV, conn_id, buf + 1, n - 1);
+                    if (rest > 0) { return 1 + rest; }
+                    return 1;
+                }
+            }
+        }
+    }
     var dl[32];
     _agnos_dl_start(&dl, tmo_us);
     while (1 == 1) {
@@ -2585,8 +2680,8 @@ fn _agnos_dl_over(dl): i64 {
 # hands back a zeroed buffer). Un-fail-closes random_bytes() and its
 # ws/sandhi/sigil/tls_native consumers on AGNOS. Returns `len` on success,
 # 0 for len<=0, -1 on a bad user range — the Linux getrandom shape, so
-# consumers checking >0 are portable. (issues/2026-06-11-windows-entropy-
-# primitive.md remains open for the Windows CSPRNG; this is the AGNOS half.)
+# consumers checking >0 are portable. (issues/archived/2026-06-11-windows-entropy-
+# primitive.md; its Windows CSPRNG half shipped in 6.2.12. This is the AGNOS half.)
 fn sys_getrandom(buf, len, flags): i64 {
     return syscall(SYS_GETRANDOM, buf, len, flags);
 }

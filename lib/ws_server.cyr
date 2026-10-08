@@ -1,13 +1,10 @@
 # lib/ws_server.cyr — server-side WebSocket (RFC 6455)
 #
 # Companion to lib/ws.cyr (client-side).
-# Includes its own first-party definers (6.6.11): syscalls.cyr, alloc.cyr, string.cyr, str.cyr,
-# net.cyr and sha1.cyr. NOT self-sufficient yet — the PENDING tier of
-# tests/gates/toolchain/stdlib_modules_self_sufficient.sh, which holds that the residual is
-# fold names ONLY: base64_encode from lib/bayan.cyr (base64.cyr was folded into bayan) and
-# sandhi_server_find_header from lib/sandhi.cyr (http_server.cyr was folded into sandhi). Both
-# are distlib bundles that strip their own includes, so this file cannot compile alone until
-# they are raw-includable.
+# Self-sufficient: includes syscalls.cyr, alloc.cyr, string.cyr, str.cyr, net.cyr, sha1.cyr and
+# two folds — bayan (base64_encode; base64.cyr was folded into it) and sandhi
+# (sandhi_server_find_header; http_server.cyr was folded into it) — whose bundles carry their
+# own requires blocks since 6.6.19 R1. CHANGELOG [6.6.19]
 #
 # Design: integrates with sandhi's HTTP server (formerly lib/http_server.cyr) — an HTTP
 # handler detects a WS upgrade request, calls ws_server_handshake(cfd, buf, n) to upgrade in
@@ -22,6 +19,8 @@ include "lib/string.cyr"
 include "lib/str.cyr"
 include "lib/net.cyr"
 include "lib/sha1.cyr"
+include "lib/bayan.cyr"
+include "lib/sandhi.cyr"
 
 # ================================================================
 # WebSocket constants

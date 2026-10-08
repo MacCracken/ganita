@@ -1,9 +1,7 @@
 # log.cyr — structured logging wrapper over sakshi
 # Usage: include "lib/log.cyr"
-# Includes its own first-party definer (6.6.11): string.cyr (strlen). The caller still supplies
-# the sakshi_* fns from lib/sakshi.cyr — a distlib fold that strips its own includes, so it is
-# not raw-includable here (the PENDING tier of tests/gates/toolchain/
-# stdlib_modules_self_sufficient.sh, which holds that sakshi_* is ALL that stays undefined).
+# Self-sufficient: includes string.cyr (strlen) and the sakshi fold (sakshi_*), whose bundle
+# carries its own requires block since 6.6.19 R1. CHANGELOG [6.6.19]
 #
 # Provides simple log_debug/info/warn/error/fatal API with
 # level filtering. Delegates to sakshi for output routing
@@ -15,6 +13,7 @@
 #   log_error("disk full");
 
 include "lib/string.cyr"
+include "lib/sakshi.cyr"
 
 # Log levels — severity-ascending (TRACE=0 .. FATAL=5)
 enum LogLevel {
@@ -28,16 +27,18 @@ enum LogLevel {
 
 var _log_level = 2;
 
-# Map log.cyr levels (ascending) to sakshi levels (descending)
-# LOG_TRACE(0) → SK_TRACE(4), LOG_DEBUG(1) → SK_DEBUG(3),
-# LOG_INFO(2) → SK_INFO(2), LOG_WARN(3) → SK_WARN(1),
-# LOG_ERROR(4) → SK_ERROR(0), LOG_FATAL(5) → SK_ERROR(0)
+# Map log.cyr levels (ascending) to sakshi's threshold (descending), BY NAME. LOG_FATAL maps
+# to SK_ERROR, not SK_FATAL: _log_emit sends fatal through sakshi_error, which SK_FATAL drops.
+# ⛔ These were literals 4..0 from a sakshi scheme with no FATAL level (ERROR = 0); sakshi
+# renumbered (FATAL 0 .. TRACE 5) and the literals did not follow, so log_init(LOG_INFO)
+# set sakshi to WARN and every log_info was dropped. Invisible while this file left sakshi
+# to its caller and its one test stubbed sakshi_* out. CHANGELOG [6.6.19]
 fn _log_to_sk(level): i64 {
-    if (level == 0) { return 4; }
-    if (level == 1) { return 3; }
-    if (level == 2) { return 2; }
-    if (level == 3) { return 1; }
-    return 0;
+    if (level == LOG_TRACE) { return SK_TRACE; }
+    if (level == LOG_DEBUG) { return SK_DEBUG; }
+    if (level == LOG_INFO) { return SK_INFO; }
+    if (level == LOG_WARN) { return SK_WARN; }
+    return SK_ERROR;
 }
 
 # Initialize logging with minimum level. Opt-in entry for the

@@ -29,7 +29,7 @@
 # server does run there, serially. (This read "clone-fork … inbound TCP is AGNOS Phase B; sit
 # is a client" until 6.6.10. CHANGELOG [6.6.10]) The cancel-token API at the bottom stays
 # SHARED (atomic-only, portable). Resolves
-# docs/development/issues/2026-06-15-cyrius-thread-agnos-clone-dispatch.md §2.
+# docs/development/issues/archived/2026-06-15-cyrius-thread-agnos-clone-dispatch.md §2.
 
 # 6.6.9: every arm calls the syscall peer, alloc / alloc_via and fncall*; they were a Requires
 # line for the caller, so a bare include was a hard error on Linux (`SYS_EPOLL_CREATE1`) and
@@ -67,7 +67,7 @@ include "lib/async_agnos.cyr"
 # v6.4.43: Windows (PE) has no epoll/timerfd/fork either — route to an IOCP backend
 # (lib/async_win.cyr), the same per-target split as agnos. The epoll body below is
 # gated NOT-agnos AND NOT-win. Nested-guard precedent: lib/fs.cyr. Resolves
-# docs/development/issues/2026-07-08-async-epoll-only-blocks-win-transport.md.
+# docs/development/issues/archived/2026-07-08-async-epoll-only-blocks-win-transport.md.
 #ifdef CYRIUS_TARGET_WIN
 include "lib/async_win.cyr"
 #endif
@@ -123,7 +123,7 @@ var TASK_SIZE = 64;
 # runtime each batch (async_run closes its epfd → single-use); with the global
 # bump (no free) that leaked ~32 B/task + 32 B/batch forever. Passing an
 # arena_allocator + reset_via(a) per batch reclaims it. See
-# docs/development/issues/2026-06-09-async-runtime-no-free-task-leak.md.
+# docs/development/issues/archived/2026-06-09-async-runtime-no-free-task-leak.md.
 # v6.4.33 F1 — +current slot @40: the task async_run is executing, so
 # async_wait_fd(rt, fd) can park THAT task on the runtime's shared epfd.
 var RT_SIZE = 48;
@@ -992,10 +992,17 @@ fn _async_process_task(ctx): i64 {
         async_wait_fd(load64(ctx + 48), pfd);                    # park on the pidfd
         return 0;
     }
-    # wake: the child has exited — reap it (returns at once) and close the pidfd
+    # wake: the child has exited — reap it (returns at once) and close the pidfd. Only a wait
+    # that returned the child's pid wrote statusbuf: under an inherited SIGCHLD = SIG_IGN the
+    # kernel has already reaped it (the pidfd still wakes us), waitpid fails ECHILD, and the
+    # stale stack word decoded as "exit 0" for a child that failed. Not observed is -1.
+    # CHANGELOG [6.6.20]
+    var cpid = load64(ctx + 32);
     var statusbuf[8];
-    sys_waitpid(load64(ctx + 32), &statusbuf, 0);
+    var w = sys_waitpid(cpid, &statusbuf, 0);
+    while (w == 0 - 4) { w = sys_waitpid(cpid, &statusbuf, 0); }
     syscall(SYS_CLOSE, load64(ctx + 40));
+    if (w != cpid) { return 0 - 1; }
     var status = load32(&statusbuf);
     if (WIFEXITED(status) == 1) { return WEXITSTATUS(status); }
     return 0 - 1;
@@ -1152,38 +1159,30 @@ fn async_read(fd, buf, len): i64 {
 }
 
 # Wait for fd to be readable, or until `ms` milliseconds elapse. Returns 1 if fd
-# became readable, 0 if the wait ended without it. A negative `ms` blocks forever.
+# became readable — data, a hang-up, a pending connection, or a regular file (always
+# readable) — and 0 if the wait ended without it: the timeout, EINTR, or an fd that is
+# not open (at once, never a hang). A negative `ms` blocks forever; one above INT_MAX
+# is clamped to it.
 #
 # Prefer this over async_await_readable whenever the wait must be interruptible: a
 # cooperative server parked on an infinite wait cannot observe a stop flag set by
-# another thread, because control never leaves the epoll call. Bounding the wait is
-# what lets the caller re-check between waits.
+# another thread, because control never leaves the wait. Bounding the wait is what
+# lets the caller re-check between waits.
 #
 # A signal-interrupted wait (EINTR) reports 0, the same as a timeout — the caller's
 # loop re-checks its own condition and waits again, which is the correct response to
 # both. CHANGELOG [6.5.6]
+# One poll(2) through fd_wait_ready (lib/syscalls_linux_common.cyr), the same primitive as
+# the macOS and Windows peers. ⛔ Until 6.6.20 this built a one-fd epoll set and ignored a
+# failed EPOLL_CTL_ADD: epoll refuses a regular file (EPERM) and a closed fd (EBADF), so the
+# wait ran on an EMPTY set — a file read as a timeout and a closed fd hung for ever with
+# `ms` < 0 — and the kernel truncated `ms` to an int. CHANGELOG [6.6.20]
 fn async_await_readable_ms(fd, ms): i64 {
-    var epfd = syscall(SYS_EPOLL_CREATE1, 0);
-    # epoll_event: { events: u32, data: u64 } = 12 bytes (padded to 16)
-    var ev[16];
-    store32(&ev, 1);
-    # data @4 (x86 packed) / @8 (aarch64 unpacked) — see _async_wait_events. This helper
-    # never reads data back, but keep the offset consistent with the reactor. (v6.4.42)
-    #ifdef CYRIUS_ARCH_AARCH64
-    store64(&ev + 8, fd);
-    #endif
-    #ifndef CYRIUS_ARCH_AARCH64
-    store64(&ev + 4, fd);
-    #endif
-    syscall(SYS_EPOLL_CTL, epfd, 1, fd, &ev);
-    var revents[16];
-    var n = sys_epoll_wait(epfd, &revents, 1, ms);
-    syscall(SYS_CLOSE, epfd);
-    if (n > 0) { return 1; }
+    if (fd_wait_ready(fd, 0, ms) == 1) { return 1; }
     return 0;
 }
 
-# Wait for fd to be readable using epoll (blocks efficiently, without limit).
+# Wait for fd to be readable (blocks without limit).
 # Always returns 0, discarding whether the fd is actually ready — that contract is
 # preserved for existing callers. Use async_await_readable_ms for a bounded wait
 # that reports which of the two happened.

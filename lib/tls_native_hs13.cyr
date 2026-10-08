@@ -2140,11 +2140,17 @@ fn _tn_build_empty_certificate(out, out_max): i64 {
 # tls_native_server_load_creds or tls_native_set_client_key): ECDSA P-256 / P-384 give a DER
 # signature over SHA-256 / SHA-384 of msg (sigil hashes internally), Ed25519 a 64-byte PureEdDSA
 # signature over msg itself. Writes the TLS SignatureScheme through `scheme_out`; returns the
-# signature length (> 0), or TLS_ERR_KEY_UNSUPPORTED (no key, or RSA), TLS_ERR_OOM or
+# signature length (> 0), or TLS_ERR_KEY_UNSUPPORTED (no key, or RSA), TLS_ERR_BUFFER_FULL or
 # TLS_ERR_AUTHN (the signer failed). The one signer of the 1.3 CertificateVerify, the 1.2
 # ServerKeyExchange and the 1.2 client CertificateVerify (6.6.14 — it was two copies of this
 # switch). CHANGELOG [6.6.14]
+# ⛔ 6.6.20: the Ed25519 arm's expanded key (seed || pk) is a `secret var`, zeroised on every
+# return. It was two _tn_alloc buffers never wiped, so every Ed25519 CertificateVerify /
+# ServerKeyExchange left one more copy of the long-term private seed in the no-free heap or the
+# connection's arena (CVE-70's wipe covers the ephemeral ECDHE secrets only). Pinned by
+# tests/tcyr/crypto/tls_native_ed25519_sign_wipe.tcyr. CHANGELOG [6.6.20]
 fn _tn_sign(ctx, msg, msg_len, sig_out, sig_max, scheme_out): i64 {
+    secret var sk64[64];
     var algo = load64(ctx + TLS_CTX_OFF_KEY_ALGO);
     var kmat = load64(ctx + TLS_CTX_OFF_KEY_MAT);
     if (kmat == 0) { return TLS_ERR_KEY_UNSUPPORTED; }
@@ -2157,12 +2163,9 @@ fn _tn_sign(ctx, msg, msg_len, sig_out, sig_max, scheme_out): i64 {
         store64(scheme_out, TLS_SIG_ECDSA_SECP384R1_SHA384);
     } elif (algo == SIG_PRIVKEY_ED25519) {
         if (sig_max < 64) { return TLS_ERR_BUFFER_FULL; }
-        var sk64 = _tn_alloc(ctx, 64);
-        var pk32 = _tn_alloc(ctx, 32);
-        if (sk64 == 0) { return TLS_ERR_OOM; }
-        if (pk32 == 0) { return TLS_ERR_OOM; }
-        ed25519_keypair(kmat, sk64, pk32);
-        if (ed25519_sign(sk64, msg, msg_len, sig_out) != 0) { return TLS_ERR_AUTHN; }
+        var pk32[32];
+        ed25519_keypair(kmat, &sk64, &pk32);
+        if (ed25519_sign(&sk64, msg, msg_len, sig_out) != 0) { return TLS_ERR_AUTHN; }
         sig_len = 64;
         store64(scheme_out, TLS_SIG_ED25519);
     } else {

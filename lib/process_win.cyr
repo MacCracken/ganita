@@ -82,6 +82,94 @@ fn _w_cmdbuf(nchars): i64 {
     return alloc(need);
 }
 
+# ⛔ 6.6.20 (CVE-102) — A SYSTEM PROGRAM IS STARTED BY ITS ABSOLUTE PATH, NEVER BY A BARE NAME.
+# CreateProcessW with no lpApplicationName resolves a bare first token by SEARCHING, and the
+# documented order visits the PARENT'S CURRENT DIRECTORY before System32 (the caller's own
+# directory, the current directory, the system directories, then PATH). Every Windows
+# `cyrius build` started `cmd /s /c …` that way from inside the project, so a `cmd.exe`
+# committed to a checkout ran on its first build, and a committed `certutil.exe` wrote the
+# hashes `cyrius deps --lock` recorded. Measured on cass (Windows 11): both ran. Wine does not
+# search the current directory — no gate could see it there — but it does search the caller's
+# own directory, which is where tests/gates/platform/pe_system_programs_absolute.sh plants.
+# `_win_sys_exe` gives `"<GetSystemDirectoryW>\<name>"`, quoted, as the command line's first
+# token: a token with a directory in it is never searched for. There is no PE reroute for
+# GetSystemDirectoryW; it is resolved through GetModuleHandleA / GetProcAddress (0xF013 /
+# 0xF014) and called with callptr, as cbt/ calls SetEnvironmentVariableA. CHANGELOG [6.6.20]
+var _win_sysdir_s = 0;
+
+# The system directory (`C:\WINDOWS\system32`) as a narrow string, cached. 0 when it cannot be
+# read or is not a drive-rooted printable-ASCII path — the callers refuse; none falls back to
+# the bare name.
+fn _win_sysdir(): i64 {
+    if (_win_sysdir_s != 0) { return _win_sysdir_s; }
+    var k32 = syscall(0xF013, "kernel32.dll");                  # GetModuleHandleA
+    if (k32 == 0) { return 0; }
+    var gsd = syscall(0xF014, k32, "GetSystemDirectoryW");     # GetProcAddress
+    if (gsd == 0) { return 0; }
+    var wb[528];                                                # 264 WCHARs: MAX_PATH + slack
+    var n = callptr(gsd, &wb, 260) & 0xFFFFFFFF;               # UINT: WCHARs, NUL excluded
+    if (n < 3 || n >= 260) { return 0; }                        # failed, or did not fit
+    var s = alloc(n + 1);
+    if (s == 0) { return 0; }
+    var i = 0;
+    while (i < n) {
+        var c = load16(&wb + i * 2);
+        if (c < 32 || c > 126 || c == 34) { return 0; }         # quoted below: no `"`
+        store8(s + i, c);
+        i = i + 1;
+    }
+    store8(s + n, 0);
+    var d = load8(s) | 32;
+    if (d < 97 || d > 122 || load8(s + 1) != 58 || load8(s + 2) != 92) { return 0; }   # `X:\`
+    _win_sysdir_s = s;
+    return s;
+}
+
+# `"<system directory>\<name>"` — a System32 program's quoted absolute path, for the first
+# token of a command line — or 0 after a NAMED refusal (the caller fails closed).
+fn _win_sys_exe(name): i64 {
+    var sd = _win_sysdir();
+    if (sd == 0) {
+        var m1 = "error: could not read the Windows system directory (GetSystemDirectoryW); refusing to start ";
+        sys_write(2, m1, strlen(m1));
+        sys_write(2, name, strlen(name));
+        var m2 = " by a bare name, which Windows would look for in the current directory first\n";
+        sys_write(2, m2, strlen(m2));
+        return 0;
+    }
+    var sl = strlen(sd);
+    var nl = strlen(name);
+    var p = alloc(sl + nl + 4);
+    if (p == 0) { return 0; }
+    store8(p, 34);
+    memcpy(p + 1, sd, sl);
+    store8(p + 1 + sl, 92);
+    memcpy(p + 2 + sl, name, nl);
+    store8(p + 2 + sl + nl, 34);
+    store8(p + 3 + sl + nl, 0);
+    return p;
+}
+
+# 6.6.20 (SEC-02, CVE-97) — 1 when `s` CANNOT be one double-quoted operand of a `cmd /s /c`
+# line. Inside cmd's quotes `& | < > ^ ( )` are literal; three things are not: a `"` ENDS the
+# operand, so the rest of the line runs as cmd's own commands (`out.exe" & echo X> pwned.txt &
+# "y` as cyrius build's output ran its echo under wine); `%NAME%` expands even quoted (`q%OS%z`
+# wrote qWindows_NTz, `%USERPROFILE%\x` wrote into the profile, and `%NAME:~n,1%` lifts any one
+# byte of a variable); and a control byte (a line break) ends the command. `!` expands only under
+# delayed expansion, which `cmd /c` leaves off unless the user's own registry turns it on. Every
+# builder that quotes a path into a cmd line asks this of each one — `_win_compile_spawn` below,
+# and cbt's, which name the refusal (`_w_cmd_operand_ok`).
+fn _w_cmd_operand_bad(s): i64 {
+    var i = 0;
+    var c = load8(s);
+    while (c != 0) {
+        if (c == 34 || c == 37 || c < 32 || c == 127) { return 1; }
+        i = i + 1;
+        c = load8(s + i);
+    }
+    return 0;
+}
+
 # Build a writable UTF-16LE command line "cmd [arg1 [arg2]]" on the heap.
 # (CreateProcessW may modify lpCommandLine in place, so it must be writable
 # heap, never a read-only literal.) Returns the buffer pointer, 0 when the heap is exhausted
@@ -273,7 +361,7 @@ fn _win_create_process_job(wcmdline, hStdOut, wenv, pi, kill_on_close): i64 {
     store64(&a + 64, &si);                       # lpStartupInfo
     store64(&a + 72, pi);                        # lpProcessInformation
     var ok = syscall(61445, &a);                 # CreateProcessW
-    if (ok == 0) { return 0; }
+    if ((ok & 0xFFFFFFFF) == 0) { return 0; }    # BOOL: only eax is defined (6.6.20)
     var job = _win_job_start(pi, kill_on_close);
     if (job < 0) {                               # could not be resumed: it was terminated
         syscall(3, load64(pi + 8));
@@ -281,7 +369,7 @@ fn _win_create_process_job(wcmdline, hStdOut, wenv, pi, kill_on_close): i64 {
         return 0;
     }
     if (job > 0) { _win_job_put(load64(pi), job); }
-    return ok;
+    return ok & 0xFFFFFFFF;
 }
 
 # ⛔ 6.6.8 — A DEADLINE ON WINDOWS TOO, AND NO "exit 0" FOR A WAIT THAT NEVER HAPPENED.
@@ -344,7 +432,7 @@ fn _win_wait_handle(h): i64 {
     if (wr != 0) { return 0 - 1; }                # WAIT_FAILED (or anything but signalled)
     var code[8];
     store64(&code, 0);
-    if (syscall(61442, h, &code) == 0) { return 0 - 1; }   # GetExitCodeProcess failed
+    if ((syscall(61442, h, &code) & 0xFFFFFFFF) == 0) { return 0 - 1; }   # GetExitCodeProcess failed (BOOL: eax only)
     return load32(&code);
 }
 
@@ -435,8 +523,11 @@ fn _win_watch_end(t, wd): i64 {
 # (nonzero=success). The Windows analogue of kill(pid, SIGKILL) — Win32 has no
 # signals, so a runaway child can only be stopped this way.
 # See 2026-07-08-windows-pe-surface-no-terminateprocess.md.
+# ⚠ Every kernel32 BOOL in this file (CreateProcessW, GetExitCodeProcess, CreatePipe,
+# TerminateProcess) is masked to 32 bits: their PE emitters define only eax, the upper half is
+# the callee's to leave dirty, so a raw `== 0` could read a failure as success. CHANGELOG [6.6.20]
 fn _win_terminate(hProcess, exitCode): i64 {
-    return syscall(61469, hProcess, exitCode);    # TerminateProcess(hProcess, exitCode)
+    return syscall(61469, hProcess, exitCode) & 0xFFFFFFFF;   # TerminateProcess — BOOL: eax only
 }
 
 # v6.4.26 — wait for the process in `pi` up to `ms` milliseconds; if it does not
@@ -462,7 +553,7 @@ fn _win_wait_timeout(pi, ms, killed_out): i64 {
     var code[8];
     store64(&code, 0);
     if (wr == 0) {
-        if (syscall(61442, hProcess, &code) != 0) { ec = load32(&code); }   # GetExitCodeProcess
+        if ((syscall(61442, hProcess, &code) & 0xFFFFFFFF) != 0) { ec = load32(&code); }   # GetExitCodeProcess
     }
     _win_job_release(hProcess, 0);
     syscall(3, hThread);                           # CloseHandle(hThread)
@@ -491,7 +582,7 @@ fn _win_wait_tree(pi, ms, killed_out): i64 {
     var code[8];
     store64(&code, 0);
     if (wr == 0) {
-        if (syscall(61442, hProcess, &code) != 0) { ec = load32(&code); }
+        if ((syscall(61442, hProcess, &code) & 0xFFFFFFFF) != 0) { ec = load32(&code); }
     }
     _win_job_release(hProcess, 1);
     syscall(3, load64(pi + 8));                    # CloseHandle(hThread)
@@ -504,15 +595,20 @@ fn _win_wait_tree(pi, ms, killed_out): i64 {
 # fork/dup2/execve, so we hand the redirect to cmd.exe via CreateProcessW.
 # `cmd /s /c "<inner>"` strips ONLY the outermost quote pair (the /s rule), so
 # the inner per-path quotes + the `<` / `>` operators reach cmd intact:
-#   cmd /s /c ""C:\...\cycc.exe" < "src.cyr" > "out.exe""
-# Writes directly to `output` (SYS_RENAME is not a PE reroute, so the POSIX
-# atomic tmp+rename can't be used here). Returns the child exit code; 1 if the
-# spawn itself fails.
+#   "C:\WINDOWS\system32\cmd.exe" /s /c ""C:\...\cycc.exe" < "src.cyr" > "out.exe""
+# (cmd.exe by its absolute path — `_win_sys_exe`, 6.6.20). Writes directly to `output`
+# (SYS_RENAME is not a PE reroute, so the POSIX atomic tmp+rename can't be used here).
+# Returns the child exit code; 1 if the spawn itself fails, or (6.6.20) if a path holds a byte
+# cmd.exe reads inside its quotes (`_w_cmd_operand_bad`) — refused rather than spawned.
 fn _win_compile_spawn(cc, source, output): i64 {
-    var wbuf = _w_cmdbuf(strlen(cc) + strlen(source) + strlen(output));
+    if (_w_cmd_operand_bad(cc) + _w_cmd_operand_bad(source) + _w_cmd_operand_bad(output) != 0) { return 1; }
+    var ce = _win_sys_exe("cmd.exe");
+    if (ce == 0) { return 1; }
+    var wbuf = _w_cmdbuf(strlen(ce) + strlen(cc) + strlen(source) + strlen(output));
     if (wbuf == 0) { return 1; }
     var o = 0;
-    o = _w_append_cstr(wbuf, o, "cmd /s /c \"\"");
+    o = _w_append_cstr(wbuf, o, ce);
+    o = _w_append_cstr(wbuf, o, " /s /c \"\"");
     o = _w_append_cstr(wbuf, o, cc);
     o = _w_append_cstr(wbuf, o, "\" < \"");
     o = _w_append_cstr(wbuf, o, source);
@@ -538,7 +634,7 @@ fn _win_make_pipe(wr_out): i64 {
     store64(&sa + 8, 0);
     store64(&sa + 16, 1);
     var pr = syscall(61444, &pipeh, &pipeh + 8, &sa, 0);   # CreatePipe
-    if (pr == 0) { return 0; }
+    if ((pr & 0xFFFFFFFF) == 0) { return 0; }    # BOOL: only eax is defined (6.6.20)
     var hRead = load64(&pipeh);
     var hWrite = load64(&pipeh + 8);
     syscall(61443, hRead, 1, 0);                  # SetHandleInformation(hRead, INHERIT, 0)
@@ -741,11 +837,21 @@ fn exec_env_str(args, env): i64 {
 # bare first token via CreateProcessW directly — shell metacharacters became
 # literal argv and nothing piped. See CHANGELOG; mirrors the POSIX
 # /bin/sh -c fix in lib/process.cyr.
+# 6.6.20 (CVE-102): cmd.exe by its absolute path (`_win_sys_exe`), and the command runs with
+# NoDefaultCurrentDirectoryInExePath set, so cmd's OWN search for a bare program in `cmdline`
+# (`git tag …` from `cyrius publish`) skips the current directory as /bin/sh does — measured on
+# cass: a planted `.\git.exe`-shaped program ran without it and "is not recognized" with it. An
+# explicit `.\prog` still runs. `set` sits before the `&` with NO space (a space would be part
+# of the value).
 fn exec_cmd(cmdline): i64 {
-    var wbuf = _w_cmdbuf(strlen(cmdline));
+    var ce = _win_sys_exe("cmd.exe");
+    if (ce == 0) { return 0 - 1; }
+    var pre = " /s /c \"set NoDefaultCurrentDirectoryInExePath=1& ";
+    var wbuf = _w_cmdbuf(strlen(ce) + strlen(pre) + strlen(cmdline));
     if (wbuf == 0) { return 0 - 1; }
     var o = 0;
-    o = _w_append_cstr(wbuf, o, "cmd /s /c \"");
+    o = _w_append_cstr(wbuf, o, ce);
+    o = _w_append_cstr(wbuf, o, pre);
     o = _w_append_cstr(wbuf, o, cmdline);
     o = _w_append_cstr(wbuf, o, "\"");
     _w_terminate(wbuf, o);

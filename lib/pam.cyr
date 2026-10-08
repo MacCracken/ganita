@@ -16,7 +16,7 @@
 #   exit status: 0 = password correct, non-zero = fail.
 #
 # This is the Path-B escape hatch documented in
-# docs/development/issues/dynlib-nss-bootstrap.md: consumers that
+# docs/development/issues/archived/dynlib-nss-bootstrap.md: consumers that
 # can't shell out to `/usr/bin/su` and can't read /etc/shadow
 # directly (because they're not root) use this helper. Works
 # against any NSS backend the system is configured for (files,
@@ -64,7 +64,9 @@ fn _pam_find_chkpwd(): i64 {
 # Returns:
 #    PAM_AUTH_OK (0)            — password verified
 #    PAM_AUTH_FAIL (1)          — rejected (wrong password, locked,
-#                                  disabled, …)
+#                                  disabled, …), or the helper's verdict
+#                                  was never observed (waitpid failed —
+#                                  e.g. an inherited SIGCHLD = SIG_IGN)
 #    PAM_AUTH_HELPER_MISSING    — unix_chkpwd not on system
 #    PAM_AUTH_PIPE_FAILED       — syscall(pipe) errored
 #    PAM_AUTH_FORK_FAILED       — syscall(fork) errored
@@ -125,8 +127,15 @@ fn pam_unix_authenticate(user, password): i64 {
     }
     sys_close(wfd);
 
+    # Only a wait that returned THIS pid wrote status_buf. Under an inherited SIGCHLD = SIG_IGN
+    # the kernel auto-reaps the helper and waitpid fails ECHILD with the buffer untouched;
+    # decoding that stale stack word read "exit 0" = PAM_AUTH_OK for a WRONG password. A
+    # verdict nobody observed fails CLOSED. EINTR (a handler without SA_RESTART) is retried.
+    # CVE-80, CHANGELOG [6.6.20]
     var status_buf[4];
-    sys_waitpid(pid, &status_buf, 0);
+    var w = sys_waitpid(pid, &status_buf, 0);
+    while (w == 0 - 4) { w = sys_waitpid(pid, &status_buf, 0); }
+    if (w != pid) { return PAM_AUTH_FAIL; }
     var status = load32(&status_buf);
 
     if (WIFEXITED(status) == 1) {

@@ -36,43 +36,18 @@
 # inside the stack would invite the same TCB-init issues that gated
 # the libssl wrapper.
 
+# The definers this stack's OWN code calls (sys_* / fd_* / the agnos socket peers, alloc / alloc_via,
+# memcpy / memeq / strlen, atomic_*, clock_now_ns, file_open, fncall*), then the sigil fold. Since
+# 6.6.19 R3 sigil's bundle carries its own compile-verified requires block (bayan, thread,
+# thread_local, sys, chrono, random, ...), so the hand mirror of its sidecar leaves that stood here
+# (CHANGELOG [6.1.25], [6.5.29], [6.0.53], [6.6.7]) is gone: nothing below exists only for sigil.
 include "lib/syscalls.cyr"
 include "lib/alloc.cyr"
-include "lib/freelist.cyr"
 include "lib/string.cyr"
-include "lib/vec.cyr"
-include "lib/hashmap.cyr"
-include "lib/io.cyr"
-include "lib/fs.cyr"
-# v6.1.25 bayan carve: bigint (u256_*) moved into lib/bayan.cyr. sigil's
-# ECDSA/crypto path calls u256_* — satisfied by bayan's back-compat aliases.
-# bayan's bundled json portion references result/fnptr (io is above);
-# include-once dedupes. See CHANGELOG [6.1.25].
-include "lib/result.cyr"
-include "lib/fnptr.cyr"
-# v6.5.29 — bayan REQUIRES lib/str.cyr. It always declared `str` in its dist sidecar; the
-# requirement only became fatal at bayan 1.4.2, when the `_toml_parse_*` family changed from
-# returning an `i64` that carried a Str to returning `Str` outright, so the type is now NAMED
-# rather than merely passed through. A bundle strips its own includes by contract (the
-# consumer supplies leaves from the sidecar), so this include belongs here, at the consumer.
-include "lib/str.cyr"
-include "lib/bayan.cyr"
-include "lib/ct.cyr"
-include "lib/keccak.cyr"
-# v6.0.53: sigil 3.6.0 added a thread-local constant-bank (reachable
-# thread_local_init at init) + worker-batch thread_create/join, and declares
-# `# Requires: lib/thread_local.cyr` — so any sigil consumer must pull
-# thread.cyr + thread_local.cyr BEFORE sigil or sigil's thread_* calls emit ud2
-# (the v6.0.53 CI SIGILL in tls_native_scaffold). include-once dedupes.
-include "lib/thread.cyr"
-include "lib/thread_local.cyr"
-# sigil's sidecar also lists sys, chrono and random, and a bundle strips its own includes, so
-# a hand list that omits them compiles with undefined fns — ud2 stubs, not link errors:
-# sys_uname (sys), clock_now_ms / sleep_ms / clock_epoch_secs (chrono), random_bytes (random).
-# Before sigil, like the leaves above. CHANGELOG [6.6.7]
-include "lib/sys.cyr"
+include "lib/atomic.cyr"
 include "lib/chrono.cyr"
-include "lib/random.cyr"
+include "lib/io.cyr"
+include "lib/fnptr.cyr"
 include "lib/sigil.cyr"
 
 # ================================================================

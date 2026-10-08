@@ -255,10 +255,17 @@ fn dur_between(start_ns, end_ns): i64 {
 # frozen 0-33 surface" note, which made every agnos poll loop busy-spin).
 # See CHANGELOG [6.0.65]/[6.2.6], issues 2026-06-04-macos-nanosleep-syscall-35-not-in-esysxlat,
 # 2026-06-14-chrono-agnos-monotonic-sleep-stale-stubs.
+# `ms` < 0 sleeps 0 and `ms` > INT_MAX sleeps INT_MAX (~24.8 days), on EVERY arm. ⛔ Until 6.6.20
+# only agnos guarded it: poll's timeout is a C int where a negative value means "no limit", and
+# Sleep's is a DWORD, so a computed `sleep_ms(deadline - now)` that had gone negative hung for
+# ever on Linux and macOS (~49.7 days on Windows), and 2^32 + 5 slept 5 ms. CHANGELOG [6.6.20]
 fn sleep_ms(ms): i64 {
+    var t = ms;
+    if (t < 0) { t = 0; }
+    if (t > 0x7FFFFFFF) { t = 0x7FFFFFFF; }
     #ifdef CYRIUS_TARGET_AGNOS
-    if (ms <= 0) { return 0; }
-    sys_sleep_ms(ms);               # sleep_ms(ms) — #41, blocks ~ms
+    if (t <= 0) { return 0; }
+    sys_sleep_ms(t);                # sleep_ms(ms) — #41, blocks ~ms
     return 0;
     #endif
     #ifdef CYRIUS_TARGET_WIN
@@ -266,15 +273,15 @@ fn sleep_ms(ms): i64 {
     # on PE, and WaitForSingleObject on the current process/thread pseudo-handle
     # returns immediately (doesn't block) — verified on cass — so a real Sleep
     # reroute is the correct path.
-    syscall(0xF00F, ms);            # Sleep(ms)
+    syscall(0xF00F, t);             # Sleep(ms)
     return 0;
     #endif
     #ifdef CYRIUS_TARGET_MACOS
-    syscall(7, 0, 0, ms);           # poll(NULL, 0, ms) — 7→230 on Darwin
+    syscall(7, 0, 0, t);            # poll(NULL, 0, ms) — 7→230 on Darwin
     return 0;
     #endif
     #ifdef CYRIUS_TARGET_LINUX
-    syscall(7, 0, 0, ms);           # poll(NULL, 0, ms)
+    syscall(7, 0, 0, t);            # poll(NULL, 0, ms)
     return 0;
     #endif
     # cx + any other target: no-op (agnos handled above)

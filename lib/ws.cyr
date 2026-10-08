@@ -1,26 +1,27 @@
 # ws.cyr — WebSocket protocol (RFC 6455)
 # Usage: include "lib/ws.cyr"
-# Includes its own first-party definers (6.6.11): syscalls.cyr, alloc.cyr, string.cyr, net.cyr.
-# NOT self-sufficient yet — the PENDING tier of
-# tests/gates/toolchain/stdlib_modules_self_sufficient.sh, which holds that the residual is
-# fold names ONLY: base64_encode from lib/bayan.cyr (base64.cyr was folded into bayan). bayan
-# is a distlib bundle that strips its own includes, so including it here does not make this
-# file compile alone; that waits on raw-includable fold bundles (roadmap, "Fold bundles that
-# are raw-includable").
+# Self-sufficient: includes syscalls.cyr, alloc.cyr, string.cyr, net.cyr and the bayan fold
+# (base64_encode — base64.cyr was folded into bayan), whose bundle carries its own requires
+# block since 6.6.19 R1. CHANGELOG [6.6.19]
 #
 # Client-side WebSocket over existing TCP connections.
 # Handles framing, masking, ping/pong, close handshake.
 #
-#   var sock = tcp_connect("127.0.0.1", 8080);
+#   var ip = net_resolve_ipv4("localhost");            # a name or IPv4 literal; -1 if unresolved
+#   var st, sock = tcp_socket();                        # Result pair: check is_err_result(st)
+#   var ct, cv = sock_connect(sock, ip, 8080);          # likewise is_err_result(ct)
 #   var ws = ws_connect(sock, "/ws", "localhost");
-#   ws_send_text(ws, "hello");
-#   var msg = ws_recv(ws);
-#   ws_close(ws);
+#   if (ws_state(ws) == WS_OPEN) {
+#       ws_send_text(ws, "hello");
+#       var msg = ws_recv(ws);
+#   }
+#   ws_close(ws);                                       # closes the socket too — not sock_close again
 
 include "lib/syscalls.cyr"
 include "lib/alloc.cyr"
 include "lib/string.cyr"
 include "lib/net.cyr"
+include "lib/bayan.cyr"
 
 # WebSocket opcodes
 enum WsOpcode {
@@ -144,34 +145,52 @@ fn ws_connect(sock, path, host): i64 {
     return ws;
 }
 
-# Send a WebSocket frame
+# Send a WebSocket frame. Returns len (0 for an empty frame such as a ping), or -1 when the
+# connection is not OPEN, len is negative or 4 GiB or more, the CSPRNG is unavailable, or a
+# write failed.
+#
+# ⛔ 6.6.20: NO ALLOCATION. The masked payload used to be an alloc(len) copy taken AFTER the header
+# was on the wire: alloc(0) is 0 on every target, so every empty frame (ws_ping, ws_send_text(ws,
+# ""), the close frame) went out in full and then reported -1; a refused allocation for len > 0
+# left a header announcing len bytes that never followed (the stream desynchronised, state still
+# OPEN); and the copy was never reclaimed, so a long-lived client grew by every byte it sent. The
+# frame is now built in one stack buffer — header, then the payload masked a chunk at a time, the
+# mask byte indexed by the ABSOLUTE payload offset — so nothing can be refused once a byte is sent.
+# Pinned by tests/tcyr/crossos/ws_client_short_write.tcyr (empty frames, chunk boundaries) and
+# tests/gates/memory/stdlib_alloc_refusal_sentinels.sh (the sender allocates nothing).
+# CHANGELOG [6.6.20]
 fn _ws_send_frame(ws, opcode, data, len): i64 {
     if (ws_state(ws) != WS_OPEN) { return 0 - 1; }
+    if (len < 0) { return 0 - 1; }
+    # The 64-bit length below carries the low 32 bits only — the same bound ws_recv_frame
+    # accepts (CVE-53) — so a frame of 4 GiB or more is refused before a byte is sent, not
+    # announced as len mod 2^32 with the whole payload streamed after it. CHANGELOG [6.6.20]
+    if (len > 0xFFFFFFFF) { return 0 - 1; }
     var fd = ws_fd(ws);
-    var hdr[14];
+    var buf[4096];           # the header (<= 14 bytes), then masked payload; one write per fill
     var hlen = 0;
 
     # First byte: FIN + opcode
-    store8(&hdr, 0x80 | (opcode & 0x0F));
+    store8(&buf, 0x80 | (opcode & 0x0F));
     hlen = 1;
 
     # Second byte: MASK + length
     if (len < 126) {
-        store8(&hdr + 1, 0x80 | len);
+        store8(&buf + 1, 0x80 | len);
         hlen = 2;
     } elif (len < 65536) {
-        store8(&hdr + 1, 0x80 | 126);
-        store8(&hdr + 2, (len >> 8) & 0xFF);
-        store8(&hdr + 3, len & 0xFF);
+        store8(&buf + 1, 0x80 | 126);
+        store8(&buf + 2, (len >> 8) & 0xFF);
+        store8(&buf + 3, len & 0xFF);
         hlen = 4;
     } else {
-        store8(&hdr + 1, 0x80 | 127);
-        store8(&hdr + 2, 0); store8(&hdr + 3, 0);
-        store8(&hdr + 4, 0); store8(&hdr + 5, 0);
-        store8(&hdr + 6, (len >> 24) & 0xFF);
-        store8(&hdr + 7, (len >> 16) & 0xFF);
-        store8(&hdr + 8, (len >> 8) & 0xFF);
-        store8(&hdr + 9, len & 0xFF);
+        store8(&buf + 1, 0x80 | 127);
+        store8(&buf + 2, 0); store8(&buf + 3, 0);
+        store8(&buf + 4, 0); store8(&buf + 5, 0);
+        store8(&buf + 6, (len >> 24) & 0xFF);
+        store8(&buf + 7, (len >> 16) & 0xFF);
+        store8(&buf + 8, (len >> 8) & 0xFF);
+        store8(&buf + 9, len & 0xFF);
         hlen = 10;
     }
 
@@ -179,28 +198,33 @@ fn _ws_send_frame(ws, opcode, data, len): i64 {
     # a frame under a predictable/uninitialized mask).
     if (_ws_gen_mask(ws) != 0) { return 0 - 1; }
     var mask = load64(ws + 16) & 0xFFFFFFFF;
-    store8(&hdr + hlen, mask & 0xFF);
-    store8(&hdr + hlen + 1, (mask >> 8) & 0xFF);
-    store8(&hdr + hlen + 2, (mask >> 16) & 0xFF);
-    store8(&hdr + hlen + 3, (mask >> 24) & 0xFF);
+    store8(&buf + hlen, mask & 0xFF);
+    store8(&buf + hlen + 1, (mask >> 8) & 0xFF);
+    store8(&buf + hlen + 2, (mask >> 16) & 0xFF);
+    store8(&buf + hlen + 3, (mask >> 24) & 0xFF);
     hlen = hlen + 4;
 
-    # Send header. v6.6.8: both writes go through sock_send_all — they used to be bare
-    # sys_write calls whose counts were dropped, so a short write (SO_SNDTIMEO, a signal) sent a
-    # truncated frame and still returned `len`. A failed frame desynchronises the stream; the
-    # caller must close. CHANGELOG [6.6.8]
-    if (sock_send_all(fd, &hdr, hlen) < 0) { return 0 - 1; }
-
-    # Mask and send payload
-    var masked = alloc(len);
-    if (masked == 0) { return 0 - 1; }
-    var i = 0;
-    while (i < len) {
-        var mb = (mask >> ((i % 4) * 8)) & 0xFF;
-        store8(masked + i, load8(data + i) ^ mb);
-        i = i + 1;
+    # Send header and masked payload. v6.6.8: every write goes through sock_send_all — they used
+    # to be bare sys_write calls whose counts were dropped, so a short write (SO_SNDTIMEO, a
+    # signal) sent a truncated frame and still returned `len`. A failed frame desynchronises the
+    # stream; the caller must close. CHANGELOG [6.6.8]
+    var pos = hlen;          # bytes already in buf: the header, on the first fill only
+    var off = 0;             # payload bytes masked and sent so far
+    var more = 1;
+    while (more == 1) {
+        var n = len - off;
+        if (n > 4096 - pos) { n = 4096 - pos; }
+        var i = 0;
+        while (i < n) {
+            var mb = (mask >> (((off + i) % 4) * 8)) & 0xFF;
+            store8(&buf + pos + i, load8(data + off + i) ^ mb);
+            i = i + 1;
+        }
+        if (sock_send_all(fd, &buf, pos + n) < 0) { return 0 - 1; }
+        off = off + n;
+        pos = 0;
+        if (off >= len) { more = 0; }
     }
-    if (sock_send_all(fd, masked, len) < 0) { return 0 - 1; }
     return len;
 }
 
@@ -343,13 +367,18 @@ fn ws_recv(ws): i64 {
     return 0;
 }
 
-# Close WebSocket connection
+# Close WebSocket connection. Closes the socket too — the caller must not close ws_fd(ws) again.
+# ⛔ Through lib/net.cyr's sock_close, never a raw syscall(3): #3 is close(2) only where a
+# translation table makes it so. On agnos it is spawn — the socket was never closed (no FIN, its
+# conn-table slot leaked, so the 9th one made tcp_socket() fail) and the stray spawn's failure
+# path disarmed the caller's CH_ENDOW endowment; on Windows it is CloseHandle, which does not
+# close a SOCKET. Pinned by tests/gates/platform/ws_close_socket_route.sh. CHANGELOG [6.6.20]
 fn ws_close(ws): i64 {
     if (ws_state(ws) == WS_OPEN) {
         _ws_send_frame(ws, WS_OP_CLOSE, "", 0);
         store64(ws + 8, WS_CLOSING);
     }
-    syscall(3, ws_fd(ws));
+    sock_close(ws_fd(ws));
     store64(ws + 8, WS_CLOSED);
     return 0;
 }

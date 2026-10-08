@@ -6,7 +6,7 @@
 # a fully-initialised glibc into a static binary's address space
 # without shelling out. Ships v5.5.28 as the real fix for the NSS
 # dispatch problem the v5.5.23–v5.5.25 auxv-synthesis attempt could
-# not solve (see docs/development/issues/dynlib-nss-bootstrap.md +
+# not solve (see docs/development/issues/archived/dynlib-nss-bootstrap.md +
 # vidya :: static_dlopen_and_nss_bootstrap_limits).
 #
 # ARCHITECTURE
@@ -48,8 +48,10 @@
 #         `dl_longjmp` to return to the caller's setjmp frame.
 #
 #   3. Post-`fdlopen_init`, `state_buf` holds real fn pointers into
-#      a fully-initialised glibc. `fdlopen_sym(state, "getaddrinfo")`
-#      returns the pointer; caller invokes via `fncallN`.
+#      a fully-initialised glibc. `fdlopen_getaddrinfo(state)` returns
+#      the pointer (each slot has such an accessor, over
+#      `fdlopen_slot(state, off)`; `fdlopen_dlsym(state)` is glibc's own
+#      dlsym, for any other symbol); caller invokes via `fncallN`.
 #
 # RISKS & MITIGATIONS
 # ===================
@@ -444,7 +446,7 @@ fn fdlopen_helper_available(): i64 {
 }
 
 # ================================================================
-# fdlopen_init / fdlopen_sym / helpers
+# fdlopen_init / fdlopen_slot + the slot accessors / helpers
 # ================================================================
 
 # Returns the size in bytes that caller must allocate for the

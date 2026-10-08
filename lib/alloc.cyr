@@ -36,7 +36,7 @@
 # A future BLOCKING-lock upgrade needs new primitives (macho
 # __ulock_wait/_wake, an agnos-userland-ABI futex) — filed as separate
 # follow-on issues.
-# See docs/development/issues/2026-06-04-cyrius-global-allocator-not-thread-safe.md.
+# See docs/development/issues/archived/2026-06-04-cyrius-global-allocator-not-thread-safe.md.
 #
 # cx bytecode has no threads and atomic_cas has no cx body, so the loop
 # is gated to the two real-thread arches (x86 / aarch64); on cx the lock
@@ -82,7 +82,7 @@ var _alloc_lock = 0;
 # (Linux/agnos/Windows) BEFORE the child runs — a monotonic 0→1 set that happens-before
 # any concurrency (clone/CreateThread is a full barrier), so both parent and child then
 # take the locked path. While it is 0, acquire/release are no-ops → the ~10 ns bump path
-# is restored. See issues/2026-06-10-runtime-bench-suite-blind.md (PF-02).
+# is restored. See issues/archived/2026-06-10-runtime-bench-suite-blind.md (PF-02).
 #
 # v6.5.19: the DECLARATION moved to lib/atomic.cyr (included just above). It is now
 # read by two independent allocator locks — this one and lib/freelist.cyr's — and
@@ -190,7 +190,7 @@ include "lib/alloc_cx.cyr"
 # the chunk grain gets a chunk sized to it — so handed-out pointers are always
 # contiguous over their own length. Linux overcommits anonymous RW mmap, so the
 # chunk size is virtual: only touched pages cost RAM.
-# See docs/development/issues/2026-06-09-brk-bump-heap-vs-fdlopen-libssl-malloc.md,
+# See docs/development/issues/archived/2026-06-09-brk-bump-heap-vs-fdlopen-libssl-malloc.md,
 # CHANGELOG [6.1.19].
 var _heap_base = 0;         # current chunk base
 var _heap_ptr = 0;          # bump pointer within the current chunk
@@ -287,7 +287,8 @@ fn alloc_init(): i64 {
     # caller (notably lib/thread.cyr's per-thread alloc_init). Callers that want to
     # free everything use alloc_reset(). The brk-era alloc_init this replaced was
     # effectively idempotent (re-brk to current break); the v6.1.19 brk→chunk switch
-    # lost that. See docs/development/issues/2026-06-09-chunked-alloc-init-not-idempotent-rechunks-on-recall.md.
+    # lost that. See docs/development/issues/archived/
+    # 2026-06-09-chunked-alloc-init-not-idempotent-rechunks-on-recall.md.
     if (_heap_base != 0) { return _heap_first_base; }
     var base = _linux_new_chunk(8);
     if (base == 0) {
@@ -776,22 +777,23 @@ fn _alloc_free_noop(state, ptr): i64 {
     return 0;
 }
 
-# Default realloc shape: alloc new + memcpy old → new. The old
-# allocation is leaked (acceptable for bump/arena since reset/exit
-# reclaims). Used by both bump_allocator and arena_allocator.
-fn _alloc_realloc_via(a, old_ptr, old_size, new_size): i64 {
-    var new_ptr = alloc_via(a, new_size);
-    if (new_ptr == 0) { return 0; }
-    if (old_ptr != 0) {
-        var copy_size = old_size;
-        if (new_size < copy_size) { copy_size = new_size; }
-        var i = 0;
-        while (i < copy_size) {
-            store8(new_ptr + i, load8(old_ptr + i));
-            i = i + 1;
-        }
+# The copy every "alloc new + copy + leak old" realloc entry shares — _bump_realloc,
+# _arena_realloc, _test_realloc and lib/poison.cyr's _poison_va_realloc: min(old_size,
+# new_size) bytes from old_ptr to new_ptr, nothing when old_ptr is 0. The old block is not
+# freed (bump and arena memory comes back only at reset / exit). It replaced
+# `_alloc_realloc_via`, which claimed to be this shared shape but had no caller — it took
+# an Allocator where a vtable entry receives the STATE, so it could not be wired — while
+# each entry re-inlined the loop. CHANGELOG [6.6.20]
+fn _alloc_copy_min(new_ptr, old_ptr, old_size, new_size): i64 {
+    if (old_ptr == 0) { return 0; }
+    var copy_size = old_size;
+    if (new_size < copy_size) { copy_size = new_size; }
+    var i = 0;
+    while (i < copy_size) {
+        store8(new_ptr + i, load8(old_ptr + i));
+        i = i + 1;
     }
-    return new_ptr;
+    return 0;
 }
 
 # ================================================================
@@ -804,9 +806,9 @@ fn _alloc_realloc_via(a, old_ptr, old_size, new_size): i64 {
 # global allocation, so use carefully when other code on the same
 # heap might still hold pointers.
 #
-# realloc + free use the shared default helpers — bump can't
-# individually free, and realloc's "alloc new + leak old" is
-# the honest semantics.
+# free is the shared no-op and realloc copies through the shared
+# _alloc_copy_min — bump can't individually free, and realloc's
+# "alloc new + leak old" is the honest semantics.
 
 fn _bump_alloc(state, size): i64 {
     return alloc(size);
@@ -815,15 +817,7 @@ fn _bump_alloc(state, size): i64 {
 fn _bump_realloc(state, old_ptr, old_size, new_size): i64 {
     var new_ptr = alloc(new_size);
     if (new_ptr == 0) { return 0; }
-    if (old_ptr != 0) {
-        var copy_size = old_size;
-        if (new_size < copy_size) { copy_size = new_size; }
-        var i = 0;
-        while (i < copy_size) {
-            store8(new_ptr + i, load8(old_ptr + i));
-            i = i + 1;
-        }
-    }
+    _alloc_copy_min(new_ptr, old_ptr, old_size, new_size);
     return new_ptr;
 }
 
@@ -854,15 +848,7 @@ fn bump_allocator(): i64 {
 fn _arena_realloc(state, old_ptr, old_size, new_size): i64 {
     var new_ptr = arena_alloc(state, new_size);
     if (new_ptr == 0) { return 0; }
-    if (old_ptr != 0) {
-        var copy_size = old_size;
-        if (new_size < copy_size) { copy_size = new_size; }
-        var i = 0;
-        while (i < copy_size) {
-            store8(new_ptr + i, load8(old_ptr + i));
-            i = i + 1;
-        }
-    }
+    _alloc_copy_min(new_ptr, old_ptr, old_size, new_size);
     return new_ptr;
 }
 
@@ -925,15 +911,7 @@ fn _test_alloc(state, size): i64 {
 fn _test_realloc(state, old_ptr, old_size, new_size): i64 {
     var new_ptr = _test_alloc(state, new_size);
     if (new_ptr == 0) { return 0; }
-    if (old_ptr != 0) {
-        var copy_size = old_size;
-        if (new_size < copy_size) { copy_size = new_size; }
-        var i = 0;
-        while (i < copy_size) {
-            store8(new_ptr + i, load8(old_ptr + i));
-            i = i + 1;
-        }
-    }
+    _alloc_copy_min(new_ptr, old_ptr, old_size, new_size);
     return new_ptr;
 }
 

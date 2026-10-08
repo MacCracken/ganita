@@ -2826,7 +2826,7 @@ fn _tn_leaf_purpose_ok(leaf, purpose): i64 {
 # we only anchor at a trusted, in-window CA root — same security floor as the old
 # rigid path, just tolerant of real-world chains. The `ni + 1` iteration bound
 # terminates any cross-sign cycle. See
-# docs/development/issues/2026-06-09-native-tls-handshake-gap-public-servers.md,
+# docs/development/issues/archived/2026-06-09-native-tls-handshake-gap-public-servers.md,
 # CHANGELOG [6.1.19].
 # ⛔ 6.6.14 (CVE-64) — WHY. This was the client's verifier only, and the server checked a client
 # certificate's POSSESSION (its CertificateVerify) and never its chain: any self-signed leaf was

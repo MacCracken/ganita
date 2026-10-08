@@ -15,10 +15,12 @@
 #                       and returns 0 once the channel is closed and empty. chan_send BLOCKS
 #                       while the ring is full, and returns -1 once the channel is closed.
 #                       0 = no second thread exists to end a wait, so do not rely on one.
-#                       On x86 macOS and agnos chan_recv answers 0 when empty and chan_send
-#                       fails when full. On cx a wait that only another thread could end
-#                       spins for ever, as it always has (6.6.16).
-#     CHAN_BLOCKING:  Linux 1 · arm64 macOS 1 · Windows 1 · x86 macOS 0 · agnos 0 · cx 0
+#                       On agnos chan_recv answers 0 when empty and chan_send fails when
+#                       full. On cx a wait that only another thread could end spins for
+#                       ever, as it always has (6.6.16).
+#     THREADS_CONCURRENT and CHAN_BLOCKING, equal on every backend:
+#                     Linux 1 · macOS 1 (arm64 and x86) · Windows 1 · agnos 0 · cx 0
+#                     (x86 macOS was 0 until 6.6.19 started real bsdthread threads there)
 #   chan_try_send / chan_try_recv / chan_close keep one contract on every target. A pool of
 #   workers that loop on chan_recv needs CHAN_BLOCKING == 1. CHANGELOG [6.6.16]
 #
@@ -35,7 +37,7 @@
 # sync (sync arrives transitively via alloc/atomic/patra) got 3 `duplicate fn`
 # warnings — and if the two impls ever drifted, link order silently picked the
 # winner. Delegating here makes sync the single owner: sync's own #ifdef routing
-# selects the backend (Linux futex / Windows SRWLOCK / macOS spinlock / agnos
+# selects the backend (Linux futex / Windows SRWLOCK / macOS __ulock lock / agnos
 # no-op) and include-once dedup collapses the both-included case to one definition.
 # The channel code below (and in thread_win/thread_agnos) uses these symbols;
 # sync.cyr includes its own definers (6.6.9); so does this file — the syscall peer, alloc and
@@ -71,10 +73,10 @@ include "lib/thread_agnos.cyr"
 # mmap_stack FAIL on Darwin, so thread_create bailed at `sbase < 0` and looked like a
 # harmless no-op. Fixing MAP_ANONYMOUS removed the accidental net and the call reached
 # the clone → SIGSYS on real ach (exit 140), bisected against only mmap.cyr swapped.
-# Routed here to the same serial fallback Windows (v6.0.53) and agnos (v6.2.3) use, so
-# the thread body ACTUALLY RUNS — which is the symptom
-# 2026-07-03-macos-threading-workers-dont-run reports. A real concurrent Darwin backend
-# (bsdthread_create / __ulock_wait) is still the roadmapped Slot 11 item.
+# Routed here to a serial fallback at first, so the thread body ACTUALLY RAN — the symptom
+# 2026-07-03-macos-threading-workers-dont-run reported. Both Mach-O arches now start REAL
+# threads there (arm64 libSystem pthread_create since v6.5.44; x86 raw bsdthread_create since
+# 6.6.19) and park on __ulock; lib/thread_macos.cyr's header has the split.
 #
 # cx (6.6.11): no peer file. cx compiles the body below with THREADS_CONCURRENT = 0 and
 # thread_create / thread_create_detached returning 0 (failure) — cxvm has one guest thread and
@@ -142,8 +144,8 @@ var THREAD_SIZE = 24;
 # DOWN, so an overflow runs off the LOW end; without a guard it silently
 # scribbles whatever the allocator handed out just below (the global
 # 256 MB chunk arena) instead of faulting. 4096 = one page on x86_64 +
-# aarch64 (16 KB on some Apple-arm64, but threading there is the serial
-# fallback, so this path is Linux-only). See CHANGELOG [6.2.44].
+# aarch64 (16 KB on Apple arm64, whose threads come from lib/thread_macos.cyr,
+# so this path is Linux-only). See CHANGELOG [6.2.44].
 var THREAD_GUARD_SIZE = 4096;
 
 # Allocate stack via mmap (returns USABLE base, or <0 on failure).
@@ -181,7 +183,7 @@ fn munmap_stack(addr, size): i64 {
 # the parent has already overwritten on its way through
 # `store64(t, r); return t;`. The race crashed every
 # `thread_create + thread_join` (filed by majra in
-# docs/development/issues/majra-cbarrier-arrive-and-wait-crash.md;
+# docs/development/issues/archived/majra-cbarrier-arrive-and-wait-crash.md;
 # investigated v5.4.9, fixed v5.4.10).
 #
 # The fix: do the entire clone + child-trampoline in one inline

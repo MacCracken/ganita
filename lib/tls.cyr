@@ -720,7 +720,7 @@ fn tls_set_verify(handle, mode, callback): i64 {
 }
 
 # ---- Typed pre-handshake trust-store + mTLS config verbs (v6.2.8) ----
-# The residual of docs/development/issues/2026-05-22-cyrius-native-tls-in-6.0.x.md:
+# The residual of docs/development/issues/archived/2026-05-22-cyrius-native-tls-in-6.0.x.md:
 # backend-agnostic replacements for sandhi's remaining `tls_dlsym("SSL_CTX_*")`
 # trust/mTLS callers (src/tls_policy/apply.cyr). Native ENFORCES via the
 # tls_native trust-store + client-auth machinery; libssl routes to the SSL_CTX_*
@@ -1049,7 +1049,7 @@ fn _tls_libssl_bind_host(ssl, host): i64 {
 # — direct libssl ABI binding ties consumers to the transport.
 #
 # Filed by sandhi 2026-04-24 in
-# `sandhi/docs/issues/2026-04-24-stdlib-tls-alpn-hook.md`,
+# `sandhi/docs/development/issues/archive/2026-04-24-stdlib-tls-alpn-hook.md`,
 # Option A (function-pointer hook — least invasive, most
 # flexible). v5.10.13 follow-up: typed wrappers added so the
 # hook can stay generic across transports.
@@ -1339,7 +1339,11 @@ fn _tls_native_accept_alloc_in(a, sock, creds, hook_fp, hook_ctx): i64 {
     if (hook_fp != 0) {
         if (fncall2(hook_fp, hook_ctx, nctx) != 0) { return 0; }
     }
+    # 6.6.20: checked, as the client twin's is — a refused shim was stored through (a SIGSEGV in
+    # the stdlib, where the contract promises "ctx-pre-handshake or 0"). Pinned by
+    # tests/tcyr/crypto/tls_shim_alloc_refused.tcyr. CHANGELOG [6.6.20]
     var ctx = _tn_alloc_a(a, 40);
+    if (ctx == 0) { return 0; }
     store64(ctx, nctx);
     store64(ctx + 8, 0);
     store64(ctx + 16, sock);

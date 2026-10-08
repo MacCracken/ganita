@@ -2,7 +2,7 @@
 #
 # Bypasses glibc NSS entirely. Parses /etc/passwd directly, same
 # way musl libc does for its entire identity surface. This is
-# Path A from docs/development/issues/dynlib-nss-bootstrap.md
+# Path A from docs/development/issues/archived/dynlib-nss-bootstrap.md
 # — the v5.5.26 half of the three-patch NSS real-fix arc
 # (v5.5.26 pwd/grp, v5.5.27 shadow, v5.5.28 fdlopen).
 #

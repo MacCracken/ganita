@@ -49,7 +49,7 @@ var SYS_SHUTDOWN = 48;
 # v6.2.10: AF_INET is 2 on both; AF_INET6 DIFFERS — Linux 10, Darwin (xnu
 # sys/socket.h) 30. Per-target so v6 sockets/sockaddrs are correct on Mach-O
 # (the backend SYSXLAT translates syscall NUMBERS, not this address-family
-# constant). See docs/development/issues/2026-06-15-cyrius-net-v6-darwin.md.
+# constant). See docs/development/issues/archived/2026-06-15-cyrius-net-v6-darwin.md.
 # 6.6.11: Windows (ws2def.h) has its own AF_INET6, 23. CHANGELOG [6.6.11]
 #ifdef CYRIUS_TARGET_MACOS
 enum SockDomain { AF_INET = 2; AF_INET6 = 30; }
@@ -74,7 +74,7 @@ enum SockOpt {
 # DIFFER from Linux (9-13 vs 32-36) — verified live on ecb Xcode MacOSX.sdk.
 # IPPROTO_IP=0 on both. struct ip_mreq is byte-identical 8 B across OSes; only
 # the option NUMBERS need per-target dispatch. See
-# docs/development/issues/2026-06-15-cyrius-mdns-multicast-primitives.md.
+# docs/development/issues/archived/2026-06-15-cyrius-mdns-multicast-primitives.md.
 enum IpOpt {
     IPPROTO_IP = 0;
     IP_MULTICAST_IF = 9;
@@ -167,7 +167,7 @@ fn sockaddr_in(addr, port): i64 {
 # NOTE: net_connect_nb6 inlines this exact 28-byte layout (it must stay
 # allocator-free, so it can't call this alloc-based builder) — keep the two in
 # lock-step if the layout ever changes (e.g. populating sin6_scope_id).
-# See docs/development/issues/2026-06-15-cyrius-net-v6-darwin.md.
+# See docs/development/issues/archived/2026-06-15-cyrius-net-v6-darwin.md.
 # Returns the 28-byte struct, or 0 when the allocation is refused. CHANGELOG [6.6.10]
 fn sockaddr_in6(addr16, port): i64 {
     var sa = alloc(28);
@@ -813,7 +813,7 @@ fn sock_shutdown(fd, how): i64 {
 # "unsupported" (-1) — sandhi's mDNS resolver degrades to the QU-bit unicast
 # path. macOS/Linux dispatch the right option numbers via the per-target IpOpt
 # / SockOpt enums above. Spec:
-# docs/development/issues/2026-06-15-cyrius-mdns-multicast-primitives.md.
+# docs/development/issues/archived/2026-06-15-cyrius-mdns-multicast-primitives.md.
 
 # Allow multiple sockets to bind the same port (mDNS: coexist with the host's
 # mDNS daemon on 5353). Returns 0 / -errno; -1 on agnos (no setsockopt).
@@ -1019,12 +1019,17 @@ fn net_connect_sa_nb(fd, sa, salen, timeout_ms): i64 {
             store16(&pfd + 6, 0);                           # revents
             var pr = syscall(7, &pfd, 1, timeout_ms);       # poll
             if (pr > 0) {
+                # 6.6.20: connected only when getsockopt itself succeeded AND read 0 — the
+                # buffer is primed non-zero, as the Windows arm's is. It was primed 0 with the
+                # return dropped, so a failed getsockopt reported a refused connect as connected.
+                # Pinned by tests/tcyr/crossos/net_connect_nb_so_error.tcyr. CHANGELOG [6.6.20]
                 var sb[4];
                 var slen[4];
-                store32(&sb,   0);
+                store32(&sb,   1);                          # not 0: an unwritten value is no success
                 store32(&slen, 4);
-                syscall(55, fd, SOL_SOCKET, SO_ERROR, &sb, &slen);  # getsockopt SO_ERROR
-                if (load32(&sb) == 0) { result = _NET_CONN_NB_OK; }
+                if (syscall(55, fd, SOL_SOCKET, SO_ERROR, &sb, &slen) == 0) {  # getsockopt SO_ERROR
+                    if (load32(&sb) == 0) { result = _NET_CONN_NB_OK; }
+                }
             } else { if (pr == 0) {
                     result = _NET_CONN_NB_TIMEOUT;
                 } }

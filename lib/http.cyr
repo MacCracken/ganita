@@ -1,6 +1,7 @@
 # http.cyr — minimal HTTP/1.0 client
 # Usage: include "lib/http.cyr"
-# Requires: alloc.cyr, string.cyr, net.cyr, str.cyr
+# Includes its own definers (6.6.9): result.cyr and net.cyr (which brings syscalls.cyr, alloc.cyr,
+# string.cyr and io.cyr) — `include "lib/http.cyr"` alone is a complete build.
 # The URL's host is resolved with net.cyr's net_resolve_ipv4 — an IPv4 literal, `localhost`,
 # /etc/hosts, then DNS; the system resolver on Windows (v6.6.9; before it no http_* call could
 # reach any host). The request is at most _HTTP_REQ_CAP (2048) bytes; a longer one is refused as
@@ -279,8 +280,9 @@ fn http_get(url): i64 {
     # int. Pre-fix: `var fd = tcp_socket(); if (fd < 0)` never fired
     # (fd is a positive heap ptr) and subsequent syscalls received
     # the Result ptr as a fd. Now: explicit is_err_result + payload
-    # unwrap, mirroring the lib/sandhi.cyr / regression-tls-live.sh
-    # call shape.
+    # unwrap, mirroring the lib/sandhi.cyr / TLS live-gate call shape
+    # (then regression-tls-live.sh; now the check driver's
+    # `_tls_live_gate`, programs/checks/services.cyr).
     var fd_r_tag, fd_r = tcp_socket();
     if (is_err_result(fd_r_tag) == 1) {
         var err = alloc(24);

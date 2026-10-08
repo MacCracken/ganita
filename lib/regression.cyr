@@ -902,16 +902,22 @@ fn regression_pipe_to_bin(bin_path, src_path, envp): i64 {
 
 # ── Process: bounded run ──────────────────
 
-# Fork + exec with wall-clock timeout. Polls
-# `waitpid(WNOHANG)` every 100 ms; on timeout ends the child and
-# its tree (`_regression_kill_tree`: TERM, grace, KILL — 6.6.8) and
-# reaps it. Replaces the bash `timeout N binary` pattern.
+# Fork + exec with wall-clock timeout, waited through `_regression_wait_deadline` (WNOHANG
+# polls in 1 / 10 / 50 ms slices); on timeout ends the child and its tree
+# (`_regression_kill_tree`: TERM, grace, KILL — 6.6.8) and reaps it. A timeout_ms <= 0 gives the
+# child no time at all: it is ended at once (-2), as it always was. Replaces the bash
+# `timeout N binary` pattern.
 #
 # Returns:
 #   0..127     normal exit code
 #   128..192   128 + WTERMSIG (signal-killed)
-#   -1         fork/exec failure
+#   -1         fork/exec failure, or the child was never observed (waitpid failed — e.g. an
+#              inherited SIGCHLD = SIG_IGN auto-reaped it)
 #   -2         timeout (child SIGKILL'd)
+# ⛔ Until 6.6.20 this verb ran its own 100 ms poll loop with no `waitpid < 0` arm — the one
+# wait 6.6.7's "a waitpid error is not the DEADLINE" fix never reached: under an inherited
+# SIG_IGN it spun the whole timeout, counted a phantom deadline kill, returned -2 for a child
+# that had succeeded, and signalled a pid already reaped (and possibly reused). CHANGELOG [6.6.20]
 fn regression_run_with_timeout(bin_path, timeout_ms, envp): i64 {
     var _rg_ppid = sys_getpid();
     var pid = _regression_fork();
@@ -931,22 +937,15 @@ fn regression_run_with_timeout(bin_path, timeout_ms, envp): i64 {
         sys_exit(127);
     }
     var stbuf[4];
-    var elapsed = 0;
-    while (elapsed < timeout_ms) {
-        var w = sys_waitpid(pid, &stbuf, 1);
-        if (w == pid) {
-            var status = load32(&stbuf);
-            if (WIFEXITED(status) == 1) { return WEXITSTATUS(status); }
-            if (WIFSIGNALED(status) == 1) { return 128 + WTERMSIG(status); }
-            return 0 - 1;
-        }
-        syscall(7, 0, 0, 100);          # poll(NULL,0,100ms) — portable 100ms sleep
-        elapsed = elapsed + 100;        # (was nanosleep 35; faults off Linux). v6.0.65
-    }
-    _regression_deadline_kills = _regression_deadline_kills + 1;
-    _regression_last_deadline = timeout_ms;
-    _regression_kill_tree(pid, &stbuf);
-    return 0 - 2;
+    var t = timeout_ms;
+    if (t <= 0) { t = 1; }      # no time at all is an immediate kill — the helper's <= 0 waits for ever
+    var reaped = _regression_wait_deadline(pid, &stbuf, t);
+    if (reaped == 0) { return 0 - 2; }
+    if (reaped < 0) { return 0 - 1; }   # never observed: no status to decode
+    var status = load32(&stbuf);
+    if (WIFEXITED(status) == 1) { return WEXITSTATUS(status); }
+    if (WIFSIGNALED(status) == 1) { return 128 + WTERMSIG(status); }
+    return 0 - 1;
 }
 
 # ── Process: exec + capture ───────────────
@@ -1194,7 +1193,8 @@ fn regression_ssh_target(env_name, default_name): i64 {
 
 # Probe whether `target` is reachable via
 # `ssh -o BatchMode=yes -o ConnectTimeout=2 target "echo alive"`.
-# Returns 1 if reachable, 0 otherwise. Used by SSH-cluster gates
+# Returns 1 if reachable, 0 otherwise — including when the probe hit the
+# deadline or was never observed (waitpid failed). Used by SSH-cluster gates
 # to skip cleanly when a host isn't currently connectable.
 #
 # `echo alive` (not `true`) — v5.9.32 portability fix: `true` is
@@ -1229,7 +1229,8 @@ fn regression_ssh_skip_check(target): i64 {
         sys_exit(127);
     }
     var stbuf[4];
-    _regression_wait_deadline(pid, &stbuf, _regression_long_timeout_ms());
+    var reaped = _regression_wait_deadline(pid, &stbuf, _regression_long_timeout_ms());
+    if (reaped != 1) { return 0; }      # the deadline, or never observed: no status to decode
     var status = load32(&stbuf);
     if (WIFEXITED(status) == 1) {
         if (WEXITSTATUS(status) == 0) { return 1; }
@@ -1238,9 +1239,10 @@ fn regression_ssh_skip_check(target): i64 {
 }
 
 # `scp -q local_path target:remote_path`. Returns 0 on success,
-# non-zero on failure. Honors caller-supplied envp (for any
-# proxy-jump / agent-forwarding environment threading).
-# `-q` for quiet (suppresses progress meter on stderr).
+# non-zero on failure: scp's exit status, -2 the deadline, -1 a fork failure,
+# a signal, or a child that was never observed (waitpid failed). Honors
+# caller-supplied envp (for any proxy-jump / agent-forwarding environment
+# threading). `-q` for quiet (suppresses progress meter on stderr).
 fn regression_scp_to(target, local_path, remote_path, envp): i64 {
     var dest = _regression_join3(target, ":", remote_path);
     var _rg_ppid = sys_getpid();
@@ -1261,16 +1263,19 @@ fn regression_scp_to(target, local_path, remote_path, envp): i64 {
         sys_exit(127);
     }
     var stbuf[4];
-    _regression_wait_deadline(pid, &stbuf, _regression_long_timeout_ms());
+    var reaped = _regression_wait_deadline(pid, &stbuf, _regression_long_timeout_ms());
+    if (reaped == 0) { return 0 - 2; }
+    if (reaped < 0) { return 0 - 1; }   # never observed: no status to decode
     var status = load32(&stbuf);
     if (WIFEXITED(status) == 1) { return WEXITSTATUS(status); }
     return 0 - 1;
 }
 
 # `ssh target command` — discard stdout/stderr; return
-# `command`'s exit status (or 128+sig on signal, -1 on any
-# failure). Used by SSH-cluster gates that only care about the
-# exit code.
+# `command`'s exit status (or 128+sig on signal, -2 the deadline,
+# -1 on any other failure, including a child that was never
+# observed — waitpid failed). Used by SSH-cluster gates that only
+# care about the exit code.
 fn regression_ssh_remote_exit(target, command, envp): i64 {
     var _rg_ppid = sys_getpid();
     var pid = _regression_fork();
@@ -1293,15 +1298,19 @@ fn regression_ssh_remote_exit(target, command, envp): i64 {
         sys_exit(127);
     }
     var stbuf[4];
-    _regression_wait_deadline(pid, &stbuf, _regression_long_timeout_ms());
+    var reaped = _regression_wait_deadline(pid, &stbuf, _regression_long_timeout_ms());
+    if (reaped == 0) { return 0 - 2; }
+    if (reaped < 0) { return 0 - 1; }   # never observed: no status to decode
     var status = load32(&stbuf);
     if (WIFEXITED(status) == 1) { return WEXITSTATUS(status); }
+    if (WIFSIGNALED(status) == 1) { return 128 + WTERMSIG(status); }
     return 0 - 1;
 }
 
 # `ssh target command > out_path` — capture stdout into the
 # given file (stderr to /dev/null). Returns the command's
-# exit status (or -1 on failure).
+# exit status (-2 the deadline, -1 on any other failure, including
+# a child that was never observed — waitpid failed).
 fn regression_ssh_remote_exec_capture(target, command, out_path, envp): i64 {
     var out_fd = sys_open(out_path, 577, 420);
     if (out_fd < 0) { return 0 - 1; }
@@ -1327,7 +1336,9 @@ fn regression_ssh_remote_exec_capture(target, command, out_path, envp): i64 {
     }
     sys_close(out_fd);
     var stbuf[4];
-    _regression_wait_deadline(pid, &stbuf, _regression_long_timeout_ms());
+    var reaped = _regression_wait_deadline(pid, &stbuf, _regression_long_timeout_ms());
+    if (reaped == 0) { return 0 - 2; }
+    if (reaped < 0) { return 0 - 1; }   # never observed: no status to decode
     var status = load32(&stbuf);
     if (WIFEXITED(status) == 1) { return WEXITSTATUS(status); }
     return 0 - 1;
@@ -1355,7 +1366,15 @@ fn regression_codesign_remote(target, remote_path, envp): i64 {
 # Run `bin_path arg1 arg2 arg3` with cwd changed to `work_dir`.
 # Capture stdout to `out_path` (pass 0 for /dev/null). Trailing
 # `0` args are skipped (so 1-arg / 2-arg invocations don't need
-# distinct fns). Returns exit status.
+# distinct fns). Returns exit status; -2 the deadline; -1 on any
+# other failure, including a child that was never observed.
+# ⛔ Until 6.6.20 this verb and the four ssh/scp verbs above ignored
+# `_regression_wait_deadline`'s result and decoded `stbuf` even when
+# waitpid had never written it (a parent that inherited SIGCHLD =
+# SIG_IGN has its children auto-reaped): the stale stack slot read as
+# "exit 0" for /bin/false, and a deadline read as the post-kill status,
+# not -2. 6.6.7 fixed only exec_capture / exec_run / pipe_to_bin.
+# CHANGELOG [6.6.20]
 fn regression_exec_in_dir3(work_dir, bin_path, arg1, arg2, arg3, out_path, envp): i64 {
     var out_fd = 0 - 1;
     if (out_path == 0) {
@@ -1388,7 +1407,9 @@ fn regression_exec_in_dir3(work_dir, bin_path, arg1, arg2, arg3, out_path, envp)
     }
     sys_close(out_fd);
     var stbuf[4];
-    _regression_wait_deadline(pid, &stbuf, _regression_timeout_ms());
+    var reaped = _regression_wait_deadline(pid, &stbuf, _regression_timeout_ms());
+    if (reaped == 0) { return 0 - 2; }
+    if (reaped < 0) { return 0 - 1; }   # never observed: no status to decode
     var status = load32(&stbuf);
     if (WIFEXITED(status) == 1) { return WEXITSTATUS(status); }
     return 0 - 1;

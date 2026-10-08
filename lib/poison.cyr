@@ -537,12 +537,7 @@ fn _poison_va_alloc(state, n): i64 {
 fn _poison_va_realloc(state, old_ptr, old_size, new_size): i64 {
     var np = _poison_va_alloc(state, new_size);
     if (np == 0) { return 0; }
-    if (old_ptr != 0) {
-        var c = old_size;
-        if (new_size < c) { c = new_size; }
-        var i = 0;
-        while (i < c) { store8(np + i, load8(old_ptr + i)); i = i + 1; }
-    }
+    _alloc_copy_min(np, old_ptr, old_size, new_size);     # lib/alloc.cyr's shared copy
     return np;
 }
 
@@ -640,16 +635,20 @@ fn _poison_fl_unlink(blk): i64 {
     return 0;
 }
 
-# 1 when `blk` decodes as a poisoned fl block that is ON the live list: an fl meta word whose
-# fill matches the leading redzone's last byte, a sane header, and list links that point back
-# at it. Anything else (a double free, a header an underwrite smashed) is 0. Caller holds
-# _poison_lock.
+# 1 when `blk` decodes as a poisoned fl block that is ON the live list: an fl meta word, a
+# sane header, and list links that point back at it. Anything else (a double free, a header
+# an underwrite smashed) is 0. Caller holds _poison_lock.
+# Ownership is decided from the HEADER only, never from a redzone byte: the leading redzone
+# is user-writable damage for _poison_fl_check to classify. Requiring its last byte to equal
+# the fill made a 1-byte underwrite (`store8(p - 1, 7)`) read as a smashed header — reported
+# `(0 bytes): 8 byte(s) changed [header]`, never unlinked or recycled, and reported AGAIN by
+# the next sweep as `[leading]`. The list links are what reject a non-listed block (a plain
+# block's `ptr - 72` is never a listed block's start). CHANGELOG [6.6.20]
 fn _poison_fl_owns(blk): i64 {
     var meta = load64(blk + 32);
     var fill = meta >> 56;
     if (fill == 0) { return 0; }
     if (((meta >> 48) & 15) != 3) { return 0; }
-    if (load8(blk + 40 + _POISON_RZ - 1) != fill) { return 0; }
     var cls = load64(blk + 8);
     if (cls > 8) {
         if ((blk & 4095) != 0) { return 0; }
@@ -667,6 +666,30 @@ fn _poison_fl_owns(blk): i64 {
         if (load64(nx + 16) != blk) { return 0; }
     }
     return 1;
+}
+
+# 1 when `blk` is on the fl live list, found by WALKING the list: `blk` itself is never read,
+# so this is safe for an address that may not be mapped (fl_free asks it about `ptr - 72` of a
+# block that decoded as plain, which can sit at the start of an arena mapping). Used only on
+# fl_free's smashed-header path, so the O(n) walk costs nothing on a clean free. Bounded by
+# _poison_fl_n, like the sweep it mirrors. CHANGELOG [6.6.20]
+fn _poison_fl_listed(blk): i64 {
+    if (_poison_fl_n == 0) { return 0; }
+    _poison_lock_acquire();
+    var hit = 0;
+    var left = _poison_fl_n;
+    var b = _poison_fl_head;
+    while (b != 0) {
+        if (b == blk) {
+            hit = 1;
+            b = 0;
+        } else {
+            left = left - 1;
+            if (left <= 0) { b = 0; } else { b = load64(b + 24); }
+        }
+    }
+    _poison_lock_release();
+    return hit;
 }
 
 # Check one listed fl block's two redzones against the fill it recorded. Returns the changed
@@ -705,13 +728,19 @@ fn _poison_fl_check(blk): i64 {
 
 # arena_new with a 64-byte header: the 56-byte layout plus a+56, the head of the list of
 # blocks this arena handed out (threaded through each block's owner link, blk+16).
+# Only an ARMED alloc() block has a poison header (its meta word at a - 48): on agnos and
+# cx (and anywhere the flag is off) a - 48 is the previous block's tail — or, for the
+# first allocation, below the heap mapping (SIGSEGV) — so the read is guarded the way
+# _poison_block guards it. CHANGELOG [6.6.20]
 fn _poison_arena_new(capacity): i64 {
     var a = alloc(64);
     if (a == 0) { return 0; }
-    if (((load64(a - _POISON_RZ - _POISON_HDR + 8) >> 52) & 1) == 1) {
-        _poison_lock_acquire();
-        _poison_hidden = _poison_hidden + 8;    # the non-poison header is 56 bytes
-        _poison_lock_release();
+    if (_poison_alloc_armed() == 1) {
+        if (((load64(a - _POISON_RZ - _POISON_HDR + 8) >> 52) & 1) == 1) {
+            _poison_lock_acquire();
+            _poison_hidden = _poison_hidden + 8;    # the non-poison header is 56 bytes
+            _poison_lock_release();
+        }
     }
     var ch = alloc(capacity + 16);
     if (ch == 0) { return 0; }

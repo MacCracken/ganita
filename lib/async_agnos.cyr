@@ -29,6 +29,9 @@ include "lib/fnptr.cyr"
 #ifdef CYRIUS_TARGET_AGNOS
 include "lib/syscalls.cyr"
 include "lib/alloc.cyr"
+# 6.6.19: async_await_readable_ms's deadline reads chrono's monotonic clock (#95 first, latched
+# fallback to #40 — agnos_monotonic_clock_rdtsc.sh).
+include "lib/chrono.cyr"
 #endif
 
 # Task states (mirror lib/async.cyr).
@@ -272,6 +275,7 @@ fn _async_recv_task(ctx): i64 {
 # yields the byte count. Mirror of async.cyr's reactor recv, degraded to serial. v6.4.39.
 fn async_recv(rt, fd, buf, len): i64 {
     var ctx = alloc_via(load64(rt + 32), 40);       # rt's allocator (mirror async.cyr)
+    if (ctx == 0) { return 0; }      # out of memory: no task (async_spawn's own OOM answer). CHANGELOG [6.6.20]
     store64(ctx, 0);
     store64(ctx + 8, fd);
     store64(ctx + 16, buf);
@@ -287,6 +291,7 @@ fn _async_send_task(ctx): i64 {
 # yields the byte count. Mirror of async.cyr's reactor send, degraded to serial. v6.4.39.
 fn async_send(rt, fd, buf, len): i64 {
     var ctx = alloc_via(load64(rt + 32), 40);       # rt's allocator (mirror async.cyr)
+    if (ctx == 0) { return 0; }      # out of memory: no task (async_spawn's own OOM answer). CHANGELOG [6.6.20]
     store64(ctx, 0);
     store64(ctx + 8, fd);
     store64(ctx + 16, buf);
@@ -306,6 +311,7 @@ fn async_resolve(rt, ns_addr, ns_port, host): i64 {
 # so this is a faithful sleep, not a stub. Guard ms<=0 (the kernel caps at 1 h).
 fn async_sleep_ms(ms): i64 {
     if (ms <= 0) { return 0; }
+    if (ms > 0x7FFFFFFF) { ms = 0x7FFFFFFF; }   # as sleep_ms clamps on every arm (6.6.20)
     sys_sleep_ms(ms);
     return 0;
 }
@@ -319,10 +325,43 @@ fn async_read(fd, buf, len): i64 {
     return sys_read(fd, buf, len);
 }
 
-# Wait for `fd` to become readable. AGNOS has no epoll for arbitrary fds and
-# its reads block until data (agnos 1.57.8+, see async_read), so the subsequent read
-# already blocks — this is a no-op that returns immediately.
+# Wait for `fd` to be readable, or until `ms` milliseconds elapse (`ms` < 0: no limit). Returns 1
+# if it became readable — data, EOF, or a pending connection on a listening socket — and 0 at the
+# deadline. The epoll backend's contract, built on the socket adapter's readiness probe
+# (_agnos_fd_ready, lib/syscalls_x86_64_agnos.cyr): agnos has no non-consuming probe, so a ready
+# listener's conn is PRE-ACCEPTED and a ready conn's first byte PEEKED into a stash that the next
+# accept / read delivers first. Between probes it sleeps (sleep_ms#41 blocks only this process,
+# 1.57.7) with a 1, 2, 4 … 32 ms backoff capped by the time left. Elapsed time is the larger of
+# chrono's monotonic clock and the naps taken (each sleeps AT LEAST its ms), so a clock that
+# stands still — a refused boot on agnos <= 1.57.6 — still reaches the deadline.
+# ⚠ An fd the probe cannot see — a pipe, a file, the keyboard — answers 1 at once: agnos 1.57.8+
+# reads of those BLOCK until data or EOF, so the read that follows IS the wait (an `ms` bound is
+# therefore not honoured for them). CHANGELOG [6.6.19]
+fn async_await_readable_ms(fd, ms): i64 {
+    if (_agnos_fd_ready(fd) != 0) { return 1; }      # ready, or no probe: the read waits
+    var t0 = clock_now_ms();
+    var slept = 0;
+    var nap = 1;
+    while (1 == 1) {
+        if (ms >= 0) {
+            var el = clock_now_ms() - t0;
+            if (el < slept) { el = slept; }           # a clock that stands still: count the naps
+            if (el >= ms) { return 0; }
+            if (nap > ms - el) { nap = ms - el; }
+        }
+        sys_sleep_ms(nap);
+        slept = slept + nap;
+        if (_agnos_fd_ready(fd) != 0) { return 1; }
+        nap = nap * 2;
+        if (nap > 32) { nap = 32; }
+    }
+    return 0;
+}
+
+# Wait without limit for `fd` to become readable; always 0 (the Linux contract). ⛔ Until 6.6.19
+# this was a no-op: sandhi's cooperative accept loop (accept answers EAGAIN, then this) spun.
 fn async_await_readable(fd): i64 {
+    async_await_readable_ms(fd, 0 - 1);
     return 0;
 }
 

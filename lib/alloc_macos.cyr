@@ -140,4 +140,4 @@ fn alloc_used() {
 # on macOS as-is, so the duplicate copies that lived here only produced five
 # "duplicate fn ... (last definition wins)" warnings on every macOS build.
 # Removed — same shape as lib/alloc_windows.cyr (OS allocator only). See
-# docs/development/issues/2026-06-02-macos-alloc-arena-duplicate-fns.md.
+# docs/development/issues/archived/2026-06-02-macos-alloc-arena-duplicate-fns.md.
