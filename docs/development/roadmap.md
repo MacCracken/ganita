@@ -20,7 +20,7 @@ The point at which `ganita_*` becomes load-bearing and cannot change.
 - [x] CHANGELOG complete from 1.0.0 onward
 - [x] Benchmark baseline captured (`scripts/bench-history.sh` → `bench-history.csv`)
 - [ ] **Test coverage adequate for the surface area** — `cyrius coverage` reports
-      100 % (142/142 at 1.2.12; it counts references since cyrius 6.6.8), and every
+      100 % (142/142 at 1.2.12, unchanged at 1.2.15; it counts references since cyrius 6.6.8), and every
       public fn and every `_compat` alias is now called by name. Counted on word
       boundaries with private helpers included the repo is at 91 % (173/190). The
       floor is a floor, not the target: what is still dark is private helpers
@@ -98,7 +98,34 @@ Deliberately not in ganita, so that nobody adds them by accident:
 
 ---
 
-## Moving the cyrius pin (done at 1.2.7: 6.6.4 → 6.6.7; at 1.2.8: → 6.6.9; at 1.2.9: → 6.6.10; at 1.2.10: → 6.6.11; at 1.2.11: → 6.6.12; at 1.2.12: → 6.6.15)
+## Later — recorded at the 6.7.5 pin (W2, 2026-10-08)
+
+1.2.15 is the pin and `dist/` only (the W2 stdlib wave: every fold moves to 6.7.5, carrying its
+high items — ganita had none open). Placed here for later:
+
+- **G-1 — a real fuzz harness** (M3, 1.3.0). `tests/ganita.fcyr` is still the scaffold.
+- **G-2 — delete `_compat.cyr`** (M4). 55 aliases, exported into cyrius's stdlib by the fold;
+  the consumers re-pin first.
+- **G-3 — the `ganita_mat_get` / `_set` bounds policy as an ADR** (M4).
+- **G-4 — coverage to the surface area.** The tool says 142/142; on word boundaries with private
+  helpers it is 173/190 (91 %), and the dark ones are private helpers reached only through callers.
+- **G-5 — `_f64_rem_pio2` is a stdlib-private dependency** ([ADR 0003](../adr/0003-tan-uses-stdlib-rem-pio2.md)).
+  It is still a plain `fn` in 6.7.5's `lib/math.cyr`, and cyrius's W2 notes say it must not become
+  `private` in 6.7.6. If cyrius ever restricts it, ganita needs a public reducer from cyrius or
+  its own copy.
+- **Optional 6.7.x adoption, each only where it makes the code clearer.** A patch: the 62 private
+  bit-pattern knobs (61 in `math_advanced.cyr` — `_F64_TINY`, the `_GK_*` / `_GP_*` coefficients,
+  … — and `_LINALG_MACH_EPS`) as `const` (none is written or address-taken; it raises the
+  toolchain floor to 6.7.2), `: bool` on the six private `_is_` predicates, and if-expressions in
+  the select-a-value branches. A minor: `GANITA_MAT_MAX_ELEMS` as a `const` and `: bool` on
+  `ganita_mat_is_symmetric` and its `mat_is_symmetric` alias (public names change kind).
+
+## Moving the cyrius pin (done at 1.2.7: 6.6.4 → 6.6.7; at 1.2.8: → 6.6.9; at 1.2.9: → 6.6.10; at 1.2.10: → 6.6.11; at 1.2.11: → 6.6.12; at 1.2.12: → 6.6.15; at 1.2.14: → 6.6.18; at 1.2.15: → 6.7.5)
+
+**1.2.15 moved it to `cyrius = "6.7.5"`** by the same sequence, before any other change: the pin,
+`cyrius deps`, `cyrius lib sync --full --relock` (113 files, byte-identical to the 6.7.5 snapshot,
+which was written from the 6.7.5 tag), and the full gate green on 1.2.14's own source. No new
+error or warning. `dist/ganita.cyr` changes only its version header.
 
 **1.2.12 moved it to `cyrius = "6.6.15"`** by the same sequence, before any `src/` change. The
 gate was green on 1.2.11's own source, 844/844. `lib/` is the 112-file 6.6.15 snapshot: 16 files
