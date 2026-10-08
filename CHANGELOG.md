@@ -4,6 +4,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.15] — 2026-10-08 — toolchain 6.7.5 (the W2 stdlib wave)
+
+No source change: every function, signature and result is 1.2.14's. Toolchain **6.6.18 →
+6.7.5**. **1,249 assertions**, unchanged.
+
+### Changed — toolchain pin and `lib/`
+
+- `cyrius.cyml [package].cyrius` **6.6.18 → 6.7.5**; `cyrius.lock` re-locked (113 rows).
+- `lib/` re-vendored with `cyrius deps`, then `cyrius lib sync --full --relock`: 113 files,
+  byte-identical to the 6.7.5 snapshot (written from the 6.7.5 tag). The bump needed no source
+  change and surfaced no new error or warning: build, smoke, tests, fuzz, bench, both coverage
+  floors (142/142 and 173/190), the consumer check, the `--no-deps` raw-include build and the five
+  examples are green on 1.2.14's own source.
+- `dist/ganita.cyr` regenerated: only its version header changes. `dist/ganita.deps` is unchanged
+  (`math alloc fmt`).
+
+### Noted — the stdlib-private dependency (G-5)
+
+- `ganita_f64_tan` (and `f64_tan`, `ganita_f32_tan`) still calls stdlib math's private reducer
+  `_f64_rem_pio2` ([ADR 0003](docs/adr/0003-tan-uses-stdlib-rem-pio2.md)). It is a plain `fn` in
+  6.7.5's `lib/math.cyr`; a cyrius that made it `private` or renamed it would break the bundle at
+  compile time. The W2 plan records that cyrius 6.7.6 keeps it callable; the roadmap carries the
+  longer-term options.
+
 ## [1.2.14] — 2026-10-06 — toolchain 6.6.18; `dist/` regenerated with a compile-verified requires block
 
 No source change: every function, signature and result is 1.2.13's. Toolchain **6.6.15 →
